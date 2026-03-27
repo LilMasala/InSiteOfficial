@@ -1,0 +1,9 @@
+[deps]
+BSON = "fbb218c0-5317-5bc6-957e-2ee96dd4b1f0"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+MbedTLS = "739be429-bea8-5141-9913-cc70e7f3736d"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"

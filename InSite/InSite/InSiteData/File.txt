@@ -1,0 +1,71 @@
+// FeatureJoiner.swift
+import Foundation
+
+func makeFeatureFramesHourly(
+    span: ClosedRange<Date>,
+    bg: [Date: BGCTX],
+    hr: [Date: HRCTX],
+    energy: [Date: EnergyCTX],
+    sleep: [Date: SleepCTX],
+    exercise: [Date: ExerciseCTX],
+    menstrual: [Date: MenstrualCTX] = [:],
+    site: [Date: SiteCTX] = [:]
+) -> [FeatureFrameHourly] {
+    // canonical key set
+    var keys = Set<Date>()
+    [bg, hr, energy, sleep, exercise].forEach { keys.formUnion($0.keys) }
+    // menstrual/site are sparse; union them too
+    keys.formUnion(menstrual.keys); keys.formUnion(site.keys)
+
+    let hours = keys.sorted()
+    var out: [FeatureFrameHourly] = []
+    out.reserveCapacity(hours.count)
+
+    for t in hours {
+        let b = bg[t]; let h = hr[t]; let en = energy[t]; let sl = sleep[t]; let ex = exercise[t]
+        let m = menstrual[t]; let si = site[t]
+
+        out.append(FeatureFrameHourly(
+            hourStartUtc: t,
+
+            bg_avg: b?.avgBg,
+            bg_tir: b?.tir,
+            bg_percentLow: b?.percentLow,
+            bg_percentHigh: b?.percentHigh,
+            bg_uRoc: b?.uRoc,
+            bg_deltaAvg7h: b?.deltaAvgFrom7dSameHour,
+            bg_zAvg7h: b?.zscoreAvg7dSameHour,
+
+            hr_mean: h?.hrMean,
+            hr_delta7h: h?.deltaFrom7dSameHour,
+            hr_z7h: h?.zscore7dSameHour,
+            rhr_daily: h?.restingHrDaily,
+
+            kcal_active: en?.activeKcal,
+            kcal_active_last3h: en?.activeKcalLast3h,
+            kcal_active_last6h: en?.activeKcalLast6h,
+            kcal_active_delta7h: en?.deltaActiveFrom7dSameHour,
+            kcal_active_z7h: en?.zscoreActive7dSameHour,
+
+            sleep_prev_total_min: sl?.prevTotalMin,
+            sleep_debt_7d_min: sl?.sleepDebt7dMin,
+            minutes_since_wake: sl?.minutesSinceWake,
+
+            ex_move_min: ex?.moveMinutes,
+            ex_exercise_min: ex?.exerciseMinutes,
+            ex_min_last3h: ex?.minutesInLast3h,
+            ex_hours_since: ex?.hoursSinceExercise,
+
+            days_since_period_start: m?.daysSincePeriodStart,
+            cycle_follicular: m.map { $0.cyclePhaseOneHot.follicular },
+            cycle_ovulation: m.map { $0.cyclePhaseOneHot.ovulation },
+            cycle_luteal: m.map { $0.cyclePhaseOneHot.luteal },
+
+            days_since_site_change: si?.daysSinceSiteChange,
+            site_loc_current: si?.currentSiteLocation,
+            site_loc_same_as_last: si.map { $0.isSiteRepeatLocation ? 1 : 0 }
+        ))
+    }
+
+    return out
+}

@@ -1,0 +1,30 @@
+# ── Excluded top-level directories ──────────────────────────────────────────
+BuildLoop/
+Documents/
+HealthKitReporter/
+InSite2/
+LogoOptions/
+LoopKit/
+LoopWorkspace3/
+Loop_App/
+google-cloud-sdk/
+learn.swiftpm/
+testUI/
+
+# ── Root-level secrets / large files ────────────────────────────────────────
+google-cloud-cli-darwin-arm.tar.gz
+insitev2_chamelia.json
+
+# ── InSite project — extras not covered by InSite/.gitignore ────────────────
+InSite/InSite_backup/
+InSite/error_log.txt.save
+InSite/File.swift
+
+# ── Python (project-level catch-all; each sub-.gitignore has its own) ────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.claude/
