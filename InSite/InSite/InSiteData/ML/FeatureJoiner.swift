@@ -33,7 +33,8 @@ func makeFeatureFramesHourly(
     exercise: [Date: ExerciseCTX],
     menstrual: [Date: MenstrualCTX] = [:],
     site: [Date: SiteCTX] = [:],
-    mood: [Date: MoodCTX] = [:]            // ← NEW
+    mood: [Date: MoodCTX] = [:],
+    insulin: [Date: InsulinCTX] = [:]
 
 ) -> [FeatureFrameHourly] {
 
@@ -47,7 +48,8 @@ func makeFeatureFramesHourly(
     keySet.formUnion(exercise.keys)
     keySet.formUnion(menstrual.keys)
     keySet.formUnion(site.keys)
-    keySet.formUnion(site.keys); keySet.formUnion(mood.keys)   // ← NEW
+    keySet.formUnion(mood.keys)
+    keySet.formUnion(insulin.keys)
 
 
     let hours = keySet.sorted()
@@ -64,6 +66,7 @@ func makeFeatureFramesHourly(
         let m  = menstrual[t]
         let si = site[t]
         let mo = mood[t]
+        let ins = insulin[t]
 
         frames.append(FeatureFrameHourly(
             hourStartUtc: t,
@@ -118,7 +121,13 @@ func makeFeatureFramesHourly(
             mood_quad_posNeg: mo?.quad_posNeg,
             mood_quad_negPos: mo?.quad_negPos,
             mood_quad_negNeg: mo?.quad_negNeg,
-            mood_hours_since: mo?.hoursSinceMood
+            mood_hours_since: mo?.hoursSinceMood,
+
+            insulin_iob: ins?.iob,
+            insulin_cob: ins?.cob,
+            insulin_recent_bolus_count: ins?.recentBolusCount,
+            insulin_recent_carb_count: ins?.recentCarbEntryCount,
+            insulin_recent_temp_basal_count: ins?.recentTempBasalCount
         ))
     }
 

@@ -94,6 +94,12 @@ public enum FeatureFrameToChameliaAdapter {
         put("hours_since_mood", frame.mood_hours_since, into: &signals)
         put("stress_acute", stressAcute(valence: frame.mood_valence, arousal: frame.mood_arousal), into: &signals)
 
+        put("iob", frame.insulin_iob, into: &signals)
+        put("cob", frame.insulin_cob, into: &signals)
+        put("recent_bolus_count", frame.insulin_recent_bolus_count, into: &signals)
+        put("recent_carb_count", frame.insulin_recent_carb_count, into: &signals)
+        put("recent_temp_basal_count", frame.insulin_recent_temp_basal_count, into: &signals)
+
         return ChameliaSignalBlob(hourStartUtc: frame.hourStartUtc, signals: signals)
     }
 

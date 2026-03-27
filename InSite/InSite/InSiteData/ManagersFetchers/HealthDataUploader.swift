@@ -24,6 +24,7 @@ enum DataKind: String {
     case siteChanges         = "site_changes"
     case features    = "features"
     case mood = "mood"
+    case insulinContext = "insulin_context"
 
     /// Default subpath per cadence (collections are always .../<subpath>/items)
     func defaultSubpath(for cadence: Cadence) -> String {
@@ -47,6 +48,8 @@ enum DataKind: String {
         case (.features, .hourly):         return "ml_feature_frames"
         case (.mood, .event):              return "events"     // ← NEW
         case (.mood, .hourly):             return "hourly"     // ← NEW
+        case (.insulinContext, .hourly):   return "hourly"
+        case (.insulinContext, .event):    return "events"
             
         default:                             return cadence.rawValue
         }
@@ -493,6 +496,69 @@ struct TherapySettingsHourlyRecord: StreamRecord {
     }
 }
 
+struct NightscoutInsulinContextHourlyRecord: StreamRecord {
+    static let kind: DataKind = .insulinContext
+    static let cadence: Cadence = .hourly
+
+    let hourStartUtc: Date
+    let iob: Double?
+    let cob: Double?
+    let recentBolusCount: Int
+    let recentCarbEntryCount: Int
+    let recentTempBasalCount: Int
+    let source: String
+
+    var documentId: String { isoHourId(hourStartUtc) }
+    var payload: [String: Any] {
+        var d: [String: Any] = [
+            "hourStartUtc": isoHourId(hourStartUtc),
+            "source": source,
+            "recentBolusCount": recentBolusCount,
+            "recentCarbEntryCount": recentCarbEntryCount,
+            "recentTempBasalCount": recentTempBasalCount
+        ]
+        if let iob { d["iob"] = iob }
+        if let cob { d["cob"] = cob }
+        return d
+    }
+}
+
+struct NightscoutTreatmentEventRecord: StreamRecord {
+    static let kind: DataKind = .insulinContext
+    static let cadence: Cadence = .event
+
+    let eventId: String
+    let sourceEventId: String?
+    let eventType: String
+    let timestamp: Date
+    let insulin: Double?
+    let carbs: Double?
+    let rate: Double?
+    let durationMinutes: Int?
+    let enteredBy: String?
+    let notes: String?
+    let source: String
+
+    var documentId: String { eventId }
+    var payload: [String: Any] {
+        var d: [String: Any] = [
+            "eventId": eventId,
+            "timestamp": Timestamp(date: timestamp),
+            "timestampIso": isoHour.string(from: timestamp),
+            "eventType": eventType,
+            "source": source
+        ]
+        if let sourceEventId { d["sourceEventId"] = sourceEventId }
+        if let insulin { d["insulin"] = insulin }
+        if let carbs { d["carbs"] = carbs }
+        if let rate { d["rate"] = rate }
+        if let durationMinutes { d["durationMinutes"] = durationMinutes }
+        if let enteredBy, !enteredBy.isEmpty { d["enteredBy"] = enteredBy }
+        if let notes, !notes.isEmpty { d["notes"] = notes }
+        return d
+    }
+}
+
 // --- Site change (event + derived daily) ---
 struct SiteChangeEventRecord: StreamRecord {
     static let kind: DataKind = .siteChanges
@@ -790,6 +856,12 @@ extension HealthDataUploader {
             put("mood_quad_negPos", f.mood_quad_negPos)
             put("mood_quad_negNeg", f.mood_quad_negNeg)
             put("mood_hours_since", f.mood_hours_since)
+
+            put("insulin_iob", f.insulin_iob)
+            put("insulin_cob", f.insulin_cob)
+            put("insulin_recent_bolus_count", f.insulin_recent_bolus_count)
+            put("insulin_recent_carb_count", f.insulin_recent_carb_count)
+            put("insulin_recent_temp_basal_count", f.insulin_recent_temp_basal_count)
             return d
         }
     }
@@ -797,6 +869,40 @@ extension HealthDataUploader {
     func uploadFeatureFramesHourly(_ frames: [FeatureFrameHourly], onDone: (() -> Void)? = nil) {
         guard !skipWrites, let up = currentUploader() else { onDone?(); return }
         up.upsert(frames.map { FeatureFrameHourlyRecord(f: $0) }, label: "ml feature frames", completion: onDone)
+    }
+
+    func uploadNightscoutInsulinContext(_ summary: NightscoutBootstrapSummary, onDone: (() -> Void)? = nil) {
+        guard !skipWrites, let up = currentUploader() else { onDone?(); return }
+        let record = NightscoutInsulinContextHourlyRecord(
+            hourStartUtc: floorToHourUTC(summary.lastValidatedAt),
+            iob: summary.latestIOB,
+            cob: summary.latestCOB,
+            recentBolusCount: summary.recentBolusCount,
+            recentCarbEntryCount: summary.recentCarbEntryCount,
+            recentTempBasalCount: summary.recentTempBasalCount,
+            source: "nightscout"
+        )
+        up.upsert([record], label: "nightscout insulin context", completion: onDone)
+    }
+
+    func uploadNightscoutTreatmentEvents(_ events: [NightscoutTreatmentEvent], onDone: (() -> Void)? = nil) {
+        guard !skipWrites, let up = currentUploader() else { onDone?(); return }
+        let records = events.map {
+            NightscoutTreatmentEventRecord(
+                eventId: $0.eventId,
+                sourceEventId: $0.sourceEventId,
+                eventType: $0.eventType,
+                timestamp: $0.timestamp,
+                insulin: $0.insulin,
+                carbs: $0.carbs,
+                rate: $0.rate,
+                durationMinutes: $0.durationMinutes,
+                enteredBy: $0.enteredBy,
+                notes: $0.notes,
+                source: $0.source
+            )
+        }
+        up.upsert(records, label: "nightscout treatment events", completion: onDone)
     }
 }
 

@@ -629,6 +629,7 @@ Base.@kwdef struct UserPreferences
     burden_sensitivity :: Float64 = 0.5
     persona            :: String  = "default"
     physical_priors    :: Dict{String, Vector{Float64}} = Dict{String, Vector{Float64}}()
+    calibration_targets :: Dict{String, Float64} = Dict{String, Float64}()
 end
 
 # -------------------------------------------------------------------
@@ -715,6 +716,26 @@ function detect_regime(
     memory    :: MemoryBuffer
 ) :: RegimeDetectionResult
     return RegimeDetectionResult(nothing, "patch_current", nothing)
+end
+
+"""
+    calibrate_posterior!(adapter, posterior, prior, targets) :: Nothing
+
+Domain adapter hook called at patient initialization when the user has supplied
+self-reported glycemic calibration targets (e.g. recent TIR / %low / %high).
+The default is a no-op — adapters override to narrow the physical posterior
+using importance sampling against a domain-specific outcome heuristic.
+
+`targets` keys are defined by the domain adapter (e.g. "recent_tir", "recent_pct_low",
+"recent_pct_high" for InSite/T1D). Chamelia core passes them blindly.
+"""
+function calibrate_posterior!(
+    adapter   :: AbstractDomainAdapter,
+    posterior :: TwinPosterior,
+    prior     :: TwinPrior,
+    targets   :: Dict{String, Float64}
+) :: Nothing
+    return nothing
 end
 
 

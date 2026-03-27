@@ -1887,3 +1887,168 @@ end
         @test result.scope == "patch_current"
     end
 end
+
+@testset "Cold-Start Calibration" begin
+    Main.ChameliaServer.reset_patient_cache!()
+    Main.ChameliaServer.set_state_backend!(Main.ChameliaServer.InMemoryStateBackend())
+
+    adapter = Main.InSiteDomainAdapter()
+
+    # ── 1. UserPreferences defaults to empty calibration_targets ──────────
+    @testset "UserPreferences defaults" begin
+        prefs = UserPreferences()
+        @test isa(prefs.calibration_targets, Dict{String, Float64})
+        @test isempty(prefs.calibration_targets)
+    end
+
+    # ── 2. calibration_targets round-trip ─────────────────────────────────
+    @testset "calibration_targets round-trip" begin
+        prefs = UserPreferences(calibration_targets = Dict("recent_tir" => 0.72, "recent_pct_low" => 0.04))
+        @test prefs.calibration_targets["recent_tir"] ≈ 0.72 atol=1e-9
+        @test prefs.calibration_targets["recent_pct_low"] ≈ 0.04 atol=1e-9
+    end
+
+    # Helper: build a fresh posterior from a default prior
+    function _fresh_posterior()
+        prior = TwinPrior(
+            trust_growth_dist       = Beta(2, 5),
+            trust_decay_dist        = Beta(2, 8),
+            burnout_sensitivity_dist = Beta(2, 5),
+            engagement_decay_dist   = Beta(2, 5),
+            physical_priors         = Dict{Symbol, Distribution}(
+                :isf_multiplier   => Normal(1.0, 0.12),
+                :basal_multiplier => Normal(1.0, 0.10),
+            ),
+            persona_label = "test"
+        )
+        posterior = TwinPosterior(
+            trust_growth_rate   = 0.2,
+            trust_decay_rate    = 0.1,
+            burnout_sensitivity = 0.1,
+            engagement_decay    = 0.05,
+            physical            = Dict{Symbol, Float64}(:isf_multiplier => 1.0, :basal_multiplier => 1.0),
+            last_updated_day    = 0,
+            n_observations      = 0,
+        )
+        return prior, posterior
+    end
+
+    # ── 3. No-op when targets are empty ───────────────────────────────────
+    @testset "no-op when targets empty" begin
+        prior, posterior = _fresh_posterior()
+        calibrate_posterior!(adapter, posterior, prior, Dict{String, Float64}())
+        @test posterior.physical[:isf_multiplier]   ≈ 1.0 atol=1e-9
+        @test posterior.physical[:basal_multiplier] ≈ 1.0 atol=1e-9
+    end
+
+    # ── 4. High TIR → ISF estimate shifts up ──────────────────────────────
+    @testset "high TIR shifts ISF up" begin
+        prior, posterior = _fresh_posterior()
+        calibrate_posterior!(adapter, posterior, prior, Dict("recent_tir" => 0.85))
+        # tir_hat = 0.85 requires higher ISF → posterior should shift above 1.0
+        @test posterior.physical[:isf_multiplier] > 1.0
+    end
+
+    # ── 5. Low TIR + high pct_high → ISF estimate shifts down ─────────────
+    @testset "low TIR + high pct_high shifts ISF down" begin
+        prior, posterior = _fresh_posterior()
+        calibrate_posterior!(adapter, posterior, prior, Dict("recent_tir" => 0.25, "recent_pct_high" => 0.60))
+        # Low TIR with lots of high → ISF must be lower → posterior should shift below 1.0
+        @test posterior.physical[:isf_multiplier] < 1.0
+    end
+
+    # ── 6. Good control → bounded update near prior ────────────────────────
+    @testset "good control stays near prior" begin
+        prior, posterior = _fresh_posterior()
+        calibrate_posterior!(adapter, posterior, prior,
+            Dict("recent_tir" => 0.72, "recent_pct_low" => 0.04, "recent_pct_high" => 0.24))
+        # Should update but stay within reasonable bounds
+        @test 0.7 < posterior.physical[:isf_multiplier]   < 1.5
+        @test 0.7 < posterior.physical[:basal_multiplier] < 1.5
+    end
+
+    # ── 7. Inconsistent targets → n_eff < 5 → no update ──────────────────
+    @testset "inconsistent targets → no update" begin
+        prior, posterior = _fresh_posterior()
+        # pct_low + pct_high > 1 is impossible; all particles will get near-zero weight
+        calibrate_posterior!(adapter, posterior, prior,
+            Dict("recent_pct_low" => 0.5, "recent_pct_high" => 0.6))
+        # Posterior should remain at prior mean (1.0) since targets are inconsistent
+        @test posterior.physical[:isf_multiplier]   ≈ 1.0 atol=1e-6
+        @test posterior.physical[:basal_multiplier] ≈ 1.0 atol=1e-6
+    end
+
+    # ── 8. Partial targets: only recent_tir → still updates ───────────────
+    @testset "partial targets update" begin
+        prior, posterior = _fresh_posterior()
+        calibrate_posterior!(adapter, posterior, prior, Dict("recent_tir" => 0.80))
+        # With high TIR target, ISF should shift; at least one physical param should change
+        @test posterior.physical[:isf_multiplier] != 1.0 || posterior.physical[:basal_multiplier] != 1.0
+    end
+
+    # ── 9. Soft bound: calibrated posterior stays within prior support ─────
+    @testset "posterior within prior support" begin
+        prior, posterior = _fresh_posterior()
+        calibrate_posterior!(adapter, posterior, prior,
+            Dict("recent_tir" => 0.90, "recent_pct_low" => 0.02, "recent_pct_high" => 0.08))
+        @test 0.5 <= posterior.physical[:isf_multiplier]   <= 1.8
+        @test 0.5 <= posterior.physical[:basal_multiplier] <= 1.8
+    end
+
+    # ── 10. server.jl: calibration_targets parses from JSON ───────────────
+    @testset "server parses calibration_targets" begin
+        prefs = Main.ChameliaServer._preferences(Dict(
+            "preferences" => Dict(
+                "calibration_targets" => Dict(
+                    "recent_tir" => 0.70,
+                    "recent_pct_low" => 0.05,
+                    "recent_pct_high" => 0.25
+                )
+            )
+        ))
+        @test prefs.calibration_targets["recent_tir"]      ≈ 0.70 atol=1e-9
+        @test prefs.calibration_targets["recent_pct_low"]  ≈ 0.05 atol=1e-9
+        @test prefs.calibration_targets["recent_pct_high"] ≈ 0.25 atol=1e-9
+    end
+
+    # ── 11. server.jl: missing keys are silently ignored ──────────────────
+    @testset "server ignores missing calibration keys" begin
+        prefs = Main.ChameliaServer._preferences(Dict(
+            "preferences" => Dict(
+                "calibration_targets" => Dict("recent_tir" => 0.65)
+            )
+        ))
+        @test haskey(prefs.calibration_targets, "recent_tir")
+        @test !haskey(prefs.calibration_targets, "recent_pct_low")
+        @test !haskey(prefs.calibration_targets, "recent_pct_high")
+    end
+
+    # ── 12. server.jl: invalid value throws ───────────────────────────────
+    @testset "server rejects non-numeric calibration_target value" begin
+        @test_throws ArgumentError Main.ChameliaServer._preferences(Dict(
+            "preferences" => Dict(
+                "calibration_targets" => Dict("recent_tir" => "bad_value")
+            )
+        ))
+    end
+
+    # ── 13. Determinism: same targets → same posterior ────────────────────
+    @testset "deterministic with same targets" begin
+        targets = Dict("recent_tir" => 0.68, "recent_pct_low" => 0.06, "recent_pct_high" => 0.26)
+        prior, post1 = _fresh_posterior()
+        calibrate_posterior!(adapter, post1, prior, targets)
+        _, post2 = _fresh_posterior()
+        calibrate_posterior!(adapter, post2, prior, targets)
+        @test post1.physical[:isf_multiplier]   ≈ post2.physical[:isf_multiplier]   atol=1e-12
+        @test post1.physical[:basal_multiplier] ≈ post2.physical[:basal_multiplier] atol=1e-12
+    end
+
+    # ── 14. end-to-end: initialize_patient uses calibration_targets ────────
+    @testset "initialize_patient applies calibration" begin
+        prefs = UserPreferences(calibration_targets = Dict("recent_tir" => 0.85))
+        sim   = Main.InSiteSimulator()
+        system = Chamelia.initialize_patient(prefs, sim)
+        # With high TIR target, ISF should shift above 1.0
+        @test system.twin.posterior.physical[:isf_multiplier] > 1.0
+    end
+end

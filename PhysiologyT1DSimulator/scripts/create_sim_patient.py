@@ -25,6 +25,7 @@ from t1d_sim.firebase_writer import FirebaseWriter
 from t1d_sim.local_writer import LocalArtifactWriter, list_local_users
 from t1d_sim.population import PatientConfig, sample_population
 from t1d_sim.questionnaire import (
+    ColdStartTargets,
     QuestionnaireAnswers,
     physical_priors_from_twins,
     questionnaire_to_patientconfig_priors,
@@ -404,6 +405,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--profile-policy", choices=["single", "limited-multi", "multi"], default="single")
+    parser.add_argument("--coldstart-targets", choices=["synthetic", "none"], default="synthetic")
     parser.add_argument("--weights-dir")
     parser.add_argument("--report-file")
     return parser
@@ -503,6 +505,10 @@ def build_preferences(cfg: PatientConfig, args) -> dict:
         "burden_sensitivity": 0.3,
         "persona": cfg.persona,
     }
+    if getattr(args, "coldstart_targets", "synthetic") == "synthetic":
+        targets = ColdStartTargets.from_patient_config(cfg).to_chamelia_targets()
+        if targets:
+            prefs["calibration_targets"] = targets
     if args.questionnaire:
         answers = QuestionnaireAnswers.from_json(args.questionnaire)
         priors = questionnaire_to_patientconfig_priors(answers)

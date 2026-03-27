@@ -16,6 +16,60 @@ from t1d_sim.missingness import make_missingness_profile
 from t1d_sim.population import PatientConfig, apply_cross_parameter_interactions
 
 
+@dataclass
+class ColdStartTargets:
+    """Self-reported glycemic summary metrics for cold-start twin calibration.
+
+    All fields optional — calibration is graceful when some are missing.
+    Values should reflect the user's recent experience (last 14–30 days).
+    """
+    recent_tir:      float | None = None   # fraction in [0, 1]
+    recent_pct_low:  float | None = None   # fraction in [0, 1]
+    recent_pct_high: float | None = None   # fraction in [0, 1]
+    window_days:     int          = 14     # reporting window in days
+
+    def to_chamelia_targets(self) -> dict[str, float]:
+        """Return dict suitable for Chamelia calibration_targets preference field."""
+        out = {}
+        if self.recent_tir is not None:
+            out["recent_tir"] = float(np.clip(self.recent_tir, 0.0, 1.0))
+        if self.recent_pct_low is not None:
+            out["recent_pct_low"] = float(np.clip(self.recent_pct_low, 0.0, 1.0))
+        if self.recent_pct_high is not None:
+            out["recent_pct_high"] = float(np.clip(self.recent_pct_high, 0.0, 1.0))
+        return out
+
+    @classmethod
+    def from_patient_config(cls, cfg: "PatientConfig", rng: np.random.Generator | None = None) -> "ColdStartTargets":
+        """Synthesize plausible self-reported targets from a known patient config.
+
+        Used in simulator experiments to simulate what a user would report.
+        Adds realistic noise to the ground-truth TIR estimate.
+        """
+        if rng is None:
+            rng = np.random.default_rng(cfg.seed + 77777)
+
+        # Linearized T1D heuristic (mirrors InSiteDomainAdapter.calibrate_posterior!)
+        isf = getattr(cfg, "isf_multiplier", 1.0)
+        basal = getattr(cfg, "basal_multiplier", 1.0)
+        tir_true = float(np.clip(0.50 + 0.35*(isf - 1.0) + 0.15*(basal - 1.0), 0.05, 0.98))
+        pct_low_true = float(np.clip(0.08 - 0.12*(isf - 1.0) - 0.04*(basal - 1.0), 0.0, 0.40))
+        pct_high_true = float(np.clip(1.0 - tir_true - pct_low_true, 0.0, 0.95))
+
+        # Add realistic self-report noise (~3-5 percentage points)
+        noise_scale = 0.04
+        tir      = float(np.clip(tir_true      + rng.normal(0, noise_scale), 0.0, 1.0))
+        pct_low  = float(np.clip(pct_low_true  + rng.normal(0, noise_scale * 0.5), 0.0, 0.5))
+        pct_high = float(np.clip(pct_high_true + rng.normal(0, noise_scale), 0.0, 1.0))
+
+        return cls(
+            recent_tir=round(tir, 3),
+            recent_pct_low=round(pct_low, 3),
+            recent_pct_high=round(pct_high, 3),
+            window_days=14,
+        )
+
+
 class ExerciseFreq(Enum):
     NEVER = "never"
     LIGHT_WEEK = "1_2x_week"

@@ -467,7 +467,8 @@ struct QuestionnaireOnboardingView: View {
                     hypoglycemiaFear: QuestionnaireToPriors.hypoglycemiaFearValue(preferencesSnapshot.hypoglycemiaFear),
                     burdenSensitivity: QuestionnaireToPriors.burdenSensitivityValue(preferencesSnapshot.recommendationCadence),
                     persona: "questionnaire_derived",
-                    physicalPriors: physicalPriorsJSON
+                    physicalPriors: physicalPriorsJSON,
+                    calibrationTargets: NightscoutConnectionStore.shared.calibrationTargets(for: authUser.uid)
                 )
                 try await ChameliaEngine.shared.initialize(patientId: authUser.uid, preferences: prefs)
                 ChameliaQuestionnaireStore.saveAnswers(answersSnapshot, userId: authUser.uid)

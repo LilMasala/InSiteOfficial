@@ -533,6 +533,9 @@ struct HomeScreen: View {
     @State private var syncTick = 0
     @State private var activeBanner: HomeBanner?
     @State private var latestTherapySnapshot: TherapySnapshot?
+    @State private var showBackfillSetupSheet = false
+    @State private var backfillConfiguration = HealthBackfillConfiguration.defaults()
+    @State private var hasRequestedHealthAuthorization = false
     @ObservedObject private var chameliaDashboard = ChameliaDashboardStore.shared
     @StateObject private var chameliaInsights = ChameliaInsightsStore()
     @EnvironmentObject private var themeManager: ThemeManager
@@ -709,6 +712,11 @@ struct HomeScreen: View {
                             // Sync (liquid-ish wave when syncing)
                             Button {
                                 guard !isSyncing else { return }
+                                if DataManager.shared.shouldPromptForInitialBackfill() {
+                                    backfillConfiguration = DataManager.shared.initialBackfillConfiguration()
+                                    showBackfillSetupSheet = true
+                                    return
+                                }
                                 isSyncing = true
                                 DataManager.shared.syncHealthData {
                                     isSyncing = false
@@ -787,16 +795,13 @@ struct HomeScreen: View {
                 }
             }
             .task {
-                            DataManager.shared.requestAuthorization { _ in }
+                            await handleInitialHealthAuthorizationFlow()
                             therapyVM.reload()   // ensure it loads on first appear
                             await refreshChameliaDashboard()
                             await refreshLatestTherapySnapshot()
                             await refreshChameliaInsights()
                             refreshLastSyncText()
                         }
-            .task {
-                DataManager.shared.requestAuthorization { _ in }
-            }
             .onAppear {
                 refreshLastSyncText()
             }
@@ -804,6 +809,14 @@ struct HomeScreen: View {
                 guard let message, !message.isEmpty else { return }
                 presentBanner(message, tone: .warning)
                 chameliaDashboard.clearTransientError()
+            }
+            .sheet(isPresented: $showBackfillSetupSheet) {
+                HealthBackfillSetupSheet(
+                    configuration: $backfillConfiguration,
+                    accent: theme.accent,
+                    isSyncing: isSyncing,
+                    onStart: startInitialBackfillSync
+                )
             }
         }
     }
@@ -878,6 +891,99 @@ private struct HomeBanner: Equatable {
 
     var message: String
     var tone: Tone
+}
+
+private struct HealthBackfillSetupSheet: View {
+    @Binding var configuration: HealthBackfillConfiguration
+    let accent: Color
+    let isSyncing: Bool
+    let onStart: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Choose how much Health data to import the first time. InSite will request up to this many days for each category and backfill Firebase before normal incremental syncs begin.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    ForEach(HealthBackfillDataType.allCases) { type in
+                        backfillRow(for: type)
+                    }
+                }
+                .padding(20)
+            }
+            .navigationTitle("Initial Health Backfill")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Not now") {
+                        dismiss()
+                    }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                Button {
+                    onStart()
+                } label: {
+                    HStack {
+                        if isSyncing {
+                            ProgressView()
+                                .tint(.white)
+                        }
+                        Text(isSyncing ? "Backfilling…" : "Start Backfill")
+                            .font(.headline)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 15)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(accent)
+                    )
+                    .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .disabled(isSyncing)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+            }
+        }
+    }
+
+    private func backfillRow(for type: HealthBackfillDataType) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(type.title)
+                .font(.headline)
+            Text(type.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Stepper(value: binding(for: type), in: 0...365, step: 5) {
+                HStack {
+                    Text("\(configuration.days(for: type)) days")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    if configuration.days(for: type) == 0 {
+                        Text("Skip")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func binding(for type: HealthBackfillDataType) -> Binding<Int> {
+        Binding(
+            get: { configuration.days(for: type) },
+            set: { configuration.setDays($0, for: type) }
+        )
+    }
 }
 
 private struct FloatingBanner: View {
@@ -1241,6 +1347,40 @@ private extension Color {
 }
 
 private extension HomeScreen {
+    func handleInitialHealthAuthorizationFlow() async {
+        guard !hasRequestedHealthAuthorization else { return }
+        hasRequestedHealthAuthorization = true
+
+        let authorized = await withCheckedContinuation { continuation in
+            DataManager.shared.requestAuthorization { success in
+                continuation.resume(returning: success)
+            }
+        }
+
+        guard authorized, DataManager.shared.shouldPromptForInitialBackfill() else { return }
+        await MainActor.run {
+            backfillConfiguration = DataManager.shared.initialBackfillConfiguration()
+            showBackfillSetupSheet = true
+        }
+    }
+
+    func startInitialBackfillSync() {
+        guard !isSyncing else { return }
+        isSyncing = true
+        let configuration = backfillConfiguration
+        DataManager.shared.syncHealthData(initialBackfill: configuration) {
+            isSyncing = false
+            showBackfillSetupSheet = false
+            refreshLastSyncText()
+            syncTick &+= 1
+            Task {
+                await refreshChameliaDashboard()
+                await refreshChameliaInsights()
+                await refreshLatestTherapySnapshot()
+            }
+        }
+    }
+
     var shadowProgressStatus: GraduationStatus {
         chameliaDashboard.state.status
             ?? GraduationStatus(

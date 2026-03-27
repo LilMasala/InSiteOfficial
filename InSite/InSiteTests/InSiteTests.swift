@@ -80,12 +80,17 @@ final class InSiteTests: XCTestCase {
             mood_quad_posNeg: 1,
             mood_quad_negPos: 0,
             mood_quad_negNeg: 0,
-            mood_hours_since: 4
+            mood_hours_since: 4,
+            insulin_iob: 1.8,
+            insulin_cob: 24,
+            insulin_recent_bolus_count: 3,
+            insulin_recent_carb_count: 2,
+            insulin_recent_temp_basal_count: 1
         )
 
         let blob = FeatureFrameToChameliaAdapter.makeSignalBlob(from: frame)
 
-        XCTAssertEqual(blob.signals.count, 39)
+        XCTAssertEqual(blob.signals.count, 44)
         XCTAssertEqual(blob.signals["tir_7d"], .double(0.76))
         XCTAssertEqual(blob.signals["pct_low_7d"], .double(0.02))
         XCTAssertEqual(blob.signals["pct_high_7d"], .double(0.18))
@@ -93,6 +98,8 @@ final class InSiteTests: XCTestCase {
         XCTAssertEqual(blob.signals["site_location"], .string("abdomen_left"))
         XCTAssertEqual(blob.signals["move_mins"], .double(32))
         XCTAssertEqual(blob.signals["stress_acute"], .double(0.5))
+        XCTAssertEqual(blob.signals["iob"], .double(1.8))
+        XCTAssertEqual(blob.signals["recent_bolus_count"], .int(3))
     }
 
     func testFeatureFrameToChameliaAdapterSkipsNilFields() throws {
@@ -134,7 +141,12 @@ final class InSiteTests: XCTestCase {
             mood_quad_posNeg: nil,
             mood_quad_negPos: nil,
             mood_quad_negNeg: nil,
-            mood_hours_since: nil
+            mood_hours_since: nil,
+            insulin_iob: nil,
+            insulin_cob: nil,
+            insulin_recent_bolus_count: nil,
+            insulin_recent_carb_count: nil,
+            insulin_recent_temp_basal_count: nil
         )
 
         let blob = FeatureFrameToChameliaAdapter.makeSignalBlob(from: frame)
@@ -186,7 +198,12 @@ final class InSiteTests: XCTestCase {
             mood_quad_posNeg: nil,
             mood_quad_negPos: nil,
             mood_quad_negNeg: nil,
-            mood_hours_since: nil
+            mood_hours_since: nil,
+            insulin_iob: nil,
+            insulin_cob: nil,
+            insulin_recent_bolus_count: nil,
+            insulin_recent_carb_count: nil,
+            insulin_recent_temp_basal_count: nil
         )
 
         let neutralValence = FeatureFrameHourly(
@@ -227,7 +244,12 @@ final class InSiteTests: XCTestCase {
             mood_quad_posNeg: nil,
             mood_quad_negPos: nil,
             mood_quad_negNeg: nil,
-            mood_hours_since: nil
+            mood_hours_since: nil,
+            insulin_iob: nil,
+            insulin_cob: nil,
+            insulin_recent_bolus_count: nil,
+            insulin_recent_carb_count: nil,
+            insulin_recent_temp_basal_count: nil
         )
 
         let lowArousal = FeatureFrameHourly(
@@ -268,7 +290,12 @@ final class InSiteTests: XCTestCase {
             mood_quad_posNeg: nil,
             mood_quad_negPos: nil,
             mood_quad_negNeg: nil,
-            mood_hours_since: nil
+            mood_hours_since: nil,
+            insulin_iob: nil,
+            insulin_cob: nil,
+            insulin_recent_bolus_count: nil,
+            insulin_recent_carb_count: nil,
+            insulin_recent_temp_basal_count: nil
         )
 
         XCTAssertEqual(
@@ -324,7 +351,12 @@ final class InSiteTests: XCTestCase {
             mood_quad_posNeg: 0,
             mood_quad_negPos: 0,
             mood_quad_negNeg: 0,
-            mood_hours_since: 1
+            mood_hours_since: 1,
+            insulin_iob: nil,
+            insulin_cob: nil,
+            insulin_recent_bolus_count: nil,
+            insulin_recent_carb_count: nil,
+            insulin_recent_temp_basal_count: nil
         )
 
         let numericSignals = FeatureFrameToChameliaAdapter.makeSignalBlob(from: frame).numericSignals

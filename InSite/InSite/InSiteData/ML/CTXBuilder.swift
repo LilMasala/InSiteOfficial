@@ -484,3 +484,25 @@ func buildBodyMassCTXByHour(
     }
     return out
 }
+
+// MARK: - Insulin / Nightscout
+
+func buildInsulinCTXByHour(
+    summary: NightscoutBootstrapSummary?,
+    span: ClosedRange<Date>
+) -> [Date: InsulinCTX] {
+    guard let summary else { return [:] }
+    let hour = floorToUtcHour(summary.lastValidatedAt)
+    guard hour >= span.lowerBound && hour <= span.upperBound else { return [:] }
+
+    return [
+        hour: InsulinCTX(
+            hourStartUtc: hour,
+            iob: summary.latestIOB,
+            cob: summary.latestCOB,
+            recentBolusCount: summary.recentBolusCount,
+            recentCarbEntryCount: summary.recentCarbEntryCount,
+            recentTempBasalCount: summary.recentTempBasalCount
+        )
+    ]
+}

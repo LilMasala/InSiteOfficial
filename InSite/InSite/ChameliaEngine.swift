@@ -530,6 +530,7 @@ struct ChameliaPreferences: Codable, Equatable {
     let burdenSensitivity: Double
     let persona: String
     let physicalPriors: [String: [Double]]
+    let calibrationTargets: [String: Double]
 
     enum CodingKeys: String, CodingKey {
         case aggressiveness
@@ -537,6 +538,7 @@ struct ChameliaPreferences: Codable, Equatable {
         case burdenSensitivity = "burden_sensitivity"
         case persona
         case physicalPriors = "physical_priors"
+        case calibrationTargets = "calibration_targets"
     }
 
     init(
@@ -544,13 +546,15 @@ struct ChameliaPreferences: Codable, Equatable {
         hypoglycemiaFear: Double,
         burdenSensitivity: Double,
         persona: String,
-        physicalPriors: [String: [Double]] = [:]
+        physicalPriors: [String: [Double]] = [:],
+        calibrationTargets: [String: Double] = [:]
     ) {
         self.aggressiveness = aggressiveness
         self.hypoglycemiaFear = hypoglycemiaFear
         self.burdenSensitivity = burdenSensitivity
         self.persona = persona
         self.physicalPriors = physicalPriors
+        self.calibrationTargets = calibrationTargets
     }
 }
 

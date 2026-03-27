@@ -17,9 +17,13 @@ If a future domain (e.g., cardiovascular rehab, AID advisory) is added,
 it provides its own AbstractDomainAdapter without touching core code.
 """
 
+using Random
+using Distributions
+
 using Main: AbstractDomainAdapter, UserPreferences,
-            RegimeDetectionResult, ConnectedAppState, MemoryBuffer
-import Main: detect_regime
+            RegimeDetectionResult, ConnectedAppState, MemoryBuffer,
+            TwinPosterior, TwinPrior
+import Main: detect_regime, calibrate_posterior!
 
 struct InSiteDomainAdapter <: AbstractDomainAdapter end
 
@@ -137,4 +141,86 @@ function detect_regime(
 
     # No other profiles yet — still surface the regime label but patch current for now
     return RegimeDetectionResult(regime, "patch_current", nothing)
+end
+
+# -------------------------------------------------------------------
+# Cold-Start Twin Calibration — InSite / T1D domain
+#
+# Importance-sampling calibration from self-reported glycemic metrics.
+# Called once at patient initialization when calibration_targets are present.
+# Updates posterior.physical[:isf_multiplier] and [:basal_multiplier] with
+# soft regularization toward the prior mean.
+# -------------------------------------------------------------------
+
+function calibrate_posterior!(
+    :: InSiteDomainAdapter,
+    posterior :: TwinPosterior,
+    prior     :: TwinPrior,
+    targets   :: Dict{String, Float64}
+) :: Nothing
+    tir_obs      = get(targets, "recent_tir",      NaN)
+    pct_low_obs  = get(targets, "recent_pct_low",  NaN)
+    pct_high_obs = get(targets, "recent_pct_high", NaN)
+
+    # bail out if no usable targets
+    (isnan(tir_obs) && isnan(pct_low_obs) && isnan(pct_high_obs)) && return nothing
+
+    # impossible self-reports should not drag the posterior toward a bogus fit
+    if !isnan(pct_low_obs) && !isnan(pct_high_obs) && (pct_low_obs + pct_high_obs > 1.0)
+        return nothing
+    end
+    if !isnan(tir_obs) && !isnan(pct_low_obs) && !isnan(pct_high_obs)
+        total = tir_obs + pct_low_obs + pct_high_obs
+        abs(total - 1.0) > 0.15 && return nothing
+    end
+
+    seed = UInt32(abs(hash(tir_obs)) % typemax(UInt32))
+    rng = Random.MersenneTwister(seed)
+
+    isf_dist   = get(prior.physical_priors, :isf_multiplier,   Normal(1.0, 0.12))
+    basal_dist = get(prior.physical_priors, :basal_multiplier, Normal(1.0, 0.10))
+
+    N = 200
+    isf_particles   = Float64[clamp(rand(rng, isf_dist),   0.5, 1.8) for _ in 1:N]
+    basal_particles = Float64[clamp(rand(rng, basal_dist), 0.5, 1.8) for _ in 1:N]
+
+    σ = 0.08
+    log_weights = zeros(N)
+    for i in 1:N
+        isf, basal = isf_particles[i], basal_particles[i]
+        tir_hat      = clamp(0.50 + 0.35*(isf - 1.0) + 0.15*(basal - 1.0), 0.05, 0.98)
+        pct_low_hat  = clamp(0.08 - 0.12*(isf - 1.0) - 0.04*(basal - 1.0), 0.0,  0.40)
+        pct_high_hat = clamp(1.0 - tir_hat - pct_low_hat,                   0.0,  0.95)
+        if !isnan(tir_obs)
+            log_weights[i] -= (tir_hat - tir_obs)^2 / (2σ^2)
+        end
+        if !isnan(pct_low_obs)
+            log_weights[i] -= (pct_low_hat - pct_low_obs)^2 / (2σ^2)
+        end
+        if !isnan(pct_high_obs)
+            log_weights[i] -= (pct_high_hat - pct_high_obs)^2 / (2σ^2)
+        end
+    end
+
+    log_weights .-= maximum(log_weights)  # log-sum-exp stability
+    weights = exp.(log_weights)
+    w_sum = sum(weights)
+    w_sum < 1e-12 && return nothing  # degenerate — bail
+
+    weights ./= w_sum
+
+    # effective sample size check
+    n_eff = 1.0 / sum(weights .^ 2)
+    n_eff < 5.0 && return nothing   # targets inconsistent with prior — don't update
+
+    isf_est   = sum(weights[i] * isf_particles[i]   for i in 1:N)
+    basal_est = sum(weights[i] * basal_particles[i] for i in 1:N)
+
+    regularization = 10.0
+    α = n_eff / (n_eff + regularization)  # soft weight toward calibrated estimate
+
+    posterior.physical[:isf_multiplier]   = α * isf_est   + (1 - α) * get(posterior.physical, :isf_multiplier,   1.0)
+    posterior.physical[:basal_multiplier] = α * basal_est + (1 - α) * get(posterior.physical, :basal_multiplier,  1.0)
+
+    return nothing
 end

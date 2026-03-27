@@ -138,6 +138,14 @@ public struct MoodCTX: Sendable {
     public let hoursSinceMood: Double?   // since last event (h)
 }
 
+public struct InsulinCTX: Sendable {
+    public let hourStartUtc: Date
+    public let iob: Double?
+    public let cob: Double?
+    public let recentBolusCount: Int?
+    public let recentCarbEntryCount: Int?
+    public let recentTempBasalCount: Int?
+}
 
 
 

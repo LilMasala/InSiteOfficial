@@ -353,7 +353,7 @@ function _signals(payload::Dict{String, Any}) :: Dict{Symbol, Any}
     )
 end
 
-function _preferences(payload::Dict{String, Any}) :: UserPreferences
+function _preferences(payload::AbstractDict{String, <:Any}) :: UserPreferences
     defaults = UserPreferences()
     raw = get(payload, "preferences", Dict{String, Any}())
     raw isa AbstractDict || throw(ArgumentError("`preferences` must be a JSON object"))
@@ -371,6 +371,18 @@ function _preferences(payload::Dict{String, Any}) :: UserPreferences
         result
     end
 
+    calibration_targets = begin
+        raw_calib = get(raw, "calibration_targets", Dict{String, Any}())
+        raw_calib isa AbstractDict || throw(ArgumentError("`preferences.calibration_targets` must be a JSON object"))
+        result = Dict{String, Float64}()
+        for key in ("recent_tir", "recent_pct_low", "recent_pct_high")
+            v = get(raw_calib, key, nothing)
+            isnothing(v) && continue
+            result[key] = _as_float(v, "preferences.calibration_targets.$key")
+        end
+        result
+    end
+
     return UserPreferences(
         aggressiveness = _as_float(get(raw, "aggressiveness", defaults.aggressiveness), "preferences.aggressiveness"),
         hypoglycemia_fear = _as_float(get(raw, "hypoglycemia_fear", defaults.hypoglycemia_fear), "preferences.hypoglycemia_fear"),
@@ -380,7 +392,8 @@ function _preferences(payload::Dict{String, Any}) :: UserPreferences
             persona isa AbstractString || throw(ArgumentError("`preferences.persona` must be a string"))
             String(persona)
         end,
-        physical_priors = physical_priors
+        physical_priors = physical_priors,
+        calibration_targets = calibration_targets
     )
 end
 

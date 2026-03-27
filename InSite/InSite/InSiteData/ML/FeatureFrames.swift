@@ -62,4 +62,11 @@ public struct FeatureFrameHourly: Sendable {
     public let mood_quad_negPos: Int?
     public let mood_quad_negNeg: Int?
     public let mood_hours_since: Double?
+
+    // Insulin / pump context
+    public let insulin_iob: Double?
+    public let insulin_cob: Double?
+    public let insulin_recent_bolus_count: Int?
+    public let insulin_recent_carb_count: Int?
+    public let insulin_recent_temp_basal_count: Int?
 }

@@ -193,6 +193,13 @@ final class TherapySettingsLogManager {
         cache.sort { $0.timestamp < $1.timestamp }
     }
 
+    func logImportedSnapshot(_ snapshot: TherapySnapshot, uid: String? = Auth.auth().currentUser?.uid) async throws {
+        guard let uid else { return }
+        try logCollection(for: uid).addDocument(from: snapshot)
+        cache.append(snapshot)
+        cache.sort { $0.timestamp < $1.timestamp }
+    }
+
     func getActiveTherapyProfile(at date: Date) async throws -> TherapySnapshot? {
         if let cached = cache.last(where: { $0.timestamp <= date }) {
             return cached

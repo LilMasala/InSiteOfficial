@@ -56,7 +56,7 @@ using Main: AbstractBeliefState, AbstractSimulator, AbstractDomainAdapter,
             KalmanBeliefEstimator, JEPABeliefEstimator, EpistemicState,
             SignalRegistry, register_signal!, initialize_noise
 
-import Main: WorldModule, Cost, Actor, Memory, Perception, Configurator, Twin
+import Main: WorldModule, Cost, Actor, Memory, Perception, Configurator, Twin, calibrate_posterior!
 
 using Main.WorldModule
 using Main.Cost
@@ -238,6 +238,8 @@ function initialize_patient(
     adapter :: Union{AbstractDomainAdapter, Nothing} = nothing,
     weights_dir :: Union{String, Nothing} = nothing
 ) :: ChameliaSystem
+    resolved_adapter = isnothing(adapter) ? Main.InSiteDomainAdapter() : adapter
+
     prior = _build_twin_prior(prefs)
 
     noise = initialize_noise()
@@ -245,6 +247,12 @@ function initialize_patient(
     WorldModule.register_noise!(sim, noise)
 
     posterior = Twin.initialize_posterior(prior)
+
+    # ── Cold-start calibration from self-reported glycemic targets ──────
+    if !isempty(prefs.calibration_targets)
+        calibrate_posterior!(resolved_adapter, posterior, prior, prefs.calibration_targets)
+    end
+
     twin = DigitalTwin(prior, posterior, Float64(std(noise.trust_noise)))
     belief = Perception.initialize_belief(prior, KalmanBeliefEstimator())
 
@@ -257,8 +265,6 @@ function initialize_patient(
     end
 
     encoder, predictor = _load_optional_jepa(weights_dir)
-
-    resolved_adapter = isnothing(adapter) ? Main.InSiteDomainAdapter() : adapter
 
     return ChameliaSystem(
         belief,

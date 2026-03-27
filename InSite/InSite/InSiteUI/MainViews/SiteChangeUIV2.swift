@@ -74,7 +74,7 @@ struct SiteChangeUIV2: View {
                 HStack {
                     Image(systemName: "plus.circle.fill")
                         .imageScale(.medium)
-                    Text("Changed site now")
+                    Text("Change Site")
                         .font(.headline)
                     Spacer()
                     Text(selectedLocationLabel)
