@@ -10,6 +10,7 @@ import torch.nn as nn
 from src.chamelia.actor import Actor
 from src.chamelia.configurator import Configurator
 from src.chamelia.cost import CostModule
+from src.chamelia.hjepa_adapter import forward_hjepa
 from src.chamelia.memory import EpisodeRecord, LatentMemory
 from src.chamelia.plugins.base import AbstractDomain
 from src.models.hjepa import HJEPA
@@ -52,12 +53,38 @@ class Chamelia(nn.Module):
         self.actor = actor
         self.cost = cost
         self.memory = memory
-        self.domain = domain
         self.embed_dim = embed_dim
         self.action_dim = action_dim
         self.num_ctx_tokens = num_ctx_tokens
         self._pending_record_idx: int | None = None
         self._step_counter = 0
+        self.set_domain(domain)
+
+    def set_domain(self, domain: AbstractDomain) -> None:
+        """Attach a runtime domain plugin and register its tokenizer if trainable.
+
+        Args:
+            domain: Active runtime domain.
+
+        Returns:
+            None.
+        """
+        self.domain = domain
+        tokenizer = domain.get_tokenizer()
+        if isinstance(tokenizer, nn.Module):
+            self.domain_tokenizer = tokenizer
+
+    def get_domain_tokenizer(self) -> nn.Module | None:
+        """Return the registered domain tokenizer module if present.
+
+        Args:
+            None.
+
+        Returns:
+            Tokenizer module or ``None``.
+        """
+        tokenizer = getattr(self, "domain_tokenizer", None)
+        return tokenizer if isinstance(tokenizer, nn.Module) else None
 
     def _extract_level_features(self, hjepa_outputs: dict) -> list[torch.Tensor]:
         """Extract per-level FPN features from HJEPA output.
@@ -91,15 +118,18 @@ class Chamelia(nn.Module):
         domain_state: dict,
         actor_mode: str = "mode2",
         store_to_memory: bool = True,
+        input_kind: str = "auto",
     ) -> dict[str, Any]:
         """Run the full Chamelia pipeline.
 
         Args:
-            tokens: Input tensor passed to HJEPA. For image HJEPA this is typically [B, C, H, W].
+            tokens: Input tensor passed to HJEPA. This may be images [B, C, H, W] or
+                pre-embedded tokens [B, N, D] depending on ``input_kind``.
             mask: Binary patch mask [B, N].
             domain_state: Opaque domain-state dict.
             actor_mode: Actor mode string, "mode1" or "mode2".
             store_to_memory: Whether to store the current episode in latent memory.
+            input_kind: ``image``, ``embedded_tokens``, or ``auto``.
 
         Returns:
             Dict containing:
@@ -110,7 +140,7 @@ class Chamelia(nn.Module):
                 - z: [B, D]
                 - hjepa_out: raw HJEPA output dict
         """
-        hjepa_out = self.hjepa(tokens, mask)
+        hjepa_out = forward_hjepa(self.hjepa, tokens, mask, input_kind=input_kind)
         z = self._get_scene_summary(hjepa_out)
         level_feats = self._extract_level_features(hjepa_out)
 
@@ -172,7 +202,12 @@ class Chamelia(nn.Module):
                 device=outcome_tokens.device,
                 dtype=torch.float32,
             )
-            outcome_hjepa = self.hjepa(outcome_tokens, mask=outcome_mask)
+            outcome_hjepa = forward_hjepa(
+                self.hjepa,
+                outcome_tokens,
+                mask=outcome_mask,
+                input_kind="embedded_tokens",
+            )
             outcome_z = self._get_scene_summary(outcome_hjepa)
 
         self.memory.fill_outcome(
@@ -200,4 +235,3 @@ class Chamelia(nn.Module):
         dummy_ctx = torch.zeros(B, self.num_ctx_tokens, self.embed_dim, device=device)
         predicted = self.cost.trainable_critic(keys.to(device), dummy_ctx)
         return self.cost.trainable_critic.compute_critic_loss(predicted, ics.to(device))
-

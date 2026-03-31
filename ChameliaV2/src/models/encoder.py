@@ -614,7 +614,7 @@ class ContextEncoder(nn.Module):
         # Add positional embeddings
         # Note: When using RoPE, absolute embeddings are less critical
         # but we keep them for backward compatibility and hybrid approaches
-        x = x + self.vit.pos_embed
+        x = x + self.vit.pos_embed[:, : x.shape[1], :]
         x = self.vit.pos_drop(x)
 
         # Apply mask if provided (set masked patches to zero)

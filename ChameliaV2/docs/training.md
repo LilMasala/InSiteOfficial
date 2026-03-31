@@ -33,6 +33,45 @@ python scripts/download_datasets.py --dataset cifar10
 ./scripts/train_mps_safe.sh configs/m1_max_optimal_20epoch.yaml
 ```
 
+### 4. Curriculum Setup
+```bash
+# Plan curriculum assets without downloading
+./setup.sh --dry-run --stage 1 --domain basic_arithmetic
+
+# Prepare default assets for selected stages
+./setup.sh --stage 0 --stage 1
+
+# Include optional assets and fail if required selected assets remain unavailable
+./setup.sh --stage 5 --include-optional --strict
+```
+
+This writes a JSON setup report and a shell follow-up file under `artifacts/setup/`.
+
+### 5. Arithmetic Smoke Test
+```bash
+# Quick local check that Chamelia can improve on fixed basic arithmetic
+PYTHONPATH=. ./.venv311/bin/python scripts/train_arithmetic_smoke.py --device cpu
+```
+
+This runs a small fixed Stage 1 arithmetic experiment and exits nonzero if training
+fails to reach the configured improvement thresholds.
+
+### 6. Adaptive Curriculum Training
+```bash
+# Run a bounded adaptive Stage 1 arithmetic training loop
+PYTHONPATH=. ./.venv311/bin/python scripts/train_chamelia.py \
+  --stage 1 \
+  --domain basic_arithmetic \
+  --device cpu \
+  --backbone-mode stub \
+  --lr 3e-3 \
+  --initial-stage-steps 160 \
+  --eval-every 40
+```
+
+This trainer evaluates every `k` steps, stops early if the stage passes, extends the
+budget if metrics are still improving, and performs bounded retunes before failing.
+
 ---
 
 ## Available Configurations

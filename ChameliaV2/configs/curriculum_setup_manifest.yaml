@@ -1,0 +1,468 @@
+version: 1
+root_data_dir: data/curriculum
+
+install_modes:
+  default: "Fetch automatically in setup.sh and fail only if the stage is enabled and the asset is missing."
+  optional: "Fetch only when setup.sh is invoked with an include-optional flag."
+  manual: "Never auto-fetch; create the destination and ingest only if the user has manually placed the file."
+  gated: "Requires credentials or license/terms acceptance; setup.sh should soft-skip unless explicitly enabled."
+  generated: "No remote fetch; generated locally during preprocessing or self-play."
+
+setup_policies:
+  hard_fail_if_stage_enabled: "Abort setup only when the stage/domain is explicitly enabled and the asset is required."
+  soft_skip: "Skip cleanly and mark unavailable in the setup report."
+
+assets:
+  - key: roberta_base
+    stage: 0
+    domains: [language]
+    kind: model_weights
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_model
+    source_url: https://huggingface.co/FacebookAI/roberta-base
+    destination: artifacts/models/roberta-base
+    estimated_size_gb: 0.5
+    consumers:
+      - src/chamelia/chamelia.py
+      - training/curriculum/domains/stage0_language.py
+    notes: "Stage 0 encoder initialization target from the curriculum spec."
+
+  - key: wikipedia_multilingual
+    stage: 0
+    domains: [language]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: http_mirror
+    source_url: https://dumps.wikimedia.org/
+    destination: data/curriculum/stage0/wikipedia
+    estimated_size_gb: 50.0
+    consumers:
+      - training/curriculum/domains/stage0_language.py
+      - training/curriculum/data/preprocessors.py
+    notes: "Top 15 languages by article count; preserve document context before sentence chunking."
+
+  - key: project_gutenberg
+    stage: 0
+    domains: [language]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: http_catalog
+    source_url: https://www.gutenberg.org/ebooks/offline_catalogs.html
+    destination: data/curriculum/stage0/gutenberg
+    estimated_size_gb: 5.0
+    consumers:
+      - training/curriculum/domains/stage0_language.py
+      - training/curriculum/data/preprocessors.py
+    notes: "Narrative and causal structure corpus."
+
+  - key: xnli
+    stage: 0
+    domains: [language]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/facebook/xnli
+    destination: data/curriculum/stage0/xnli
+    estimated_size_gb: 0.5
+    consumers:
+      - training/curriculum/domains/stage0_language.py
+      - training/curriculum/probes/semantic_probe.py
+    notes: "Cross-lingual transfer and conceptual alignment."
+
+  - key: pmc_open_access
+    stage: 0
+    domains: [language, medical_knowledge, clinical_reasoning]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: ftp_or_http
+    source_url: https://pmc.ncbi.nlm.nih.gov/tools/openftlist/
+    destination: data/curriculum/stage0/pmc_open_access
+    estimated_size_gb: 20.0
+    consumers:
+      - training/curriculum/domains/stage0_language.py
+      - training/curriculum/domains/stage5_health.py
+      - training/curriculum/data/preprocessors.py
+    notes: "Filter to endocrinology, chronic disease management, clinical reasoning, patient outcomes, and quality-of-life text."
+
+  - key: the_stack
+    stage: 0
+    domains: [language, code_reasoning]
+    kind: dataset
+    install_mode: optional
+    setup_policy: soft_skip
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/bigcode/the-stack
+    destination: data/curriculum/stage0/the_stack
+    estimated_size_gb: 25.0
+    consumers:
+      - training/curriculum/domains/stage0_language.py
+      - training/curriculum/domains/stage1_reasoning.py
+    notes: "Terms acceptance required; use Python and Julia subsets first."
+
+  - key: cecil_textbook_pdf
+    stage: 0
+    domains: [medical_knowledge, clinical_reasoning]
+    kind: manual_corpus
+    install_mode: manual
+    setup_policy: soft_skip
+    fetch_method: manual_drop
+    source_url: https://grupomedicina.wordpress.com/wp-content/uploads/2011/09/cecil-textbook-of-medicine.pdf
+    destination: data/manual/medical_texts/cecil-textbook-of-medicine.pdf
+    estimated_size_gb: 0.2
+    consumers:
+      - training/curriculum/domains/stage0_language.py
+      - training/curriculum/domains/stage5_health.py
+    notes: "Manual-review source only. Do not auto-download in setup.sh."
+
+  - key: basic_arithmetic_generated
+    stage: 1
+    domains: [basic_arithmetic]
+    kind: generated_dataset
+    install_mode: generated
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: local_generator
+    source_url: local://training/curriculum/generators/logic_gen.py
+    destination: data/curriculum/stage1/basic_arithmetic
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+      - training/curriculum/generators/logic_gen.py
+    notes: "No external download; generate examples during preprocessing."
+
+  - key: agieval
+    stage: 1
+    domains: [lsat, sat_reasoning]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/RUCAIBox/agieval
+    destination: data/curriculum/stage1/agieval
+    estimated_size_gb: 0.2
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+      - training/curriculum/probes/reasoning_probe.py
+    notes: "Primary open LSAT source. Use lsat-ar, lsat-lr, lsat-rc, plus SAT subsets as auxiliary reasoning MCQs."
+
+  - key: gsm8k
+    stage: 1
+    domains: [basic_arithmetic, math_competition, arithmetic_word]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/openai/gsm8k
+    destination: data/curriculum/stage1/gsm8k
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+      - training/curriculum/domains/stage2_patterns.py
+    notes: "Word-problem reasoning bridge between simple arithmetic and structured pattern tasks."
+
+  - key: hendrycks_math
+    stage: 1
+    domains: [math_competition]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/EleutherAI/hendrycks_math
+    destination: data/curriculum/stage1/hendrycks_math
+    estimated_size_gb: 1.0
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+      - training/curriculum/probes/reasoning_probe.py
+    notes: "Competition-style math and proof pressure."
+
+  - key: logiqa2
+    stage: 1
+    domains: [formal_logic]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/baber/logiqa2
+    destination: data/curriculum/stage1/logiqa2
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+      - training/curriculum/probes/reasoning_probe.py
+    notes: "Formal and natural-language logic benchmark."
+
+  - key: proofwriter
+    stage: 1
+    domains: [formal_logic]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/tasksource/proofwriter
+    destination: data/curriculum/stage1/proofwriter
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+      - training/curriculum/probes/reasoning_probe.py
+    notes: "Symbolic entailment and proof-style reasoning."
+
+  - key: folio
+    stage: 1
+    domains: [formal_logic]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/tasksource/folio
+    destination: data/curriculum/stage1/folio
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+      - training/curriculum/probes/reasoning_probe.py
+    notes: "First-order logic reasoning dataset."
+
+  - key: open_platypus
+    stage: 1
+    domains: [lsat, math_competition, code_reasoning]
+    kind: dataset
+    install_mode: optional
+    setup_policy: soft_skip
+    fetch_method: huggingface_dataset
+    source_url: https://huggingface.co/datasets/garage-bAInd/Open-Platypus
+    destination: data/curriculum/stage1/open_platypus
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage1_reasoning.py
+    notes: "Supplemental reasoning mix only. Contains mixed-license upstream components, including non-commercial sources."
+
+  - key: oeis
+    stage: 2
+    domains: [oeis_sequences]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: http_download
+    source_url: https://oeis.org/wiki/Download
+    destination: data/curriculum/stage2/oeis
+    estimated_size_gb: 2.0
+    consumers:
+      - training/curriculum/domains/stage2_patterns.py
+      - training/curriculum/probes/pattern_probe.py
+    notes: "Integer sequences and formula metadata."
+
+  - key: arc_agi_2
+    stage: 2
+    domains: [arc_tasks]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: git_or_http
+    source_url: https://github.com/arcprize/ARC-AGI-2
+    destination: data/curriculum/stage2/arc_agi_2
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage2_patterns.py
+      - training/curriculum/generators/gridworld_gen.py
+    notes: "Grid abstraction and transformation reasoning."
+
+  - key: synthetic_regimes
+    stage: 2
+    domains: [hmm_sequences, ecological_timeseries, financial_timeseries, csp, gridworld]
+    kind: generated_dataset
+    install_mode: generated
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: local_generator
+    source_url: local://training/curriculum/generators/sequence_gen.py
+    destination: data/curriculum/stage2/generated
+    estimated_size_gb: 0.2
+    consumers:
+      - training/curriculum/domains/stage2_patterns.py
+      - training/curriculum/generators/sequence_gen.py
+      - training/curriculum/generators/gridworld_gen.py
+    notes: "Generate HMM, regime-shift, CSP, and synthetic multivariate trajectories locally."
+
+  - key: stockfish
+    stage: 3
+    domains: [chess]
+    kind: engine
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: binary_release
+    source_url: https://stockfishchess.org/download/
+    destination: artifacts/engines/stockfish
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage3_games.py
+      - training/curriculum/generators/chess_env.py
+      - training/curriculum/probes/game_probe.py
+    notes: "Required for supervised eval targets and graduation probes."
+
+  - key: lichess_db
+    stage: 3
+    domains: [chess]
+    kind: dataset
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: http_download
+    source_url: https://database.lichess.org/
+    destination: data/curriculum/stage3/chess/lichess
+    estimated_size_gb: 100.0
+    consumers:
+      - training/curriculum/domains/stage3_games.py
+      - training/curriculum/generators/chess_env.py
+    notes: "Use recent standard, puzzle, and elite subsets first to control footprint."
+
+  - key: katago
+    stage: 3
+    domains: [go]
+    kind: engine
+    install_mode: optional
+    setup_policy: soft_skip
+    fetch_method: binary_release
+    source_url: https://github.com/lightvector/KataGo/releases
+    destination: artifacts/engines/katago
+    estimated_size_gb: 1.0
+    consumers:
+      - training/curriculum/domains/stage3_games.py
+    notes: "Open Go engine. Pair with locally generated self-play until a vetted SGF corpus is selected."
+
+  - key: openspiel
+    stage: 3
+    domains: [poker, gridworld, collab_selfplay]
+    kind: framework
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: git_repo
+    source_url: https://github.com/google-deepmind/open_spiel
+    destination: external/open_spiel
+    estimated_size_gb: 1.0
+    consumers:
+      - training/curriculum/domains/stage3_games.py
+      - training/curriculum/domains/stage4_collaborative.py
+      - training/curriculum/generators/poker_env.py
+      - training/curriculum/generators/collab_env.py
+    notes: "Primary open framework for poker and multi-agent curriculum tasks."
+
+  - key: collaborative_selfplay
+    stage: 4
+    domains: [collab_selfplay]
+    kind: generated_dataset
+    install_mode: generated
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: local_generator
+    source_url: local://training/curriculum/generators/collab_env.py
+    destination: data/curriculum/stage4/generated
+    estimated_size_gb: 0.5
+    consumers:
+      - training/curriculum/domains/stage4_collaborative.py
+      - training/curriculum/generators/collab_env.py
+    notes: "Self-play and partner-modeling traces generated locally."
+
+  - key: meds_tooling
+    stage: 5
+    domains: [medical_knowledge, clinical_reasoning, synthetic_patients, t1d_specific]
+    kind: framework
+    install_mode: default
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: git_repo
+    source_url: https://github.com/Medical-Event-Data-Standard/meds
+    destination: external/meds
+    estimated_size_gb: 0.1
+    consumers:
+      - training/curriculum/domains/stage5_health.py
+      - training/curriculum/data/preprocessors.py
+    notes: "MEDS tooling for event-sequence health data normalization."
+
+  - key: mimic_iv_demo_meds
+    stage: 5
+    domains: [medical_knowledge, clinical_reasoning]
+    kind: dataset
+    install_mode: default
+    setup_policy: soft_skip
+    fetch_method: physionet_demo
+    source_url: https://physionet.org/content/mimic-iv-demo-meds/0.0.1/
+    destination: data/curriculum/stage5/mimic_iv_demo_meds
+    estimated_size_gb: 0.5
+    consumers:
+      - training/curriculum/domains/stage5_health.py
+      - training/curriculum/data/preprocessors.py
+    notes: "Open demo corpus for development; not a substitute for full credentialed MIMIC."
+
+  - key: mimic_iv_full
+    stage: 5
+    domains: [medical_knowledge, clinical_reasoning]
+    kind: gated_dataset
+    install_mode: gated
+    setup_policy: soft_skip
+    fetch_method: physionet_credentialed
+    source_url: https://physionet.org/content/mimiciv/3.1/
+    destination: data/curriculum/stage5/mimic_iv_full
+    estimated_size_gb: 250.0
+    consumers:
+      - training/curriculum/domains/stage5_health.py
+      - training/curriculum/data/preprocessors.py
+    notes: "Use only if PhysioNet credentials and DUA are in place."
+
+  - key: scibert
+    stage: 5
+    domains: [medical_knowledge, clinical_reasoning]
+    kind: model_weights
+    install_mode: optional
+    setup_policy: soft_skip
+    fetch_method: huggingface_model
+    source_url: https://huggingface.co/allenai/scibert_scivocab_uncased
+    destination: artifacts/models/scibert
+    estimated_size_gb: 0.5
+    consumers:
+      - training/curriculum/domains/stage5_health.py
+    notes: "Optional scientific text encoder initialization or probe backbone."
+
+  - key: biomedbert
+    stage: 5
+    domains: [medical_knowledge, clinical_reasoning]
+    kind: model_weights
+    install_mode: optional
+    setup_policy: soft_skip
+    fetch_method: huggingface_model
+    source_url: https://huggingface.co/microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext
+    destination: artifacts/models/biomedbert
+    estimated_size_gb: 0.5
+    consumers:
+      - training/curriculum/domains/stage5_health.py
+    notes: "Optional biomedical-language initialization for Stage 5 ablations."
+
+  - key: synthetic_patients
+    stage: 5
+    domains: [synthetic_patients, t1d_specific, care_ethics]
+    kind: generated_dataset
+    install_mode: generated
+    setup_policy: hard_fail_if_stage_enabled
+    fetch_method: local_generator
+    source_url: local://training/curriculum/generators/health_sim.py
+    destination: data/curriculum/stage5/synthetic_patients
+    estimated_size_gb: 1.0
+    consumers:
+      - training/curriculum/domains/stage5_health.py
+      - training/curriculum/generators/health_sim.py
+      - training/curriculum/probes/health_probe.py
+    notes: "Primary Stage 5 runtime path until richer clinical data integrations are enabled."
+
+unresolved_domains:
+  - domain: gre
+    current_status: "No vetted open dataset chosen yet."
+    fallback: "Use AGIEval LSAT/SAT plus LogiQA2 and ProofWriter until a GRE-specific source is added."
+  - domain: mcat_cars
+    current_status: "No vetted open dataset chosen yet."
+    fallback: "Use PMC OA reasoning passages and medical vignettes as a proxy."
+  - domain: go
+    current_status: "Engine selected, corpus not yet selected."
+    fallback: "Use KataGo plus locally generated self-play."
+  - domain: patient_doctor_dialogue
+    current_status: "No curated open corpus selected yet."
+    fallback: "Derive synthetic dialogue and filtered case-style text from PMC OA and local generators."
+  - domain: care_ethics
+    current_status: "No dedicated open benchmark selected yet."
+    fallback: "Use synthetic cases and locally authored evaluation sets."

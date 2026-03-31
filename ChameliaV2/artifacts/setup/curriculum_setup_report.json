@@ -1,0 +1,106 @@
+{
+  "manifest_path": "/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/configs/curriculum_setup_manifest.yaml",
+  "strict": true,
+  "dry_run": true,
+  "selected_assets": [
+    {
+      "key": "basic_arithmetic_generated",
+      "stage": 1,
+      "domains": [
+        "basic_arithmetic"
+      ],
+      "kind": "generated_dataset",
+      "install_mode": "generated",
+      "setup_policy": "hard_fail_if_stage_enabled",
+      "fetch_method": "local_generator",
+      "source_url": "local://training/curriculum/generators/logic_gen.py",
+      "destination": "data/curriculum/stage1/basic_arithmetic",
+      "estimated_size_gb": 0.1,
+      "consumers": [
+        "training/curriculum/domains/stage1_reasoning.py",
+        "training/curriculum/generators/logic_gen.py"
+      ],
+      "notes": "No external download; generate examples during preprocessing."
+    },
+    {
+      "key": "gsm8k",
+      "stage": 1,
+      "domains": [
+        "basic_arithmetic",
+        "math_competition",
+        "arithmetic_word"
+      ],
+      "kind": "dataset",
+      "install_mode": "default",
+      "setup_policy": "hard_fail_if_stage_enabled",
+      "fetch_method": "huggingface_dataset",
+      "source_url": "https://huggingface.co/datasets/openai/gsm8k",
+      "destination": "data/curriculum/stage1/gsm8k",
+      "estimated_size_gb": 0.1,
+      "consumers": [
+        "training/curriculum/domains/stage1_reasoning.py",
+        "training/curriculum/domains/stage2_patterns.py"
+      ],
+      "notes": "Word-problem reasoning bridge between simple arithmetic and structured pattern tasks."
+    }
+  ],
+  "results": [
+    {
+      "key": "basic_arithmetic_generated",
+      "stage": 1,
+      "status": "generated_ready",
+      "install_mode": "generated",
+      "fetch_method": "local_generator",
+      "destination": "/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/data/curriculum/stage1/basic_arithmetic",
+      "source_url": "local://training/curriculum/generators/logic_gen.py",
+      "domains": [
+        "basic_arithmetic"
+      ],
+      "notes": "No external download; generate examples during preprocessing.",
+      "followup_hint": "Generated locally into /Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/data/curriculum/stage1/basic_arithmetic"
+    },
+    {
+      "key": "gsm8k",
+      "stage": 1,
+      "status": "planned_fetch",
+      "install_mode": "default",
+      "fetch_method": "huggingface_dataset",
+      "destination": "/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/data/curriculum/stage1/gsm8k",
+      "source_url": "https://huggingface.co/datasets/openai/gsm8k",
+      "domains": [
+        "basic_arithmetic",
+        "math_competition",
+        "arithmetic_word"
+      ],
+      "notes": "Word-problem reasoning bridge between simple arithmetic and structured pattern tasks.",
+      "followup_hint": "huggingface-cli download --repo-type dataset openai/gsm8k --local-dir /Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/data/curriculum/stage1/gsm8k"
+    }
+  ],
+  "unresolved_domains": [
+    {
+      "domain": "gre",
+      "current_status": "No vetted open dataset chosen yet.",
+      "fallback": "Use AGIEval LSAT/SAT plus LogiQA2 and ProofWriter until a GRE-specific source is added."
+    },
+    {
+      "domain": "mcat_cars",
+      "current_status": "No vetted open dataset chosen yet.",
+      "fallback": "Use PMC OA reasoning passages and medical vignettes as a proxy."
+    },
+    {
+      "domain": "go",
+      "current_status": "Engine selected, corpus not yet selected.",
+      "fallback": "Use KataGo plus locally generated self-play."
+    },
+    {
+      "domain": "patient_doctor_dialogue",
+      "current_status": "No curated open corpus selected yet.",
+      "fallback": "Derive synthetic dialogue and filtered case-style text from PMC OA and local generators."
+    },
+    {
+      "domain": "care_ethics",
+      "current_status": "No dedicated open benchmark selected yet.",
+      "fallback": "Use synthetic cases and locally authored evaluation sets."
+    }
+  ]
+}

@@ -14,6 +14,7 @@ from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
 from src.chamelia.memory import EpisodeRecord, LatentMemory
 from src.chamelia.plugins.base import AbstractDomain, DomainRegistry
 from src.chamelia.tokenizers import SequenceTokenizer
+from src.models.hjepa import HJEPA
 
 
 class DummyHJEPA(nn.Module):
@@ -297,3 +298,110 @@ def test_chamelia_pipeline_shapes() -> None:
     assert critic_loss is not None
     assert critic_loss.dim() == 0
 
+
+def test_chamelia_with_real_hjepa_backbone() -> None:
+    """Run a lightweight integration pass using the real HJEPA backbone.
+
+    This smoke test uses the backbone at its natural tiny-ViT dimension to verify that
+    Chamelia can assemble around the real model without relying on the lightweight stub.
+
+    Returns:
+        None.
+    """
+    torch.manual_seed(0)
+
+    embed_dim = 192
+    num_ctx_tokens = 4
+    action_dim = 8
+
+    domain = DummyDomain(embed_dim=64, action_dim=action_dim)
+    DomainRegistry.register(domain)
+
+    hjepa = HJEPA(
+        encoder_type="vit_tiny_patch16_224",
+        img_size=224,
+        embed_dim=embed_dim,
+        predictor_depth=1,
+        predictor_num_heads=3,
+        predictor_mlp_ratio=2.0,
+        num_hierarchies=3,
+        pretrained=False,
+        drop_path_rate=0.0,
+        use_fpn=True,
+        fpn_feature_dim=embed_dim,
+        use_gradient_checkpointing=False,
+        use_layerscale=False,
+        use_flash_attention=False,
+    )
+    hjepa.eval()
+
+    configurator = Configurator(
+        embed_dim=embed_dim,
+        num_ctx_tokens=num_ctx_tokens,
+        num_heads=3,
+        num_layers=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        memory_read_k=4,
+    )
+    actor = Actor(
+        embed_dim=embed_dim,
+        action_dim=action_dim,
+        num_heads=3,
+        num_layers=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        num_ctx_tokens=num_ctx_tokens,
+    )
+    cost_fns, weights = zip(*domain.get_intrinsic_cost_fns(), strict=False)
+    intrinsic_cost = IntrinsicCost(list(cost_fns), list(weights))
+    critic = TrainableCritic(
+        embed_dim=embed_dim,
+        num_heads=3,
+        num_layers=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        num_ctx_tokens=num_ctx_tokens,
+        horizon=5,
+    )
+    cost_module = CostModule(intrinsic_cost=intrinsic_cost, trainable_critic=critic)
+    memory = LatentMemory(embed_dim=embed_dim, max_episodes=8, retrieval_k=4, device="cpu")
+
+    model = Chamelia(
+        hjepa=hjepa,
+        configurator=configurator,
+        actor=actor,
+        cost=cost_module,
+        memory=memory,
+        domain=domain,
+        embed_dim=embed_dim,
+        action_dim=action_dim,
+        num_ctx_tokens=num_ctx_tokens,
+    )
+    model.eval()
+
+    images = torch.randn(1, 3, 224, 224)
+    mask = torch.zeros(1, 196, dtype=torch.float32)
+    mask[:, :8] = 1.0
+    domain_state = {"bonus": torch.zeros(1)}
+
+    with torch.no_grad():
+        outputs = model(
+            tokens=images,
+            mask=mask,
+            domain_state=domain_state,
+            actor_mode="mode2",
+            store_to_memory=False,
+        )
+
+    level_feats = model._extract_level_features(outputs["hjepa_out"])
+
+    assert outputs["z"].shape == (1, embed_dim)
+    assert outputs["ctx_tokens"].shape == (1, num_ctx_tokens, embed_dim)
+    assert outputs["action_vec"].shape == (1, action_dim)
+    assert outputs["cost"]["total"].shape == (1,)
+    assert outputs["hjepa_out"]["target_features"].shape == (1, 197, embed_dim)
+    assert len(level_feats) == 3
+    assert level_feats[0].shape == (1, 196, embed_dim)
+    assert level_feats[1].shape == (1, 98, embed_dim)
+    assert level_feats[2].shape == (1, 49, embed_dim)

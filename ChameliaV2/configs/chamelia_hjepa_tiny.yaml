@@ -1,0 +1,46 @@
+# Tiny real-HJEPA config for local curriculum training/debug.
+
+model:
+  encoder_type: "vit_tiny_patch16_224"
+  img_size: 224
+  embed_dim: 192
+  num_hierarchies: 3
+  use_fpn: true
+  fpn_fusion_method: "add"
+  use_gradient_checkpointing: false
+  use_layerscale: false
+  use_flash_attention: false
+  predictor_depth: 1
+  predictor_num_heads: 3
+  predictor_mlp_ratio: 2.0
+
+  configurator:
+    num_ctx_tokens: 4
+    num_heads: 3
+    num_layers: 1
+    mlp_ratio: 2.0
+    dropout: 0.0
+    memory_read_k: 4
+
+  actor:
+    num_heads: 3
+    num_layers: 1
+    mlp_ratio: 2.0
+    dropout: 0.0
+
+  cost:
+    critic_num_heads: 3
+    critic_num_layers: 1
+    critic_mlp_ratio: 2.0
+    critic_dropout: 0.0
+    critic_horizon: 5
+
+  memory:
+    max_episodes: 16
+    retrieval_k: 4
+    device: "cpu"
+
+training:
+  optimizer: "adam"
+  weight_decay: 0.0
+  learning_rate: 1.0e-3
