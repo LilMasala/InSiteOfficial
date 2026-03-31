@@ -1,0 +1,451 @@
+"""
+k-Nearest Neighbors (k-NN) evaluation for H-JEPA.
+
+k-NN evaluation is a common protocol for self-supervised learning that measures
+feature quality without any training. It classifies test samples based on their
+nearest neighbors in the training set.
+"""
+
+import logging
+from typing import Any
+
+import numpy as np
+import numpy.typing as npt
+import torch
+import torch.nn as nn
+from sklearn.metrics import accuracy_score, top_k_accuracy_score
+from sklearn.neighbors import NearestNeighbors
+from torch.utils.data import DataLoader
+
+from .feature_extraction import extract_features as _extract_features
+
+logger = logging.getLogger(__name__)
+
+
+class KNNEvaluator:
+    """
+    k-Nearest Neighbors evaluator for frozen features.
+
+    Args:
+        model: H-JEPA model (will be frozen)
+        hierarchy_level: Which hierarchy level to evaluate (0=finest)
+        k: Number of neighbors to consider
+        distance_metric: Distance metric ('cosine', 'euclidean', 'minkowski')
+        pooling: Feature pooling method ('mean', 'max')
+        temperature: Temperature for distance weighting (lower = sharper)
+        device: Device to run on
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        hierarchy_level: int = 0,
+        k: int = 20,
+        distance_metric: str = "cosine",
+        pooling: str = "mean",
+        temperature: float = 0.07,
+        device: str = "cuda",
+    ):
+        self.model = model
+        self.hierarchy_level = hierarchy_level
+        self.k = k
+        self.distance_metric = distance_metric
+        self.pooling = pooling
+        self.temperature = temperature
+        self.device = device
+
+        # Freeze model
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # Will store training features and labels
+        self.train_features: npt.NDArray[np.float64] | None = None
+        self.train_labels: npt.NDArray[np.int64] | None = None
+        self.knn_index: NearestNeighbors | None = None
+
+    def pool_features(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Pool patch features to single vector.
+
+        Args:
+            features: Features [B, N, D] or [B, D]
+
+        Returns:
+            Pooled features [B, D]
+        """
+        if features.ndim == 2:
+            return features
+
+        if self.pooling == "mean":
+            return features.mean(dim=1)
+        elif self.pooling == "max":
+            return features.max(dim=1)[0]
+        else:
+            raise ValueError(f"Unknown pooling method: {self.pooling}")
+
+    @torch.no_grad()
+    def extract_features(
+        self, dataloader: DataLoader[Any], normalize: bool = True, desc: str = "Extracting features"
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int64]]:
+        """
+        Extract and pool features from dataset.
+
+        Args:
+            dataloader: DataLoader for the dataset
+            normalize: Whether to L2 normalize features
+            desc: Progress bar description
+
+        Returns:
+            Tuple of (features, labels) as numpy arrays
+        """
+        return _extract_features(
+            model=self.model,
+            dataloader=dataloader,
+            hierarchy_level=self.hierarchy_level,
+            device=self.device,
+            pool=True,
+            pooling=self.pooling,
+            normalize=normalize,
+            desc=desc,
+        )
+
+    def build_knn_index(
+        self,
+        train_loader: DataLoader[Any],
+        normalize: bool = True,
+    ) -> None:
+        """
+        Build k-NN index from training data.
+
+        Args:
+            train_loader: Training data loader
+            normalize: Whether to normalize features
+        """
+        # Extract training features
+        self.train_features, self.train_labels = self.extract_features(
+            train_loader, normalize=normalize, desc="Building k-NN index"
+        )
+
+        # Build k-NN index
+        metric = self.distance_metric
+        if metric == "cosine":
+            # For cosine similarity with normalized features, use euclidean
+            # distance (equivalent after normalization)
+            metric = "euclidean" if normalize else "cosine"
+
+        self.knn_index = NearestNeighbors(
+            n_neighbors=self.k,
+            metric=metric,
+            algorithm="auto",
+            n_jobs=-1,  # Use all CPU cores
+        )
+        self.knn_index.fit(self.train_features)
+
+        logger.info("Built k-NN index with %d samples", len(self.train_features))
+
+    def predict(
+        self,
+        test_features: npt.NDArray[np.float64],
+        num_classes: int,
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.float64]]:
+        """
+        Predict labels using k-NN.
+
+        Args:
+            test_features: Test features [N, D]
+            num_classes: Number of classes
+
+        Returns:
+            Tuple of (predictions, prediction_probs) [N] and [N, num_classes]
+        """
+        if self.knn_index is None or self.train_labels is None:
+            raise RuntimeError("k-NN index not built. Call build_knn_index first.")
+
+        # Find k nearest neighbors
+        distances, indices = self.knn_index.kneighbors(test_features)
+
+        # Get labels of neighbors
+        neighbor_labels = self.train_labels[indices]  # [N, k]
+
+        # Weight by distance (closer neighbors have more weight)
+        # Convert distances to similarities
+        if self.distance_metric == "cosine" and self.temperature > 0:
+            # For cosine: similarity = 1 - distance
+            # Then apply softmax with temperature
+            similarities = 1 - distances
+            weights = np.exp(similarities / self.temperature)
+        else:
+            # For euclidean: use negative distance
+            weights = np.exp(-distances / self.temperature)
+
+        # Normalize weights
+        weights = weights / weights.sum(axis=1, keepdims=True)
+
+        # Weighted voting
+        prediction_probs = np.zeros((len(test_features), num_classes))
+
+        for i in range(len(test_features)):
+            for j in range(self.k):
+                label = neighbor_labels[i, j]
+                prediction_probs[i, label] += weights[i, j]
+
+        # Get predictions
+        predictions = np.argmax(prediction_probs, axis=1)
+
+        return predictions, prediction_probs
+
+    def evaluate(
+        self,
+        test_loader: DataLoader[Any],
+        num_classes: int,
+        normalize: bool = True,
+        top_k_list: list[int] = [1, 5],
+        verbose: bool = True,
+    ) -> dict[str, float]:
+        """
+        Evaluate k-NN classifier on test set.
+
+        Args:
+            test_loader: Test data loader
+            num_classes: Number of classes
+            normalize: Whether to normalize features
+            top_k_list: List of k values for top-k accuracy
+            verbose: Whether to show progress
+
+        Returns:
+            Dictionary with metrics
+        """
+        if self.knn_index is None or self.train_labels is None:
+            raise RuntimeError("k-NN index not built. Call build_knn_index first.")
+
+        # Extract test features
+        test_features, test_labels = self.extract_features(
+            test_loader, normalize=normalize, desc="Extracting test features"
+        )
+
+        # Predict
+        predictions, prediction_probs = self.predict(test_features, num_classes)
+
+        # Compute metrics
+        accuracy = accuracy_score(test_labels, predictions) * 100
+
+        metrics = {
+            "accuracy": accuracy,
+            "top_1_accuracy": accuracy,  # Same as accuracy
+        }
+
+        # Top-k accuracies
+        for k in top_k_list:
+            if k > 1:
+                top_k_acc = (
+                    top_k_accuracy_score(test_labels, prediction_probs, k=min(k, num_classes)) * 100
+                )
+                metrics[f"top_{k}_accuracy"] = top_k_acc
+
+        if verbose:
+            logger.info("k-NN Evaluation Results (k=%d):", self.k)
+            logger.info("  Accuracy: %.2f%%", accuracy)
+            for k in top_k_list:
+                if k > 1 and f"top_{k}_accuracy" in metrics:
+                    logger.info("  Top-%d Accuracy: %.2f%%", k, metrics[f"top_{k}_accuracy"])
+
+        return metrics
+
+    def evaluate_multiple_k(
+        self,
+        test_loader: DataLoader[Any],
+        num_classes: int,
+        k_values: list[int] = [1, 5, 10, 20, 50, 100, 200],
+        normalize: bool = True,
+        verbose: bool = True,
+    ) -> dict[int, dict[str, float]]:
+        """
+        Evaluate k-NN with different k values.
+
+        Args:
+            test_loader: Test data loader
+            num_classes: Number of classes
+            k_values: List of k values to try
+            normalize: Whether to normalize features
+            verbose: Whether to show progress
+
+        Returns:
+            Dictionary mapping k to metrics
+        """
+        # Extract test features once
+        test_features, test_labels = self.extract_features(
+            test_loader, normalize=normalize, desc="Extracting test features"
+        )
+
+        results: dict[int, dict[str, float]] = {}
+
+        for k in k_values:
+            if self.train_features is None or k > len(self.train_features):
+                if verbose:
+                    logger.info("Skipping k=%d (larger than training set size)", k)
+                continue
+
+            # Update k-NN index with new k
+            if self.knn_index is not None:
+                self.knn_index.n_neighbors = k
+            self.k = k
+
+            # Predict
+            predictions, prediction_probs = self.predict(test_features, num_classes)
+
+            # Compute accuracy
+            accuracy = accuracy_score(test_labels, predictions) * 100
+
+            results[k] = {
+                "accuracy": accuracy,
+                "top_1_accuracy": accuracy,
+            }
+
+            if verbose:
+                logger.info("k=%3d: Accuracy = %.2f%%", k, accuracy)
+
+        return results
+
+
+def knn_eval(
+    model: nn.Module,
+    train_loader: DataLoader[Any],
+    test_loader: DataLoader[Any],
+    num_classes: int,
+    hierarchy_level: int = 0,
+    k: int = 20,
+    distance_metric: str = "cosine",
+    temperature: float = 0.07,
+    device: str = "cuda",
+    verbose: bool = True,
+) -> dict[str, float]:
+    """
+    Convenience function for k-NN evaluation.
+
+    Args:
+        model: H-JEPA model
+        train_loader: Training data loader
+        test_loader: Test data loader
+        num_classes: Number of classes
+        hierarchy_level: Which hierarchy level to evaluate
+        k: Number of neighbors
+        distance_metric: Distance metric
+        temperature: Temperature for distance weighting
+        device: Device to run on
+        verbose: Whether to show progress
+
+    Returns:
+        Evaluation metrics
+    """
+    evaluator = KNNEvaluator(
+        model=model,
+        hierarchy_level=hierarchy_level,
+        k=k,
+        distance_metric=distance_metric,
+        temperature=temperature,
+        device=device,
+    )
+
+    # Build index
+    evaluator.build_knn_index(train_loader)
+
+    # Evaluate
+    metrics = evaluator.evaluate(
+        test_loader=test_loader,
+        num_classes=num_classes,
+        verbose=verbose,
+    )
+
+    return metrics
+
+
+def sweep_knn_params(
+    model: nn.Module,
+    train_loader: DataLoader[Any],
+    test_loader: DataLoader[Any],
+    num_classes: int,
+    hierarchy_level: int = 0,
+    k_values: list[int] = [10, 20, 50, 100, 200],
+    temperatures: list[float] = [0.01, 0.05, 0.07, 0.1, 0.5],
+    distance_metrics: list[str] = ["cosine", "euclidean"],
+    device: str = "cuda",
+) -> dict[str, Any]:
+    """
+    Sweep over k-NN hyperparameters to find best configuration.
+
+    Args:
+        model: H-JEPA model
+        train_loader: Training data loader
+        test_loader: Test data loader
+        num_classes: Number of classes
+        hierarchy_level: Which hierarchy level to evaluate
+        k_values: List of k values to try
+        temperatures: List of temperatures to try
+        distance_metrics: List of distance metrics to try
+        device: Device to run on
+
+    Returns:
+        Dictionary with results for each configuration
+    """
+    results: dict[str, Any] = {}
+    best_acc = 0.0
+    best_config: str | None = None
+
+    logger.info("Sweeping k-NN hyperparameters...")
+    logger.info("k values: %s", k_values)
+    logger.info("Temperatures: %s", temperatures)
+    logger.info("Distance metrics: %s", distance_metrics)
+
+    for metric in distance_metrics:
+        for temp in temperatures:
+            for k in k_values:
+                config_name = f"{metric}_k{k}_t{temp}"
+
+                logger.info("Testing %s...", config_name)
+
+                try:
+                    evaluator = KNNEvaluator(
+                        model=model,
+                        hierarchy_level=hierarchy_level,
+                        k=k,
+                        distance_metric=metric,
+                        temperature=temp,
+                        device=device,
+                    )
+
+                    evaluator.build_knn_index(train_loader)
+                    metrics = evaluator.evaluate(
+                        test_loader=test_loader,
+                        num_classes=num_classes,
+                        verbose=False,
+                    )
+
+                    results[config_name] = {
+                        "config": {
+                            "k": k,
+                            "temperature": temp,
+                            "distance_metric": metric,
+                        },
+                        "metrics": metrics,
+                    }
+
+                    acc = metrics["accuracy"]
+                    logger.info("  Accuracy: %.2f%%", acc)
+
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_config = config_name
+
+                except (RuntimeError, ValueError) as e:
+                    logger.error("  Error: %s", e)
+                    continue
+
+    if best_config is not None:
+        logger.info("Best configuration: %s", best_config)
+        logger.info("Best accuracy: %.2f%%", best_acc)
+        logger.info("Config: %s", results[best_config]["config"])
+    else:
+        logger.info("No successful configurations found.")
+
+    return results
