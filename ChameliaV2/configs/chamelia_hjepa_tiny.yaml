@@ -44,3 +44,14 @@ training:
   optimizer: "adam"
   weight_decay: 0.0
   learning_rate: 1.0e-3
+  store_to_memory: true
+  critic_train_interval: 20
+  critic_loss_weight: 1.0
+  mode1_distill_interval: 0
+  mode1_distill_weight: 0.0
+  representation_loss_weight: 1.0
+
+loss:
+  type: "combined"
+  hierarchy_weights: [1.0, 0.7, 0.5]
+  vicreg_weight: 0.1

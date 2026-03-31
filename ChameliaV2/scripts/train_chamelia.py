@@ -23,6 +23,8 @@ from src.chamelia.chamelia import Chamelia
 from src.chamelia.configurator import Configurator
 from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
 from src.chamelia.memory import LatentMemory
+from src.losses.combined import CombinedLoss
+from src.losses.hjepa_loss import HJEPALoss
 from src.models.hjepa import HJEPA
 from training.curriculum.control import AdaptiveTrainingController, EvalPoint
 from training.curriculum.domains.base import CurriculumDomain
@@ -76,11 +78,17 @@ class StubSequenceHJEPA(torch.nn.Module):
         """
         masked_tokens = tokens * (1.0 - mask.unsqueeze(-1))
         cls = masked_tokens.mean(dim=1, keepdim=True)
-        target_features = torch.cat([cls, masked_tokens], dim=1)
+        target_features = torch.cat([cls, tokens], dim=1)
+        predictions = self._apply_fpn(masked_tokens, is_prediction=True)
+        targets = self._apply_fpn(tokens, is_prediction=False)
+        masks_valid = [
+            torch.ones(tokens.shape[0], level.shape[1], dtype=torch.bool, device=tokens.device)
+            for level in predictions
+        ]
         return {
-            "predictions": [masked_tokens],
-            "targets": [masked_tokens],
-            "mask_valid": torch.ones(tokens.shape[0], tokens.shape[1], dtype=torch.bool, device=tokens.device),
+            "predictions": predictions,
+            "targets": targets,
+            "masks_valid": masks_valid,
             "context_features": target_features,
             "target_features": target_features,
         }
@@ -148,8 +156,54 @@ def _resolve_training_config(chamelia_config: dict[str, Any], backbone_mode: str
         Effective training configuration.
     """
     if backbone_mode == "stub":
-        return chamelia_config.get("stub_training", {"optimizer": "adam", "weight_decay": 0.0, "learning_rate": 3e-3})
+        return chamelia_config.get(
+            "stub_training",
+            {
+                "optimizer": "adam",
+                "weight_decay": 0.0,
+                "learning_rate": 3e-3,
+                "store_to_memory": True,
+                "critic_train_interval": 20,
+                "critic_loss_weight": 1.0,
+                "mode1_distill_interval": 0,
+                "mode1_distill_weight": 0.0,
+                "representation_loss_weight": 1.0,
+            },
+        )
     return chamelia_config.get("training", {})
+
+
+def build_representation_loss(chamelia_config: dict[str, Any], model_cfg: dict[str, Any]) -> torch.nn.Module | None:
+    """Build the configured representation loss for curriculum training.
+
+    Args:
+        chamelia_config: Parsed config dictionary.
+        model_cfg: Effective model config.
+
+    Returns:
+        Loss module or ``None``.
+    """
+    loss_cfg = chamelia_config.get("loss", {})
+    loss_type = str(loss_cfg.get("type", "combined")).lower()
+    num_hierarchies = int(model_cfg.get("num_hierarchies", 3))
+    hierarchy_weights = loss_cfg.get("hierarchy_weights", [1.0] * num_hierarchies)
+    if loss_type == "hjepa":
+        return HJEPALoss(
+            loss_type="smoothl1",
+            hierarchy_weights=hierarchy_weights,
+            num_hierarchies=num_hierarchies,
+            normalize_embeddings=True,
+        )
+    if loss_type == "combined":
+        return CombinedLoss(
+            jepa_loss_type="smoothl1",
+            jepa_hierarchy_weights=hierarchy_weights,
+            num_hierarchies=num_hierarchies,
+            normalize_embeddings=True,
+            vicreg_weight=loss_cfg.get("vicreg_weight", 0.1),
+            apply_vicreg_per_level=True,
+        )
+    return None
 
 
 def stage_passed(stage_domains: list[CurriculumDomain], metrics: dict[str, dict[str, float]]) -> bool:
@@ -783,6 +837,7 @@ def run_training(args: argparse.Namespace) -> int:
         selected_stages=selected_stages,
         selected_domains=selected_domains,
     )
+    effective_model_cfg = _resolve_model_config(chamelia_config, args.backbone_mode)
     model = build_model(
         chamelia_config,
         stages,
@@ -793,6 +848,7 @@ def run_training(args: argparse.Namespace) -> int:
     training_cfg = _resolve_training_config(chamelia_config, args.backbone_mode)
     base_lr = float(args.lr if args.lr is not None else training_cfg.get("learning_rate", 1.5e-4))
     optimizer = build_optimizer(model, training_cfg, base_lr)
+    representation_loss_fn = build_representation_loss(chamelia_config, effective_model_cfg)
 
     curriculum_config["checkpoint_dir"] = args.checkpoint_dir
     graduation_manager = GraduationManager(stages, curriculum_config)
@@ -803,6 +859,13 @@ def run_training(args: argparse.Namespace) -> int:
         config=curriculum_config,
         device=device,
         optimizer=optimizer,
+        representation_loss_fn=representation_loss_fn,
+        representation_loss_weight=float(training_cfg.get("representation_loss_weight", 1.0)),
+        store_to_memory=bool(training_cfg.get("store_to_memory", True)),
+        critic_train_interval=int(training_cfg.get("critic_train_interval", 0)),
+        critic_loss_weight=float(training_cfg.get("critic_loss_weight", 1.0)),
+        mode1_distill_interval=int(training_cfg.get("mode1_distill_interval", 0)),
+        mode1_distill_weight=float(training_cfg.get("mode1_distill_weight", 0.0)),
     )
     if stages and stages[0]:
         runner._runtime_domains[stages[0][0].domain_name()] = model.domain

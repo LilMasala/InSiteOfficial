@@ -56,7 +56,7 @@ class Chamelia(nn.Module):
         self.embed_dim = embed_dim
         self.action_dim = action_dim
         self.num_ctx_tokens = num_ctx_tokens
-        self._pending_record_idx: int | None = None
+        self._pending_record_indices: list[int] = []
         self._step_counter = 0
         self.set_domain(domain)
 
@@ -156,18 +156,22 @@ class Chamelia(nn.Module):
         cost_out = self.cost(z, action_vec, ctx_tokens, domain_state)
 
         if store_to_memory:
-            record = EpisodeRecord(
-                key=z.detach()[0],
-                action=action_vec.detach()[0],
-                ctx_tokens=ctx_tokens.detach()[0],
-                ic_at_decision=float(cost_out["ic"][0].item()),
-                ic_realized=None,
-                tc_predicted=float(cost_out["tc"][0].item()),
-                outcome_key=None,
-                step=self._step_counter,
-                domain_name=self.domain.domain_name,
-            )
-            self._pending_record_idx = self.memory.store(record)
+            self._pending_record_indices = []
+            for batch_idx in range(z.shape[0]):
+                record = EpisodeRecord(
+                    key=z.detach()[batch_idx],
+                    action=action_vec.detach()[batch_idx],
+                    ctx_tokens=ctx_tokens.detach()[batch_idx],
+                    ic_at_decision=float(cost_out["ic"][batch_idx].item()),
+                    ic_realized=None,
+                    tc_predicted=float(cost_out["tc"][batch_idx].item()),
+                    outcome_key=None,
+                    step=self._step_counter,
+                    domain_name=self.domain.domain_name,
+                )
+                self._pending_record_indices.append(self.memory.store(record))
+        else:
+            self._pending_record_indices = []
 
         self._step_counter += 1
         return {
@@ -179,17 +183,21 @@ class Chamelia(nn.Module):
             "hjepa_out": hjepa_out,
         }
 
-    def fill_outcome(self, ic_realized: float, outcome_observation: Any) -> None:
+    def fill_outcome(
+        self,
+        ic_realized: float | torch.Tensor | list[float],
+        outcome_observation: Any,
+    ) -> None:
         """Fill delayed outcome into memory.
 
         Args:
-            ic_realized: Realized intrinsic cost scalar.
-            outcome_observation: Raw observation to tokenize and encode.
+            ic_realized: Realized intrinsic cost scalar, list, or tensor [B].
+            outcome_observation: Raw observation to tokenize and encode. May be batched.
 
         Returns:
             None.
         """
-        if self._pending_record_idx is None:
+        if not self._pending_record_indices:
             return
 
         tokenizer = self.domain.get_tokenizer()
@@ -210,12 +218,18 @@ class Chamelia(nn.Module):
             )
             outcome_z = self._get_scene_summary(outcome_hjepa)
 
-        self.memory.fill_outcome(
-            self._pending_record_idx,
-            ic_realized=ic_realized,
-            outcome_key=outcome_z.detach()[0],
-        )
-        self._pending_record_idx = None
+        realized_tensor = torch.as_tensor(ic_realized, dtype=torch.float32).flatten()
+        if realized_tensor.numel() == 1 and outcome_z.shape[0] > 1:
+            realized_tensor = realized_tensor.repeat(outcome_z.shape[0])
+
+        batch_count = min(len(self._pending_record_indices), outcome_z.shape[0], realized_tensor.shape[0])
+        for batch_idx in range(batch_count):
+            self.memory.fill_outcome(
+                self._pending_record_indices[batch_idx],
+                ic_realized=float(realized_tensor[batch_idx].item()),
+                outcome_key=outcome_z.detach()[batch_idx],
+            )
+        self._pending_record_indices = []
 
     def train_critic_from_memory(self) -> torch.Tensor | None:
         """Build a critic loss from memory-stored realized outcomes.

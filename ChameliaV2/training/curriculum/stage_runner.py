@@ -32,6 +32,13 @@ class CurriculumStageRunner:
         device: torch.device | str,
         train_step: callable | None = None,
         optimizer: torch.optim.Optimizer | None = None,
+        representation_loss_fn: Any | None = None,
+        representation_loss_weight: float = 1.0,
+        store_to_memory: bool = False,
+        critic_train_interval: int = 0,
+        critic_loss_weight: float = 1.0,
+        mode1_distill_interval: int = 0,
+        mode1_distill_weight: float = 0.0,
     ) -> None:
         """Initialize the curriculum runner.
 
@@ -43,6 +50,13 @@ class CurriculumStageRunner:
             device: Target device.
             train_step: Optional callback consuming ``(model, batch, domain, level, device)``.
             optimizer: Optional optimizer for default gradient updates.
+            representation_loss_fn: Optional JEPA/combined representation loss module.
+            representation_loss_weight: Scalar weight for representation loss.
+            store_to_memory: Whether Chamelia should store training episodes to memory.
+            critic_train_interval: Interval in steps for critic updates from memory.
+            critic_loss_weight: Scalar weight for memory critic loss.
+            mode1_distill_interval: Interval in steps for distilling mode1 from mode2.
+            mode1_distill_weight: Scalar weight for mode1 distillation loss.
         """
         self.model = model
         self.stages = stages
@@ -51,6 +65,15 @@ class CurriculumStageRunner:
         self.device = torch.device(device)
         self.train_step = train_step
         self.optimizer = optimizer
+        if isinstance(representation_loss_fn, torch.nn.Module):
+            representation_loss_fn = representation_loss_fn.to(self.device)
+        self.representation_loss_fn = representation_loss_fn
+        self.representation_loss_weight = representation_loss_weight
+        self.store_to_memory = store_to_memory
+        self.critic_train_interval = critic_train_interval
+        self.critic_loss_weight = critic_loss_weight
+        self.mode1_distill_interval = mode1_distill_interval
+        self.mode1_distill_weight = mode1_distill_weight
         self.stage_idx = int(config.get("curriculum", {}).get("start_stage", 0))
         self.global_step = 0
         self.checkpoint_dir = Path(config.get("checkpoint_dir", "checkpoints"))
@@ -196,7 +219,7 @@ class CurriculumStageRunner:
             mask=step_batch.input_mask,
             domain_state=step_batch.domain_state,
             actor_mode="mode2",
-            store_to_memory=False,
+            store_to_memory=self.store_to_memory,
             input_kind=input_kind,
         )
         runtime_costs = runtime_domain.get_intrinsic_cost_fns()
@@ -207,6 +230,40 @@ class CurriculumStageRunner:
                 outputs["action_vec"],
                 step_batch.domain_state,
             ).mean()
+        if self.representation_loss_fn is not None:
+            hjepa_out = outputs["hjepa_out"]
+            masks = hjepa_out.get("masks_valid", hjepa_out.get("mask_valid"))
+            if isinstance(masks, torch.Tensor):
+                masks = [masks for _ in range(len(hjepa_out["predictions"]))]
+            rep_loss_dict = self.representation_loss_fn(
+                hjepa_out["predictions"],
+                hjepa_out["targets"],
+                masks=masks,
+                context_features=hjepa_out.get("context_features"),
+            )
+            loss = loss + self.representation_loss_weight * rep_loss_dict["loss"]
+
+        if self.store_to_memory:
+            outcome_observation = step_batch.domain_state.get("target", step_batch.domain_state.get("tokens"))
+            if outcome_observation is not None:
+                self.model.fill_outcome(
+                    ic_realized=outputs["cost"]["ic"].detach(),
+                    outcome_observation=outcome_observation,
+                )
+
+        next_step = self.global_step + 1
+        if self.critic_train_interval > 0 and next_step % self.critic_train_interval == 0:
+            critic_loss = self.model.train_critic_from_memory()
+            if critic_loss is not None:
+                loss = loss + self.critic_loss_weight * critic_loss
+
+        if self.mode1_distill_interval > 0 and next_step % self.mode1_distill_interval == 0:
+            distill_loss = self.model.actor.distill_from_mode2(
+                states=outputs["z"],
+                ctx_tokens=outputs["ctx_tokens"],
+                mode2_actions=outputs["action_vec"],
+            )
+            loss = loss + self.mode1_distill_weight * distill_loss
         return loss
 
     def run(self) -> None:

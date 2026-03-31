@@ -82,6 +82,12 @@ stub_training:
   learning_rate: 3.0e-3
   weight_decay: 0.0
   optimizer: "adam"
+  store_to_memory: true
+  critic_train_interval: 20
+  critic_loss_weight: 1.0
+  mode1_distill_interval: 0
+  mode1_distill_weight: 0.0
+  representation_loss_weight: 1.0
 
 training:
   # Inherited from HJEPA trainer for backbone training
@@ -99,6 +105,10 @@ training:
   critic_train_interval: 100
   mode1_distill_interval: 500
   memory_outcome_delay: 30
+  store_to_memory: true
+  critic_loss_weight: 1.0
+  mode1_distill_weight: 0.05
+  representation_loss_weight: 1.0
 
 loss:
   type: "combined"
