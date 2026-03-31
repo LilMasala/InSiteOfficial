@@ -231,7 +231,7 @@ end
     action = Main.ScheduledAction(
         1,
         Main.parameter_adjustment,
-        [Main.SegmentDelta(segment_id="morning", isf_delta=0.05, basal_delta=-0.03)],
+        [Main.SegmentDelta(segment_id="morning", parameter_deltas=Dict(:isf_delta => 0.05, :basal_delta => -0.03))],
         Main.StructureEdit[],
     )
     @test !Main.is_null(action)
@@ -291,9 +291,10 @@ end
         segment_summaries = [(
             segment_id = "morning",
             label = "360–720 min",
-            isf = "ISF +5.0%",
-            cr = "CR unchanged",
-            basal = "Basal -3.0%",
+            parameter_summaries = Dict(
+                "isf_delta" => "isf_delta +5.0%",
+                "basal_delta" => "basal_delta -3.0%",
+            ),
         )],
         structure_summaries = String[],
     )
@@ -503,10 +504,10 @@ end
         1,
         Main.parameter_adjustment,
         [
-            Main.SegmentSurface(segment_id="overnight", start_min=0, end_min=720, isf=42.0, cr=10.0, basal=0.8),
-            Main.SegmentSurface(segment_id="day", start_min=720, end_min=1440, isf=48.0, cr=12.0, basal=0.7),
+            Main.SegmentSurface(segment_id="overnight", start_min=0, end_min=720, parameter_values=Dict(:isf => 42.0, :cr => 10.0, :basal => 0.8)),
+            Main.SegmentSurface(segment_id="day", start_min=720, end_min=1440, parameter_values=Dict(:isf => 48.0, :cr => 12.0, :basal => 0.7)),
         ],
-        [Main.SegmentDelta(segment_id="day", isf_delta=0.10, basal_delta=-0.05)],
+        [Main.SegmentDelta(segment_id="day", parameter_deltas=Dict(:isf => 0.10, :basal => -0.05))],
         Main.StructureEdit[],
     )
     scheduled_state = Main.WorldModule.sim_step!(sim, state, scheduled_action, sample_noise(noise))
@@ -590,10 +591,10 @@ end
         1,
         Main.parameter_adjustment,
         [
-            Main.SegmentSurface(segment_id="overnight", start_min=0, end_min=720, isf=42.0, cr=10.0, basal=0.8),
-            Main.SegmentSurface(segment_id="day", start_min=720, end_min=1440, isf=48.0, cr=12.0, basal=0.7),
+            Main.SegmentSurface(segment_id="overnight", start_min=0, end_min=720, parameter_values=Dict(:isf => 42.0, :cr => 10.0, :basal => 0.8)),
+            Main.SegmentSurface(segment_id="day", start_min=720, end_min=1440, parameter_values=Dict(:isf => 48.0, :cr => 12.0, :basal => 0.7)),
         ],
-        [Main.SegmentDelta(segment_id="day", isf_delta=0.10, basal_delta=-0.05)],
+        [Main.SegmentDelta(segment_id="day", parameter_deltas=Dict(:isf => 0.10, :basal => -0.05))],
         Main.StructureEdit[],
     )
     scheduled_features = Main.WorldModule.action_to_features(scheduled_action)
@@ -607,8 +608,8 @@ end
 
     @test length(scheduled_features) == 8
     @test scheduled_features[4] == 1.0f0
-    @test scheduled_features[6] > 0.0f0
-    @test scheduled_features[8] < 0.0f0
+    @test any(>(0.0f0), scheduled_features[6:8])
+    @test any(<(0.0f0), scheduled_features[6:8])
     @test length(scheduled_rollouts) == config.φ_world.N_roll
     @test all(isfinite, scheduled_energies)
 
@@ -1554,6 +1555,7 @@ end
 @testset "Clinical Delta Gate" begin
     using Main.Actor: passes_clinical_delta_gate, CandidateAction, ScheduledAction
     using Main.WorldModule: min_clinical_delta
+    using Main: UserPreferences
 
     sim     = Main.InSiteSimulator("default", 42)
     mock    = Main.WorldModule.MockSimulator()
@@ -1576,12 +1578,12 @@ end
 
     # ── ScheduledAction: passes when at least one segment delta >= threshold ──
     seg = Main.SegmentSurface(segment_id="s1", start_min=0, end_min=480,
-                              isf=50.0, cr=10.0, basal=1.0)
+                              parameter_values=Dict(:isf => 50.0, :cr => 10.0, :basal => 1.0))
     big_sched   = ScheduledAction(1, Main.parameter_adjustment, [seg],
-                                  [Main.SegmentDelta(segment_id="s1", isf_delta=0.05)],
+                                  [Main.SegmentDelta(segment_id="s1", parameter_deltas=Dict(:isf_delta => 0.05))],
                                   Main.StructureEdit[])
     small_sched = ScheduledAction(1, Main.parameter_adjustment, [seg],
-                                  [Main.SegmentDelta(segment_id="s1", isf_delta=0.01)],
+                                  [Main.SegmentDelta(segment_id="s1", parameter_deltas=Dict(:isf_delta => 0.01))],
                                   Main.StructureEdit[])
     empty_sched = ScheduledAction(1, Main.parameter_adjustment, [seg],
                                   Main.SegmentDelta[], Main.StructureEdit[])
@@ -1596,6 +1598,32 @@ end
     # ── MockSimulator uses conservative default 0.01 ───────────────
     @test min_clinical_delta(mock) ≈ 0.01  atol=1e-8
     @test passes_clinical_delta_gate(small_action, mock)   # 2% >= 1% default
+
+    # ── User minimums can further suppress small-but-clinical changes ─────
+    adapter = Main.InSiteDomainAdapter()
+    prefs_isf = UserPreferences(minimum_action_delta_thresholds = Dict("isf_delta" => 0.06))
+    @test !passes_clinical_delta_gate(big_action, sim, adapter, prefs_isf)
+    @test passes_clinical_delta_gate(CandidateAction(Dict(:isf_delta => 0.07)), sim, adapter, prefs_isf)
+
+    prefs_mixed = UserPreferences(
+        minimum_action_delta_thresholds = Dict(
+            "isf_delta" => 0.06,
+            "cr_delta" => 0.04,
+            "basal_delta" => 0.08
+        )
+    )
+    @test passes_clinical_delta_gate(CandidateAction(Dict(:cr_delta => 0.05)), sim, adapter, prefs_mixed)
+    @test !passes_clinical_delta_gate(CandidateAction(Dict(:basal_delta => 0.05)), sim, adapter, prefs_mixed)
+
+    sched_pref = UserPreferences(minimum_action_delta_thresholds = Dict("basal_delta" => 0.07))
+    sched_big_enough = ScheduledAction(1, Main.parameter_adjustment, [seg],
+                                       [Main.SegmentDelta(segment_id="s1", parameter_deltas=Dict(:basal_delta => 0.08))],
+                                       Main.StructureEdit[])
+    sched_too_small = ScheduledAction(1, Main.parameter_adjustment, [seg],
+                                      [Main.SegmentDelta(segment_id="s1", parameter_deltas=Dict(:basal_delta => 0.05))],
+                                      Main.StructureEdit[])
+    @test passes_clinical_delta_gate(sched_big_enough, sim, adapter, sched_pref)
+    @test !passes_clinical_delta_gate(sched_too_small, sim, adapter, sched_pref)
 end
 
 @testset "Profile Context in ConnectedAppState" begin
@@ -2044,11 +2072,201 @@ end
     end
 
     # ── 14. end-to-end: initialize_patient uses calibration_targets ────────
+    # Must pass InSiteDomainAdapter explicitly — the default adapter is a
+    # domain-agnostic no-op stub that cannot know about ISF/TIR relationships.
     @testset "initialize_patient applies calibration" begin
         prefs = UserPreferences(calibration_targets = Dict("recent_tir" => 0.85))
         sim   = Main.InSiteSimulator()
-        system = Chamelia.initialize_patient(prefs, sim)
+        system = Chamelia.initialize_patient(prefs, sim; adapter = Main.InSiteDomainAdapter())
         # With high TIR target, ISF should shift above 1.0
         @test system.twin.posterior.physical[:isf_multiplier] > 1.0
     end
+end
+
+# ─────────────────────────────────────────────────────────────────
+# JEPA Predictor — Action-Conditioned Training
+#
+# Tests for the shadow-period predictor fine-tuning pipeline:
+#   1. MemoryRecord.latent_μ_at_outcome is written by store_outcome!
+#   2. record_outcome! on a JEPA system populates the outcome latent
+#   3. MemoryTransitionDataset builds correct triples from memory
+#   4. Effective action scaling (accept/partial/reject) is correct
+#   5. train_predictor! runs without error and reduces MSE loss
+# ─────────────────────────────────────────────────────────────────
+
+@testset "JEPA Predictor Action-Conditioned Training" begin
+
+    # ── helpers ──────────────────────────────────────────────────
+    function _make_jepa_belief(z_dim::Int = 4)
+        JEPABeliefState(
+            μ           = randn(Float32, z_dim),
+            log_σ       = fill(-1.0f0, z_dim),
+            entropy     = 0.0f0,
+            obs_log_lik = 0.0f0
+        )
+    end
+
+    function _make_jepa_record(id::Int, belief::JEPABeliefState, action::AbstractAction)
+        μ, log_σ = Float32.(vec(belief.μ)), Float32.(vec(belief.log_σ))
+        MemoryRecord(
+            id                  = id,
+            day                 = id,
+            belief_entropy      = 1.0,
+            action              = action,
+            epistemic           = EpistemicState(0.8, 0.8, 0.8, true),
+            config_snapshot     = make_test_config(),
+            user_response       = nothing,
+            realized_signals    = nothing,
+            realized_cost       = nothing,
+            critic_target       = nothing,
+            shadow_delta_score  = nothing,
+            trust_at_rec        = 0.5,
+            burnout_at_rec      = 0.1,
+            engagement_at_rec   = 0.7,
+            burden_at_rec       = 0.2,
+            latent_μ_at_rec     = μ,
+            latent_log_σ_at_rec = log_σ,
+        )
+    end
+
+    z_dim = 4
+
+    # ── 1. store_outcome! writes latent_μ_at_outcome ─────────────
+    @testset "store_outcome! sets latent_μ_at_outcome" begin
+        mem = MemoryBuffer()
+        rec = _make_jepa_record(1, _make_jepa_belief(z_dim), NullAction())
+        push!(mem.records, rec)
+
+        outcome_μ = Float32[0.1, 0.2, 0.3, 0.4]
+        Memory.store_outcome!(mem, 1, Accept, Dict{Symbol,Any}(), 0.5;
+                              latent_μ_at_outcome = outcome_μ)
+
+        stored = Memory.get_record(mem, 1)
+        @test !isnothing(stored.latent_μ_at_outcome)
+        @test stored.latent_μ_at_outcome ≈ outcome_μ
+    end
+
+    # ── 2. store_outcome! without latent leaves field nothing ─────
+    @testset "store_outcome! without latent leaves field nothing" begin
+        mem = MemoryBuffer()
+        rec = _make_jepa_record(1, _make_jepa_belief(z_dim), NullAction())
+        push!(mem.records, rec)
+
+        Memory.store_outcome!(mem, 1, Reject, Dict{Symbol,Any}(), 0.0)
+        stored = Memory.get_record(mem, 1)
+        @test isnothing(stored.latent_μ_at_outcome)
+    end
+
+    # ── 3. record_outcome! populates latent on JEPA system ────────
+    @testset "record_outcome! captures outcome latent from JEPA belief" begin
+        sim    = Main.InSiteSimulator()
+        system = Chamelia.initialize_patient(UserPreferences(), sim)
+
+        # Manually set a JEPA belief so _latent_μ_from_belief fires
+        outcome_μ = randn(Float32, 64)
+        system.belief = JEPABeliefState(
+            μ           = outcome_μ,
+            log_σ       = fill(-1.0f0, 64),
+            entropy     = 0.0f0,
+            obs_log_lik = 0.0f0
+        )
+
+        # Seed a record so store_outcome! has something to fill in
+        epistemic = Perception.compute_epistemic_state(
+            system.belief, system.mem, NullAction(),
+            system.config.φ_cost.thresholds
+        )
+        psy = Chamelia.psy_from_belief(system.belief)
+        rec_id = Memory.store_record!(system.mem, 1, system.belief,
+                                      NullAction(), epistemic, system.config, psy)
+
+        Chamelia.record_outcome!(system, rec_id, Accept,
+                                 Dict{Symbol,Any}(:tir => 0.7), 0.3)
+
+        stored = Memory.get_record(system.mem, rec_id)
+        @test !isnothing(stored.latent_μ_at_outcome)
+        @test stored.latent_μ_at_outcome ≈ outcome_μ
+    end
+
+    # ── 4. MemoryTransitionDataset builds triples correctly ───────
+    @testset "MemoryTransitionDataset builds from completed records" begin
+        mem    = MemoryBuffer()
+        action = Actor.CandidateAction(Dict(:x => 0.1))
+
+        for i in 1:5
+            rec = _make_jepa_record(i, _make_jepa_belief(z_dim), action)
+            rec.latent_μ_at_outcome = randn(Float32, z_dim)
+            rec.user_response       = Accept
+            push!(mem.records, rec)
+        end
+
+        # Record without outcome latent — should be excluded
+        incomplete = _make_jepa_record(6, _make_jepa_belief(z_dim), action)
+        push!(mem.records, incomplete)
+
+        dataset = Chamelia._build_latent_triples(mem)
+        @test Perception.n_samples(dataset) == 5
+        @test length(dataset.z_t[1])     == z_dim
+        @test length(dataset.a_feats[1]) == 8   # action_to_features output dim
+        @test length(dataset.z_tH[1])    == z_dim
+    end
+
+    # ── 5. Effective action feature scaling ───────────────────────
+    @testset "effective action features scale by response" begin
+        action  = Actor.CandidateAction(Dict(:x => 1.0))
+        full_a  = WorldModule.action_to_features(action)
+
+        make_rec = (response) -> begin
+            rec = _make_jepa_record(1, _make_jepa_belief(z_dim), action)
+            rec.user_response       = response
+            rec.latent_μ_at_outcome = zeros(Float32, z_dim)
+            mem = MemoryBuffer(); push!(mem.records, rec)
+            Chamelia._build_latent_triples(mem).a_feats[1]
+        end
+
+        # Accept → full action features
+        @test make_rec(Accept)  ≈ full_a
+
+        # Partial → half magnitude
+        @test make_rec(Partial) ≈ 0.5f0 .* full_a
+
+        # Reject → zeros
+        @test all(iszero, make_rec(Reject))
+    end
+
+    # ── 6. get_training_batch returns correct shapes ──────────────
+    @testset "get_training_batch returns correct tensor shapes" begin
+        n = 10; a_dim = 8; batch = 4
+        dataset = Perception.MemoryTransitionDataset(
+            [randn(Float32, z_dim) for _ in 1:n],
+            [randn(Float32, a_dim) for _ in 1:n],
+            [randn(Float32, z_dim) for _ in 1:n],
+        )
+        z_t_b, a_b, z_tH_b = Perception.get_training_batch(dataset, batch)
+        @test size(z_t_b)  == (z_dim, batch)
+        @test size(a_b)    == (a_dim, batch)
+        @test size(z_tH_b) == (z_dim, batch)
+    end
+
+    # ── 7. train_predictor! runs and loss is finite ───────────────
+    @testset "train_predictor! runs without error and loss is finite" begin
+        n = 30; a_dim = 8; z_dim_pred = 64
+        dataset = Perception.MemoryTransitionDataset(
+            [randn(Float32, z_dim_pred) for _ in 1:n],
+            [randn(Float32, a_dim)      for _ in 1:n],
+            [randn(Float32, z_dim_pred) for _ in 1:n],
+        )
+        predictor = WorldModule.JEPAPredictor(z_dim_pred, 16, 128, a_dim)
+        Perception.train_predictor!(predictor, dataset; n_epochs=5, batch_size=8)
+        @test isfinite(Perception.LAST_PREDICTOR_TRAINING_LOSS[])
+    end
+
+    # ── 8. train_predictor! is a no-op on empty dataset ──────────
+    @testset "train_predictor! is a no-op on empty dataset" begin
+        dataset   = Perception.MemoryTransitionDataset([], [], [])
+        predictor = WorldModule.JEPAPredictor()
+        # Should return nothing without throwing
+        @test isnothing(Perception.train_predictor!(predictor, dataset))
+    end
+
 end

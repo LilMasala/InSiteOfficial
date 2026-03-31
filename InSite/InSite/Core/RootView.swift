@@ -170,7 +170,8 @@ struct RootView: View {
                             hypoglycemiaFear: 0.5,
                             burdenSensitivity: 0.5,
                             persona: "default",
-                            calibrationTargets: NightscoutConnectionStore.shared.calibrationTargets(for: authUser.uid)
+                            calibrationTargets: NightscoutConnectionStore.shared.calibrationTargets(for: authUser.uid),
+                            minimumActionDeltaThresholds: [:]
                         )
                     try await ChameliaEngine.shared.initialize(
                         patientId: authUser.uid,

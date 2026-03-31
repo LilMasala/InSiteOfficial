@@ -14,6 +14,20 @@ A failing action is rejected entirely — not penalized, rejected.
 
 using Statistics
 
+function _action_delta_pairs(action :: CandidateAction)
+    return collect(pairs(action.deltas))
+end
+
+function _action_delta_pairs(action :: ScheduledAction)
+    out = Pair{Symbol, Float64}[]
+    for delta in action.segment_deltas
+        for (key, value) in delta.parameter_deltas
+            push!(out, key => Float64(value))
+        end
+    end
+    return out
+end
+
 # ─────────────────────────────────────────────────────────────────
 # Safety Constraint Interface
 # Simulator plugin registers domain-specific safety constraints.
@@ -302,36 +316,39 @@ end
 #   Effect size gate  → is the predicted improvement statistically real?
 #   Clinical delta gate → is the raw action physically / clinically actionable?
 #
-# A 1% ISF change on ISF=50 (0.5 mg/dL/U) may show positive effect size in
-# rollouts but is below pump granularity and clinically meaningless.
+# A tiny action delta may show positive effect size in rollouts but still be
+# below device granularity or practical implementation significance.
 # Both gates must pass for a recommendation to be surfaced.
 # ─────────────────────────────────────────────────────────────────
 
 function passes_clinical_delta_gate(
     action :: CandidateAction,
-    sim    :: AbstractSimulator
+    sim    :: AbstractSimulator,
+    adapter :: AbstractDomainAdapter = Main.DefaultDomainAdapter(),
+    prefs  :: UserPreferences = UserPreferences()
 ) :: Bool
-    threshold = min_clinical_delta(sim)
-    return any(abs(v) >= threshold for v in values(action.deltas))
+    baseline_threshold = min_clinical_delta(sim)
+    return any(abs(v) >= max(baseline_threshold, minimum_action_delta_threshold(adapter, prefs, key))
+               for (key, v) in _action_delta_pairs(action))
 end
 
 function passes_clinical_delta_gate(
     action :: ScheduledAction,
-    sim    :: AbstractSimulator
+    sim    :: AbstractSimulator,
+    adapter :: AbstractDomainAdapter = Main.DefaultDomainAdapter(),
+    prefs  :: UserPreferences = UserPreferences()
 ) :: Bool
-    threshold = min_clinical_delta(sim)
     isempty(action.segment_deltas) && return false
-    return any(
-        abs(d.isf_delta) >= threshold ||
-        abs(d.cr_delta)  >= threshold ||
-        abs(d.basal_delta) >= threshold
-        for d in action.segment_deltas
-    )
+    baseline_threshold = min_clinical_delta(sim)
+    return any(abs(v) >= max(baseline_threshold, minimum_action_delta_threshold(adapter, prefs, key))
+               for (key, v) in _action_delta_pairs(action))
 end
 
 function passes_clinical_delta_gate(
     action :: AbstractAction,
-    sim    :: AbstractSimulator
+    sim    :: AbstractSimulator,
+    adapter :: AbstractDomainAdapter = Main.DefaultDomainAdapter(),
+    prefs  :: UserPreferences = UserPreferences()
 ) :: Bool
     # NullAction and other no-op types never pass — they have no therapy change
     return false

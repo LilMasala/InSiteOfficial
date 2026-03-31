@@ -12,10 +12,16 @@ struct SettingsView: View {
     @StateObject private var viewModel = SettingsViewModel()
     @Binding var showSignInView: Bool
     @State private var chameliaLevel2Enabled = false
+    @ObservedObject private var telemetrySourceStore = TelemetrySourceStore.shared
     @ObservedObject private var nightscoutStore = NightscoutConnectionStore.shared
+    @ObservedObject private var tandemStore = TandemConnectionStore.shared
     @State private var showNightscoutSheet = false
+    @State private var showTandemSheet = false
     @State private var isValidatingNightscout = false
+    @State private var isRefreshingTandemStatus = false
+    @State private var isConnectingTandem = false
     @State private var nightscoutBanner: String?
+    @State private var tandemBanner: String?
 
     var body: some View {
         List {
@@ -34,6 +40,18 @@ struct SettingsView: View {
                 }
 
                 Toggle("Allow Chamelia to suggest new time blocks", isOn: $chameliaLevel2Enabled)
+            }
+
+            Section("Telemetry Source") {
+                Picker("Source", selection: telemetrySelectionBinding) {
+                    ForEach(TelemetrySource.allCases) { source in
+                        Text(source.title).tag(source)
+                    }
+                }
+
+                Text(telemetrySourceStore.selectedSource.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
@@ -101,6 +119,54 @@ struct SettingsView: View {
                 Text("Nightscout can backfill recent CGM, profile, and treatment context so Chamelia can cold-start from real recent data instead of asking you to estimate TIR manually.")
             }
 
+            Section {
+                Button {
+                    showTandemSheet = true
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(tandemPrimaryTitle)
+                            Text(tandemSubtitle)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                LabeledContent("Source") {
+                    Text("Tandem direct")
+                }
+                LabeledContent("Status") {
+                    Text(tandemStatusTitle)
+                }
+                LabeledContent("Region") {
+                    Text(tandemStore.state.region.rawValue)
+                }
+                if let lastSuccessfulSync = tandemStore.state.lastSuccessfulSync {
+                    LabeledContent("Last successful sync") {
+                        Text(lastSuccessfulSync.formatted(date: .abbreviated, time: .shortened))
+                    }
+                }
+                if let message = tandemVisibleErrorMessage {
+                    Text(message)
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+
+                Button(isRefreshingTandemStatus ? "Refreshing Tandem Status…" : "Refresh Tandem Status") {
+                    Task { await refreshTandemStatus() }
+                }
+                .disabled(isRefreshingTandemStatus || !tandemStore.state.shouldAttemptStatusRefresh)
+            } header: {
+                Text("Tandem")
+            } footer: {
+                Text("Tandem Direct uses a separate adapter service, triggers canonical Firestore imports, and keeps downstream therapy hydration source-agnostic.")
+            }
+
             Button("Log Out") {
                 Task {
                     do {
@@ -150,7 +216,10 @@ struct SettingsView: View {
         .onAppear {
             viewModel.loadAuthProviders()
             chameliaLevel2Enabled = ChameliaSettingsStore.level2Enabled()
+            telemetrySourceStore.refresh()
             nightscoutStore.refresh()
+            tandemStore.refresh()
+            Task { await refreshTandemStatusIfNeeded() }
         }
         .navigationTitle("Settings")
         .onChange(of: chameliaLevel2Enabled) { newValue in
@@ -175,6 +244,31 @@ struct SettingsView: View {
                 }
             )
         }
+        .sheet(isPresented: $showTandemSheet) {
+            TandemConnectionSheet(
+                initialState: tandemStore.state,
+                isConnecting: isConnectingTandem,
+                onSave: { adapterBaseURLString, email, password, region, pumpSerialNumber in
+                    Task {
+                        isConnectingTandem = true
+                        defer { isConnectingTandem = false }
+                        do {
+                            try await tandemStore.connect(
+                                adapterBaseURLString: adapterBaseURLString,
+                                email: email,
+                                password: password,
+                                region: region,
+                                pumpSerialNumber: pumpSerialNumber
+                            )
+                            tandemBanner = "Tandem connected."
+                            showTandemSheet = false
+                        } catch {
+                            tandemBanner = error.localizedDescription
+                        }
+                    }
+                }
+            )
+        }
         .alert("Nightscout", isPresented: Binding(
             get: { nightscoutBanner != nil },
             set: { if !$0 { nightscoutBanner = nil } }
@@ -182,6 +276,14 @@ struct SettingsView: View {
             Button("OK", role: .cancel) { nightscoutBanner = nil }
         } message: {
             Text(nightscoutBanner ?? "")
+        }
+        .alert("Tandem", isPresented: Binding(
+            get: { tandemBanner != nil },
+            set: { if !$0 { tandemBanner = nil } }
+        )) {
+            Button("OK", role: .cancel) { tandemBanner = nil }
+        } message: {
+            Text(tandemBanner ?? "")
         }
     }
 
@@ -193,11 +295,21 @@ struct SettingsView: View {
         let parts = [
             answers.aggressiveness?.rawValue.replacingOccurrences(of: "_", with: " "),
             draft.hypoglycemiaFear?.rawValue.replacingOccurrences(of: "_", with: " "),
-            draft.recommendationCadence?.rawValue.replacingOccurrences(of: "_", with: " ")
+            draft.recommendationCadence?.rawValue.replacingOccurrences(of: "_", with: " "),
+            draft.minimumAcceptableISFChange.map { "ISF \($0.rawValue)" },
+            draft.minimumAcceptableCRChange.map { "CR \($0.rawValue)" },
+            draft.minimumAcceptableBasalChange.map { "Basal \($0.rawValue)" }
         ]
         .compactMap { $0 }
 
         return parts.isEmpty ? "Not set" : parts.joined(separator: " · ")
+    }
+
+    private var telemetrySelectionBinding: Binding<TelemetrySource> {
+        Binding(
+            get: { telemetrySourceStore.selectedSource },
+            set: { telemetrySourceStore.setSelectedSource($0) }
+        )
     }
 
     private var nightscoutSubtitle: String {
@@ -211,6 +323,53 @@ struct SettingsView: View {
         return "Optional read-only sync for CGM, settings, and treatments"
     }
 
+    private var tandemSubtitle: String {
+        if !tandemStore.state.isAdapterConfigured {
+            return "Not configured yet"
+        }
+        if !tandemStore.state.hasAttemptedConnection {
+            return "Adapter configured. Enter Tandem credentials to connect."
+        }
+        switch tandemStore.state.status {
+        case .connected:
+            if let lastSuccessfulSync = tandemStore.state.lastSuccessfulSync {
+                return "Tandem direct · synced \(lastSuccessfulSync.formatted(date: .abbreviated, time: .shortened))"
+            }
+            return "Tandem direct · ready to sync"
+        case .needsReauth:
+            return "Tandem direct · re-auth required"
+        case .failed:
+            return tandemStore.state.lastErrorMessage ?? "Tandem direct · connection failed"
+        case .disconnected:
+            return "Not connected"
+        }
+    }
+
+    private var tandemPrimaryTitle: String {
+        if tandemStore.state.isConnected {
+            return "Tandem Connected"
+        }
+        if !tandemStore.state.isAdapterConfigured || !tandemStore.state.hasAttemptedConnection {
+            return "Connect Tandem"
+        }
+        return "Connect Tandem"
+    }
+
+    private var tandemStatusTitle: String {
+        if !tandemStore.state.isAdapterConfigured {
+            return "Not configured"
+        }
+        if !tandemStore.state.hasAttemptedConnection {
+            return "Not connected"
+        }
+        return tandemStore.state.status.title
+    }
+
+    private var tandemVisibleErrorMessage: String? {
+        guard tandemStore.state.hasAttemptedConnection else { return nil }
+        return tandemStore.state.lastErrorMessage
+    }
+
     private func refreshNightscoutValidation() async {
         isValidatingNightscout = true
         defer { isValidatingNightscout = false }
@@ -219,6 +378,23 @@ struct SettingsView: View {
             nightscoutBanner = "Nightscout snapshot refreshed."
         } catch {
             nightscoutBanner = error.localizedDescription
+        }
+    }
+
+    private func refreshTandemStatusIfNeeded() async {
+        guard telemetrySourceStore.selectedSource == .tandemDirect else { return }
+        guard tandemStore.state.shouldAttemptStatusRefresh else { return }
+        await refreshTandemStatus()
+    }
+
+    private func refreshTandemStatus() async {
+        guard !isRefreshingTandemStatus else { return }
+        isRefreshingTandemStatus = true
+        defer { isRefreshingTandemStatus = false }
+        do {
+            try await tandemStore.refreshStatus()
+        } catch {
+            tandemBanner = error.localizedDescription
         }
     }
 }
@@ -281,6 +457,82 @@ private struct NightscoutConnectionSheet: View {
             .task {
                 baseURLString = initialState.baseURLString
                 authMode = initialState.authMode
+            }
+        }
+    }
+}
+
+private struct TandemConnectionSheet: View {
+    let initialState: TandemConnectionState
+    let isConnecting: Bool
+    let onSave: (_ adapterBaseURLString: String, _ email: String, _ password: String, _ region: TandemRegion, _ pumpSerialNumber: String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var adapterBaseURLString = ""
+    @State private var email = ""
+    @State private var password = ""
+    @State private var region: TandemRegion = .us
+    @State private var pumpSerialNumber = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Account") {
+                    TextField("Email", text: $email)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.emailAddress)
+                        .autocorrectionDisabled()
+
+                    SecureField("Password", text: $password)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    Picker("Region", selection: $region) {
+                        ForEach(TandemRegion.allCases) { value in
+                            Text(value.rawValue).tag(value)
+                        }
+                    }
+
+                    TextField("Pump serial number (optional)", text: $pumpSerialNumber)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                }
+
+                Section("Adapter") {
+                    TextField("http://127.0.0.1:8091", text: $adapterBaseURLString)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                        .autocorrectionDisabled()
+                }
+
+                Section("What InSite does") {
+                    Text("InSite sends Tandem credentials only to the adapter service, asks it to write canonical Firestore telemetry, then continues normal app hydration from Firestore.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Tandem")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isConnecting ? "Connecting…" : "Connect") {
+                        onSave(adapterBaseURLString, email, password, region, pumpSerialNumber)
+                    }
+                    .disabled(
+                        isConnecting ||
+                        adapterBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        password.isEmpty
+                    )
+                }
+            }
+            .task {
+                adapterBaseURLString = initialState.adapterBaseURLString
+                region = initialState.region
+                pumpSerialNumber = initialState.pumpSerialNumber
             }
         }
     }

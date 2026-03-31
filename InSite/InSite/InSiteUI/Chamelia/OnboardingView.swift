@@ -355,6 +355,15 @@ struct QuestionnaireOnboardingView: View {
             singleChoice("How often do you want recommendations?", selection: $preferenceDraft.recommendationCadence, options: [
                 (.daily, "Daily"), (.weekly, "Weekly"), (.significant, "Only significant changes")
             ])
+            singleChoice("What's the smallest ISF change you'd actually bother applying?", selection: $preferenceDraft.minimumAcceptableISFChange, options: [
+                (.tiny, "Tiny"), (.meaningful, "Meaningful"), (.substantial, "Substantial")
+            ])
+            singleChoice("What's the smallest carb ratio change you'd actually bother applying?", selection: $preferenceDraft.minimumAcceptableCRChange, options: [
+                (.tiny, "Tiny"), (.meaningful, "Meaningful"), (.substantial, "Substantial")
+            ])
+            singleChoice("What's the smallest basal change you'd actually bother applying?", selection: $preferenceDraft.minimumAcceptableBasalChange, options: [
+                (.tiny, "Tiny"), (.meaningful, "Meaningful"), (.substantial, "Substantial")
+            ])
             singleChoice("How precisely do you implement pump setting changes when you make them?", selection: $answers.complianceLevel, options: [
                 (.exact, "Exactly as set"), (.close, "Pretty closely"), (.rough, "Roughly"), (.forget, "Sometimes forget / approximate")
             ])
@@ -468,7 +477,8 @@ struct QuestionnaireOnboardingView: View {
                     burdenSensitivity: QuestionnaireToPriors.burdenSensitivityValue(preferencesSnapshot.recommendationCadence),
                     persona: "questionnaire_derived",
                     physicalPriors: physicalPriorsJSON,
-                    calibrationTargets: NightscoutConnectionStore.shared.calibrationTargets(for: authUser.uid)
+                    calibrationTargets: NightscoutConnectionStore.shared.calibrationTargets(for: authUser.uid),
+                    minimumActionDeltaThresholds: QuestionnaireToPriors.minimumActionDeltaThresholds(from: preferencesSnapshot)
                 )
                 try await ChameliaEngine.shared.initialize(patientId: authUser.uid, preferences: prefs)
                 ChameliaQuestionnaireStore.saveAnswers(answersSnapshot, userId: authUser.uid)

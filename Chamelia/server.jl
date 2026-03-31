@@ -383,6 +383,17 @@ function _preferences(payload::AbstractDict{String, <:Any}) :: UserPreferences
         result
     end
 
+    minimum_action_delta_thresholds = begin
+        raw_thresholds = get(raw, "minimum_action_delta_thresholds", Dict{String, Any}())
+        raw_thresholds isa AbstractDict || throw(ArgumentError("`preferences.minimum_action_delta_thresholds` must be a JSON object"))
+        result = Dict{String, Float64}()
+        for (key, value) in raw_thresholds
+            key isa AbstractString || throw(ArgumentError("`preferences.minimum_action_delta_thresholds` keys must be strings"))
+            result[String(key)] = _as_float(value, "preferences.minimum_action_delta_thresholds.$key")
+        end
+        result
+    end
+
     return UserPreferences(
         aggressiveness = _as_float(get(raw, "aggressiveness", defaults.aggressiveness), "preferences.aggressiveness"),
         hypoglycemia_fear = _as_float(get(raw, "hypoglycemia_fear", defaults.hypoglycemia_fear), "preferences.hypoglycemia_fear"),
@@ -393,7 +404,8 @@ function _preferences(payload::AbstractDict{String, <:Any}) :: UserPreferences
             String(persona)
         end,
         physical_priors = physical_priors,
-        calibration_targets = calibration_targets
+        calibration_targets = calibration_targets,
+        minimum_action_delta_thresholds = minimum_action_delta_thresholds
     )
 end
 
@@ -406,13 +418,24 @@ function _segment_surface(raw, key::String) :: Main.SegmentSurface
         segment_id = "segment_$(start_min)_$(end_min)"
     end
 
+    parameter_values = begin
+        raw_parameters = get(raw, "parameter_values", nothing)
+        if raw_parameters isa AbstractDict
+            Dict{Symbol, Float64}(Symbol(String(k)) => _as_float(v, "$key.parameter_values.$k") for (k, v) in raw_parameters)
+        else
+            Dict{Symbol, Float64}(
+                :isf => _as_float(get(raw, "isf", nothing), "$key.isf"),
+                :cr => _as_float(get(raw, "cr", nothing), "$key.cr"),
+                :basal => _as_float(get(raw, "basal", nothing), "$key.basal"),
+            )
+        end
+    end
+
     return Main.SegmentSurface(
         segment_id = String(segment_id),
         start_min = Int(round(_as_float(get(raw, "start_min", nothing), "$key.start_min"))),
         end_min = Int(round(_as_float(get(raw, "end_min", nothing), "$key.end_min"))),
-        isf = _as_float(get(raw, "isf", nothing), "$key.isf"),
-        cr = _as_float(get(raw, "cr", nothing), "$key.cr"),
-        basal = _as_float(get(raw, "basal", nothing), "$key.basal"),
+        parameter_values = parameter_values,
     )
 end
 
@@ -831,6 +854,39 @@ function _load_from_backend(
     end
 end
 
+function _try_load_from_backend(
+    patient_id::String;
+    ctx::Union{Nothing, Dict{String, Any}}=nothing,
+    route_stage::String="state.load_from_backend"
+) :: Union{Chamelia.ChameliaSystem, Nothing}
+    fields = _patient_fields(patient_id)
+    try
+        return _load_from_backend(patient_id; ctx=ctx)
+    catch err
+        _emit_log(
+            "WARNING",
+            "state_load_ignored";
+            ctx=ctx,
+            stage=route_stage,
+            fields=_merge_fields(
+                fields,
+                Dict(
+                    "error_type" => string(typeof(err)),
+                    "error_message" => sprint(showerror, err)
+                )
+            )
+        )
+        return nothing
+    end
+end
+
+function _try_load_from_backend_for_initialize(
+    patient_id::String;
+    ctx::Union{Nothing, Dict{String, Any}}=nothing
+) :: Union{Chamelia.ChameliaSystem, Nothing}
+    return _try_load_from_backend(patient_id; ctx=ctx, route_stage="route.chamelia_initialize_patient")
+end
+
 function _persist_state!(
     patient_id::String,
     system::Chamelia.ChameliaSystem;
@@ -859,7 +915,7 @@ function _lookup_patient(
 
         _emit_log("INFO", "patient_cache_miss"; ctx=ctx, stage="patient.lookup", fields=fields)
         if autoload
-            loaded = _load_from_backend(patient_id; ctx=ctx)
+            loaded = _try_load_from_backend(patient_id; ctx=ctx, route_stage="patient.lookup")
             if !isnothing(loaded)
                 PATIENTS[patient_id] = loaded
                 _emit_log("INFO", "patient_autoloaded"; ctx=ctx, stage="patient.lookup", fields=fields)
@@ -925,9 +981,7 @@ function _serialize_action(action) :: Dict{String, Any}
             "segment_deltas" => [
                 Dict(
                     "segment_id" => delta.segment_id,
-                    "isf_delta" => delta.isf_delta,
-                    "cr_delta" => delta.cr_delta,
-                    "basal_delta" => delta.basal_delta,
+                    "parameter_deltas" => Dict(String(key) => value for (key, value) in delta.parameter_deltas),
                 )
                 for delta in action.segment_deltas
             ],
@@ -1013,9 +1067,7 @@ function _serialize_recommendation(pkg) :: Dict{String, Any}
             Dict(
                 "segment_id" => summary.segment_id,
                 "label" => summary.label,
-                "isf" => summary.isf,
-                "cr" => summary.cr,
-                "basal" => summary.basal,
+                "parameter_summaries" => summary.parameter_summaries,
             )
             for summary in pkg.segment_summaries
         ],
@@ -1037,7 +1089,7 @@ function _initialize_handler(payload::Dict{String, Any}, ctx::Dict{String, Any})
             return _json_response(200, Dict("ok" => true, "patient_id" => patient_id, "status" => _status_payload(PATIENTS[patient_id])))
         end
 
-        system = _load_from_backend(patient_id; ctx=ctx)
+        system = _try_load_from_backend_for_initialize(patient_id; ctx=ctx)
         if isnothing(system)
             prefs = _with_stage_logging(ctx, "route.initialize.preferences"; fields=patient_fields) do
                 return _preferences(payload)
@@ -1362,6 +1414,9 @@ end
 function main() :: Nothing
     port = parse(Int, get(ENV, "PORT", "8080"))
     credentials_path = get(ENV, "GOOGLE_APPLICATION_CREDENTIALS", "")
+    if get(ENV, "STORAGE_BACKEND", "") == "memory"
+        set_state_backend!(InMemoryStateBackend())
+    end
     _emit_log(
         "INFO",
         "server_starting";

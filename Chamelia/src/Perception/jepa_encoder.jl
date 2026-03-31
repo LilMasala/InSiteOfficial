@@ -288,13 +288,20 @@ function (enc::HierarchicalJEPAEncoder)(
     batch  = size(subhourly, 5)
 
     # ── Level 1: encode each hour independently ───────────────────
-    # run HourlyEncoder over every hour of every day
-    hourly_summaries = Array{Float32}(undef, 32, 24, n_days, batch)
-    for d in 1:n_days
-        for h in 1:24
-            x_hour = subhourly[:, :, h, d, :]   # (n_subhourly, 12, batch)
-            hourly_summaries[:, h, d, :] = enc.hourly(x_hour)
+    # When there are no sub-hourly signals, skip the HourlyEncoder and
+    # use zero summaries — same as the training path in jepa_training.jl.
+    d_hourly = length(enc.hourly.cls_token)
+    hourly_summaries = if size(subhourly, 1) == 0
+        zeros(Float32, d_hourly, 24, n_days, batch)
+    else
+        out = Array{Float32}(undef, d_hourly, 24, n_days, batch)
+        for d in 1:n_days
+            for h in 1:24
+                x_hour = subhourly[:, :, h, d, :]   # (n_subhourly, 12, batch)
+                out[:, h, d, :] = enc.hourly(x_hour)
+            end
         end
+        out
     end
 
     # ── Level 2: encode each day independently ────────────────────

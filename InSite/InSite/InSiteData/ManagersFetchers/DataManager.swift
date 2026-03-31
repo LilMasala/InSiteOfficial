@@ -118,6 +118,309 @@ struct HealthBackfillConfiguration: Codable, Equatable {
     }
 }
 
+enum TelemetrySource: String, Codable, CaseIterable, Identifiable {
+    case none
+    case nightscout
+    case tandemDirect
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .none: return "None"
+        case .nightscout: return "Nightscout"
+        case .tandemDirect: return "Tandem Direct"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .none:
+            return "Use HealthKit and existing Firestore data only."
+        case .nightscout:
+            return "Validate and import recent CGM, profile, and treatment context from Nightscout."
+        case .tandemDirect:
+            return "Ask the local Tandem adapter to import canonical therapy and insulin context."
+        }
+    }
+}
+
+enum TandemRegion: String, Codable, CaseIterable, Identifiable {
+    case us = "US"
+    case eu = "EU"
+
+    var id: String { rawValue }
+}
+
+enum TandemConnectionStatus: String, Codable {
+    case disconnected
+    case connected
+    case failed
+    case needsReauth = "needs_reauth"
+
+    var title: String {
+        switch self {
+        case .disconnected: return "Not connected"
+        case .connected: return "Connected"
+        case .failed: return "Failed"
+        case .needsReauth: return "Needs Re-Auth"
+        }
+    }
+}
+
+struct TandemConnectionState: Codable, Equatable {
+    var adapterBaseURLString: String = ""
+    var region: TandemRegion = .us
+    var pumpSerialNumber: String = ""
+    var status: TandemConnectionStatus = .disconnected
+    var hasAttemptedConnection: Bool = false
+    var lastSuccessfulSync: Date?
+    var lastErrorMessage: String?
+    var updatedAt: Date?
+
+    var normalizedAdapterBaseURLString: String {
+        adapterBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    var isAdapterConfigured: Bool {
+        !normalizedAdapterBaseURLString.isEmpty
+    }
+
+    var isConnected: Bool { status == .connected }
+    var needsReauth: Bool { status == .needsReauth }
+
+    var shouldAttemptStatusRefresh: Bool {
+        isAdapterConfigured && (hasAttemptedConnection || isConnected || needsReauth || lastSuccessfulSync != nil)
+    }
+}
+
+enum TandemAdapterError: LocalizedError {
+    case missingAuthenticatedUser
+    case invalidURL
+    case invalidResponse
+    case serverError(Int, String)
+    case adapterError(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingAuthenticatedUser:
+            return "Sign in before connecting Tandem."
+        case .invalidURL:
+            return "Enter a valid Tandem adapter URL."
+        case .invalidResponse:
+            return "The Tandem adapter returned an unexpected response."
+        case let .serverError(code, message):
+            return message.isEmpty ? "The Tandem adapter returned an error (\(code))." : message
+        case let .adapterError(message):
+            return message
+        }
+    }
+}
+
+private enum TelemetrySourcePreferences {
+    static func key(for uid: String) -> String { "TelemetrySource.\(uid)" }
+
+    static func load(for uid: String?) -> TelemetrySource {
+        guard let uid, !uid.isEmpty,
+              let rawValue = UserDefaults.standard.string(forKey: key(for: uid)),
+              let source = TelemetrySource(rawValue: rawValue) else {
+            return .none
+        }
+        return source
+    }
+
+    static func save(_ source: TelemetrySource, for uid: String?) {
+        guard let uid, !uid.isEmpty else { return }
+        UserDefaults.standard.set(source.rawValue, forKey: key(for: uid))
+    }
+}
+
+final class TelemetrySourceStore: ObservableObject {
+    static let shared = TelemetrySourceStore()
+
+    @Published private(set) var selectedSource: TelemetrySource = .none
+
+    private init() {
+        refresh()
+    }
+
+    func refresh(for uid: String? = Auth.auth().currentUser?.uid) {
+        selectedSource = TelemetrySourcePreferences.load(for: uid)
+    }
+
+    func setSelectedSource(_ source: TelemetrySource, for uid: String? = Auth.auth().currentUser?.uid) {
+        selectedSource = source
+        TelemetrySourcePreferences.save(source, for: uid)
+    }
+}
+
+private struct TandemStatusResponse: Decodable {
+    let ok: Bool
+    let connected: Bool?
+    let needsReauth: Bool?
+    let source: String?
+    let region: String?
+    let lastSuccessfulSync: String?
+    let lastError: String?
+}
+
+private struct TandemConnectResponse: Decodable {
+    let ok: Bool
+    let connectionState: String?
+    let source: String?
+    let region: String?
+    let error: String?
+}
+
+struct TandemSyncResponse: Decodable {
+    let ok: Bool
+    let source: String?
+    let therapySnapshotDocId: String?
+    let therapySnapshotWritten: Bool?
+    let eventCount: Int?
+    let hourlyContextWritten: Bool?
+    let lastSuccessfulSync: String?
+    let error: String?
+}
+
+private actor TandemAdapterClient {
+    func connect(
+        baseURLString: String,
+        uid: String,
+        email: String,
+        password: String,
+        region: TandemRegion,
+        pumpSerialNumber: String?
+    ) async throws -> TandemConnectionState {
+        let body = TandemConnectRequest(
+            uid: uid,
+            email: email,
+            password: password,
+            region: region.rawValue,
+            pumpSerialNumber: pumpSerialNumber
+        )
+        let response: TandemConnectResponse = try await request(
+            baseURLString: baseURLString,
+            path: "/telemetry/tandem/connect",
+            method: "POST",
+            body: body
+        )
+        guard response.ok else {
+            throw TandemAdapterError.adapterError(response.error ?? "Tandem connection failed.")
+        }
+        return try await status(baseURLString: baseURLString, uid: uid, fallbackRegion: region)
+    }
+
+    func status(
+        baseURLString: String,
+        uid: String,
+        fallbackRegion: TandemRegion? = nil
+    ) async throws -> TandemConnectionState {
+        let response: TandemStatusResponse = try await request(
+            baseURLString: baseURLString,
+            path: "/telemetry/tandem/status?uid=\(uid.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? uid)",
+            method: "GET",
+            body: Optional<Int>.none
+        )
+        guard response.ok else {
+            throw TandemAdapterError.invalidResponse
+        }
+
+        let region = TandemRegion(rawValue: response.region ?? fallbackRegion?.rawValue ?? TandemRegion.us.rawValue) ?? .us
+        let status: TandemConnectionStatus
+        if response.needsReauth == true {
+            status = .needsReauth
+        } else if response.connected == true {
+            status = .connected
+        } else if response.lastError != nil {
+            status = .failed
+        } else {
+            status = .disconnected
+        }
+
+        return TandemConnectionState(
+            adapterBaseURLString: baseURLString,
+            region: region,
+            pumpSerialNumber: "",
+            status: status,
+            lastSuccessfulSync: parseISODate(response.lastSuccessfulSync),
+            lastErrorMessage: response.lastError,
+            updatedAt: Date()
+        )
+    }
+
+    func sync(baseURLString: String, uid: String, days: Int) async throws -> TandemSyncResponse {
+        let response: TandemSyncResponse = try await request(
+            baseURLString: baseURLString,
+            path: "/telemetry/tandem/sync",
+            method: "POST",
+            body: TandemSyncRequest(uid: uid, days: days)
+        )
+        guard response.ok else {
+            throw TandemAdapterError.adapterError(response.error ?? "Tandem sync failed.")
+        }
+        return response
+    }
+
+    private func request<Body: Encodable, Response: Decodable>(
+        baseURLString: String,
+        path: String,
+        method: String,
+        body: Body?
+    ) async throws -> Response {
+        let trimmed = baseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let baseURL = URL(string: trimmed), !trimmed.isEmpty else {
+            throw TandemAdapterError.invalidURL
+        }
+        guard let url = URL(string: path, relativeTo: baseURL) else {
+            throw TandemAdapterError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = 30
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(body)
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw TandemAdapterError.invalidResponse
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String ?? ""
+            throw TandemAdapterError.serverError(http.statusCode, message)
+        }
+
+        do {
+            return try JSONDecoder().decode(Response.self, from: data)
+        } catch {
+            throw TandemAdapterError.invalidResponse
+        }
+    }
+
+    private func parseISODate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
+    private struct TandemConnectRequest: Encodable {
+        let uid: String
+        let email: String
+        let password: String
+        let region: String
+        let pumpSerialNumber: String?
+    }
+
+    private struct TandemSyncRequest: Encodable {
+        let uid: String
+        let days: Int
+    }
+}
+
 enum NightscoutAuthMode: String, Codable, CaseIterable, Identifiable {
     case accessToken
     case apiSecret
@@ -592,6 +895,34 @@ private actor NightscoutClient {
         }
     }
 
+    private func intValue(_ raw: Any?) -> Int? {
+        switch raw {
+        case let value as Int:
+            return value
+        case let value as NSNumber:
+            return value.intValue
+        case let value as Double:
+            return Int(value)
+        case let value as String:
+            return Int(value)
+        default:
+            return nil
+        }
+    }
+
+    private func stringValue(_ raw: Any?) -> String? {
+        switch raw {
+        case let value as String:
+            return value
+        case let value as NSNumber:
+            return value.stringValue
+        case let value as CustomStringConvertible:
+            return value.description
+        default:
+            return nil
+        }
+    }
+
     private func sha1Hex(_ secret: String) -> String {
         let encoded = secret.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? secret
         let digest = Insecure.SHA1.hash(data: Data(encoded.utf8))
@@ -684,6 +1015,172 @@ final class NightscoutConnectionStore: ObservableObject {
     }
 }
 
+final class TandemConnectionStore: ObservableObject {
+    static let shared = TandemConnectionStore()
+
+    @Published private(set) var state = TandemConnectionState()
+
+    private let client = TandemAdapterClient()
+    private let defaults = UserDefaults.standard
+
+    private init() {
+        refresh()
+    }
+
+    func refresh(for uid: String? = Auth.auth().currentUser?.uid) {
+        state = loadState(for: uid)
+    }
+
+    func connect(
+        adapterBaseURLString: String,
+        email: String,
+        password: String,
+        region: TandemRegion,
+        pumpSerialNumber: String,
+        uid: String? = Auth.auth().currentUser?.uid
+    ) async throws {
+        guard let uid, !uid.isEmpty else {
+            throw TandemAdapterError.missingAuthenticatedUser
+        }
+
+        var nextState = loadState(for: uid)
+        nextState.adapterBaseURLString = adapterBaseURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        nextState.region = region
+        nextState.pumpSerialNumber = pumpSerialNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        nextState.hasAttemptedConnection = true
+        nextState.lastErrorMessage = nil
+        nextState.updatedAt = Date()
+        saveState(nextState, for: uid)
+        state = nextState
+
+        do {
+            var validatedState = try await client.connect(
+                baseURLString: nextState.normalizedAdapterBaseURLString,
+                uid: uid,
+                email: email.trimmingCharacters(in: .whitespacesAndNewlines),
+                password: password,
+                region: region,
+                pumpSerialNumber: nextState.pumpSerialNumber.isEmpty ? nil : nextState.pumpSerialNumber
+            )
+            validatedState.pumpSerialNumber = nextState.pumpSerialNumber
+            validatedState.updatedAt = Date()
+            saveState(validatedState, for: uid)
+            state = validatedState
+        } catch {
+            nextState.status = .failed
+            nextState.lastErrorMessage = error.localizedDescription
+            nextState.updatedAt = Date()
+            saveState(nextState, for: uid)
+            state = nextState
+            throw error
+        }
+    }
+
+    func refreshStatus(for uid: String? = Auth.auth().currentUser?.uid) async throws {
+        guard let uid, !uid.isEmpty else {
+            throw TandemAdapterError.missingAuthenticatedUser
+        }
+        let existingState = loadState(for: uid)
+        guard existingState.shouldAttemptStatusRefresh else {
+            state = existingState
+            return
+        }
+
+        do {
+            var refreshedState = try await client.status(
+                baseURLString: existingState.normalizedAdapterBaseURLString,
+                uid: uid,
+                fallbackRegion: existingState.region
+            )
+            refreshedState.pumpSerialNumber = existingState.pumpSerialNumber
+            refreshedState.updatedAt = Date()
+            saveState(refreshedState, for: uid)
+            state = refreshedState
+        } catch {
+            var failedState = existingState
+            failedState.status = .failed
+            failedState.lastErrorMessage = error.localizedDescription
+            failedState.updatedAt = Date()
+            saveState(failedState, for: uid)
+            state = failedState
+            throw error
+        }
+    }
+
+    func sync(days: Int, for uid: String? = Auth.auth().currentUser?.uid) async throws -> TandemSyncResponse {
+        guard let uid, !uid.isEmpty else {
+            throw TandemAdapterError.missingAuthenticatedUser
+        }
+        let existingState = loadState(for: uid)
+        let baseURLString = existingState.normalizedAdapterBaseURLString
+        guard existingState.isAdapterConfigured else {
+            throw TandemAdapterError.adapterError("Configure Tandem first.")
+        }
+        guard existingState.hasAttemptedConnection else {
+            throw TandemAdapterError.adapterError("Connect Tandem first.")
+        }
+
+        do {
+            let response = try await client.sync(baseURLString: baseURLString, uid: uid, days: days)
+            var refreshedState = try await client.status(
+                baseURLString: baseURLString,
+                uid: uid,
+                fallbackRegion: existingState.region
+            )
+            refreshedState.pumpSerialNumber = existingState.pumpSerialNumber
+            refreshedState.updatedAt = Date()
+            saveState(refreshedState, for: uid)
+            state = refreshedState
+            return response
+        } catch {
+            var failedState = existingState
+            failedState.status = .failed
+            failedState.lastErrorMessage = error.localizedDescription
+            failedState.updatedAt = Date()
+            saveState(failedState, for: uid)
+            state = failedState
+            throw error
+        }
+    }
+
+    private func key(for uid: String) -> String {
+        "TandemConnectionState.\(uid)"
+    }
+
+    private func loadState(for uid: String?) -> TandemConnectionState {
+        guard let uid, !uid.isEmpty,
+              let data = defaults.data(forKey: key(for: uid)),
+              let decoded = try? JSONDecoder().decode(TandemConnectionState.self, from: data) else {
+            return TandemConnectionState()
+        }
+        return migrateLegacyState(decoded)
+    }
+
+    private func saveState(_ state: TandemConnectionState, for uid: String) {
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        defaults.set(data, forKey: key(for: uid))
+    }
+
+    private func migrateLegacyState(_ state: TandemConnectionState) -> TandemConnectionState {
+        var migrated = state
+        let legacyLocalhost = "http://127.0.0.1:8091"
+        let normalizedLegacyLocalhost = "http://127.0.0.1:8091"
+        let isLegacyDefaultURL =
+            migrated.adapterBaseURLString == legacyLocalhost ||
+            migrated.normalizedAdapterBaseURLString == normalizedLegacyLocalhost
+
+        if isLegacyDefaultURL && !migrated.hasAttemptedConnection && migrated.lastSuccessfulSync == nil {
+            migrated.adapterBaseURLString = ""
+            if migrated.status == .failed || migrated.status == .disconnected {
+                migrated.status = .disconnected
+                migrated.lastErrorMessage = nil
+            }
+        }
+
+        return migrated
+    }
+}
+
 // MARK: - ActiveProfileResolver (in-memory; no network per row)
 private struct ActiveProfileResolver {
     struct Interval { let start: Date; let end: Date; let snap: TherapySnapshot }
@@ -752,10 +1249,13 @@ final class DataManager {
     }
 
     // MARK: - Sync entrypoint (stops spinner after fetches + writes)
-    func syncHealthData(initialBackfill: HealthBackfillConfiguration? = nil, completion: @escaping () -> Void) {
+    func syncHealthData(
+        initialBackfill: HealthBackfillConfiguration? = nil,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
         guard let uid = Auth.auth().currentUser?.uid else {
             print("[DataManager] No authenticated user; skipping health data sync.")
-            DispatchQueue.main.async { completion() }
+            DispatchQueue.main.async { completion(.success(())) }
             return
         }
         uploader.refresh(for: uid)
@@ -811,6 +1311,18 @@ final class DataManager {
         
 
         Task {
+            do {
+                try await self.syncSelectedTelemetrySource(
+                    userId: uid,
+                    lookbackDays: max(14, initialConfiguration?.maximumDays ?? 14)
+                )
+            } catch {
+                await MainActor.run {
+                    completion(.failure(error))
+                }
+                return
+            }
+
             // Build one in-memory resolver (no per-row awaits)
             let snapshots = (try? await TherapySettingsLogManager.shared
                 .loadSnapshots(since: overallStartDate, until: endDate)) ?? []
@@ -1011,7 +1523,7 @@ final class DataManager {
                         return cal.date(from: comps)!
                     }
                     let span: ClosedRange<Date> = floorToHourUTC(overallStartDate)...floorToHourUTC(endDate)
-                    let nightscoutSummary = await self.validatedNightscoutSummary(for: uid)
+                    let insulinCtx = await self.loadCanonicalInsulinCTXByHour(userId: uid, span: span)
 
                     let bgCtx: [Date: BGCTX] = buildBGCTXByHour(
                         hourly: bg_hourly,
@@ -1043,15 +1555,8 @@ final class DataManager {
                     )
                     let moodEvents = MoodCache.shared.load()
                     let moodCtx: [Date: MoodCTX] = buildMoodCTXByHour(span: span, events: moodEvents, maxCarryHours: 24)
-                    let insulinCtx: [Date: InsulinCTX] = buildInsulinCTXByHour(summary: nightscoutSummary, span: span)
 
                     var latestFrame: FeatureFrameHourly?
-
-                    if let nightscoutSummary {
-                        writes.enter()
-                        await self.applyNightscoutSummary(nightscoutSummary, userId: uid)
-                        writes.leave()
-                    }
 
                     writes.enter()
                     SiteChangeData.shared.buildSiteCtxByHour(startUtc: span.lowerBound, endUtc: span.upperBound) { siteCtx in
@@ -1099,7 +1604,7 @@ final class DataManager {
                                     initialConfiguration?.save(for: uid)
                                     UserDefaults.standard.set(true, forKey: firstRunKey)
                                 }
-                                completion()
+                                completion(.success(()))
                             }
                         }
                     }
@@ -1111,6 +1616,58 @@ final class DataManager {
 }
 
 private extension DataManager {
+    func syncSelectedTelemetrySource(userId: String, lookbackDays: Int) async throws {
+        let selectedSource = TelemetrySourcePreferences.load(for: userId)
+        switch selectedSource {
+        case .none:
+            return
+        case .nightscout:
+            guard let summary = await validatedNightscoutSummary(for: userId) else {
+                throw TandemAdapterError.adapterError("Nightscout sync failed. Check the connection in Settings and try again.")
+            }
+            await applyNightscoutSummary(summary, userId: userId)
+        case .tandemDirect:
+            _ = try await TandemConnectionStore.shared.sync(days: lookbackDays, for: userId)
+        }
+    }
+
+    func loadCanonicalInsulinCTXByHour(userId: String, span: ClosedRange<Date>) async -> [Date: InsulinCTX] {
+        let collection = Firestore.firestore()
+            .collection("users")
+            .document(userId)
+            .collection("insulin_context")
+            .document("hourly")
+            .collection("items")
+
+        do {
+            let documents = try await collection
+                .whereField(FieldPath.documentID(), isGreaterThanOrEqualTo: isoHourId(span.lowerBound))
+                .whereField(FieldPath.documentID(), isLessThanOrEqualTo: isoHourId(span.upperBound))
+                .getDocuments()
+                .documents
+
+            var output: [Date: InsulinCTX] = [:]
+            let parser = ISO8601DateFormatter()
+            for document in documents {
+                let payload = document.data()
+                let rawHour = (payload["hourStartUtc"] as? String) ?? document.documentID
+                guard let hour = parser.date(from: rawHour) else { continue }
+                output[hour] = InsulinCTX(
+                    hourStartUtc: hour,
+                    iob: (payload["iob"] as? NSNumber)?.doubleValue,
+                    cob: (payload["cob"] as? NSNumber)?.doubleValue,
+                    recentBolusCount: (payload["recentBolusCount"] as? NSNumber)?.intValue,
+                    recentCarbEntryCount: (payload["recentCarbEntryCount"] as? NSNumber)?.intValue,
+                    recentTempBasalCount: (payload["recentTempBasalCount"] as? NSNumber)?.intValue
+                )
+            }
+            return output
+        } catch {
+            print("[DataManager] Canonical insulin context load failed: \(error.localizedDescription)")
+            return [:]
+        }
+    }
+
     func validatedNightscoutSummary(for userId: String) async -> NightscoutBootstrapSummary? {
         do {
             try await NightscoutConnectionStore.shared.validateConnection(for: userId)
@@ -1156,6 +1713,14 @@ private extension DataManager {
         await withCheckedContinuation { continuation in
             self.uploader.uploadNightscoutInsulinContext(summary) {
                 continuation.resume()
+            }
+        }
+
+        if !summary.recentTreatmentEvents.isEmpty {
+            await withCheckedContinuation { continuation in
+                self.uploader.uploadNightscoutTreatmentEvents(summary.recentTreatmentEvents) {
+                    continuation.resume()
+                }
             }
         }
     }

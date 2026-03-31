@@ -120,6 +120,9 @@ function _segment_at_minute(
     return isempty(segments) ? nothing : segments[1]
 end
 
+_segment_parameter(segment::SegmentSurface, key::Symbol, default::Float64=0.0) =
+    Float64(get(segment.parameter_values, key, default))
+
 function _apply_structure_edits(
     segments::Vector{SegmentSurface},
     edits::Vector{StructureEdit}
@@ -136,17 +139,13 @@ function _apply_structure_edits(
                 segment_id = "$(segment.segment_id)_a",
                 start_min = segment.start_min,
                 end_min = split_at,
-                isf = segment.isf,
-                cr = segment.cr,
-                basal = segment.basal,
+                parameter_values = deepcopy(segment.parameter_values),
             )
             right = SegmentSurface(
                 segment_id = "$(segment.segment_id)_b",
                 start_min = split_at,
                 end_min = segment.end_min,
-                isf = segment.isf,
-                cr = segment.cr,
-                basal = segment.basal,
+                parameter_values = deepcopy(segment.parameter_values),
             )
             prefix = idx > 1 ? current[1:idx-1] : SegmentSurface[]
             suffix = idx < length(current) ? current[idx+1:end] : SegmentSurface[]
@@ -166,9 +165,10 @@ function _apply_structure_edits(
                 segment_id = "$(first.segment_id)__$(second.segment_id)",
                 start_min = first.start_min,
                 end_min = second.end_min,
-                isf = (first.isf + second.isf) / 2,
-                cr = (first.cr + second.cr) / 2,
-                basal = (first.basal + second.basal) / 2,
+                parameter_values = Dict(
+                    key => (_segment_parameter(first, key) + _segment_parameter(second, key)) / 2
+                    for key in union(keys(first.parameter_values), keys(second.parameter_values))
+                ),
             )
             current = sort(
                 [seg for seg in current if seg.segment_id != first.segment_id && seg.segment_id != second.segment_id];
@@ -195,9 +195,10 @@ function _apply_segment_deltas(
                 segment_id = segment.segment_id,
                 start_min = segment.start_min,
                 end_min = segment.end_min,
-                isf = max(1e-6, segment.isf * (1.0 + delta.isf_delta)),
-                cr = max(1e-6, segment.cr * (1.0 + delta.cr_delta)),
-                basal = max(1e-6, segment.basal * (1.0 + delta.basal_delta)),
+                parameter_values = Dict(
+                    key => max(1e-6, value * (1.0 + get(delta.parameter_deltas, key, 0.0)))
+                    for (key, value) in segment.parameter_values
+                ),
             )
         end
         for segment in segments
@@ -453,9 +454,21 @@ function sim_step!(
             next_cr = current_cr
             next_basal = current_basal
         else
-            next_isf = clamp(current_isf * edited_segment.isf / max(base_segment.isf, 1e-6), 0.70, 1.35)
-            next_cr = clamp(current_cr * edited_segment.cr / max(base_segment.cr, 1e-6), 0.70, 1.35)
-            next_basal = clamp(current_basal * edited_segment.basal / max(base_segment.basal, 1e-6), 0.75, 1.25)
+            next_isf = clamp(
+                current_isf * _segment_parameter(edited_segment, :isf) / max(_segment_parameter(base_segment, :isf, 1.0), 1e-6),
+                0.70,
+                1.35
+            )
+            next_cr = clamp(
+                current_cr * _segment_parameter(edited_segment, :cr) / max(_segment_parameter(base_segment, :cr, 1.0), 1e-6),
+                0.70,
+                1.35
+            )
+            next_basal = clamp(
+                current_basal * _segment_parameter(edited_segment, :basal) / max(_segment_parameter(base_segment, :basal, 1.0), 1e-6),
+                0.75,
+                1.25
+            )
         end
     else
         next_isf = clamp(current_isf * (1.0 + _action_delta(action, :isf_delta)), 0.70, 1.35)

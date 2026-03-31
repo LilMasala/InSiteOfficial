@@ -47,11 +47,13 @@ using Flux
 using BSON
 
 using Main: AbstractBeliefState, AbstractSimulator, AbstractDomainAdapter,
-            DigitalTwin, MemoryBuffer,
+            DigitalTwin, MemoryBuffer, MemoryRecord,
             ConfiguratorState, RolloutNoise, UserPreferences, Observation,
             PsyState, GaussianBeliefState, ParticleBeliefState, JEPABeliefState,
             ScalarTrust, ScalarBurnout, ScalarEngagement, ScalarBurden,
-            TwinPrior, TwinPosterior, NullAction, UserResponse, RecommendationPackage,
+            TwinPrior, TwinPosterior, NullAction, UserResponse,
+            Accept, Reject, Partial,
+            RecommendationPackage,
             ConnectedAppCapabilities, ConnectedAppState,
             KalmanBeliefEstimator, JEPABeliefEstimator, EpistemicState,
             SignalRegistry, register_signal!, initialize_noise
@@ -222,7 +224,7 @@ function _build_twin_prior(prefs::UserPreferences) :: TwinPrior
         end
     end
 
-    return TwinPrior(
+    return TwinPrior( 
         trust_growth_dist = Beta(2, 10),
         trust_decay_dist = Beta(5, 10),
         burnout_sensitivity_dist = Beta(2, 5),
@@ -238,7 +240,7 @@ function initialize_patient(
     adapter :: Union{AbstractDomainAdapter, Nothing} = nothing,
     weights_dir :: Union{String, Nothing} = nothing
 ) :: ChameliaSystem
-    resolved_adapter = isnothing(adapter) ? Main.InSiteDomainAdapter() : adapter
+    resolved_adapter = isnothing(adapter) ? Main.DefaultDomainAdapter() : adapter
 
     prior = _build_twin_prior(prefs)
 
@@ -473,6 +475,7 @@ function step!(
             capabilities,
             app_state,
             system.adapter,
+            system.prefs,
             obs.signals,
             system.mem
         )
@@ -527,7 +530,14 @@ function record_outcome!(
     signals :: Dict{Symbol, Any},
     cost    :: Float64
 ) :: Nothing
-    Memory.store_outcome!(system.mem, rec_id, response, signals, cost)
+    # Capture the current belief latent BEFORE anything mutates system state.
+    # At this call site system.belief has already been updated by the observe/step
+    # calls that happened between recommendation and outcome recording, so it IS
+    # the z_{t+H} we need for JEPA predictor training.
+    outcome_latent = _latent_μ_from_belief(system.belief)
+
+    Memory.store_outcome!(system.mem, rec_id, response, signals, cost;
+                          latent_μ_at_outcome = outcome_latent)
     _refresh_graduation!(system)
     Memory.maybe_update_critic!(system.mem, system.current_day, system.config)
 
@@ -581,6 +591,87 @@ function record_outcome!(
     end
 
     Actor.train_actor_cql!(system.mem)
+    maybe_train_predictor!(system)
+    return nothing
+end
+
+# ─────────────────────────────────────────────────────────────────
+# JEPA predictor action-conditioned training
+#
+# After enough shadow-period outcomes have accumulated in memory we
+# fine-tune the predictor on real (z_t, a_eff, z_{t+H}) triples.
+# This is SEPARATE from train_encoder! which only learns the latent
+# space structure and correctly uses null actions for VICReg.
+#
+# Trigger: MIN_PREDICTOR_TRAINING_SAMPLES completed triples, then
+# every PREDICTOR_TRAINING_INTERVAL new ones to amortise compute.
+# ─────────────────────────────────────────────────────────────────
+
+const _MIN_PREDICTOR_TRAINING_SAMPLES = 20
+const _PREDICTOR_TRAINING_INTERVAL    = 5
+
+# Extract μ from JEPA belief; nothing for Kalman / particle paths.
+function _latent_μ_from_belief(::AbstractBeliefState) :: Union{Vector{Float32}, Nothing}
+    return nothing
+end
+function _latent_μ_from_belief(belief::JEPABeliefState) :: Union{Vector{Float32}, Nothing}
+    return Float32.(vec(belief.μ))
+end
+
+# Effective action features for a completed memory record.
+# We scale by the patient's response so the predictor learns what
+# actually happened, not just what was recommended:
+#   Accept  → full action (patient implemented the change)
+#   Partial → half-magnitude (partial implementation)
+#   Reject  → zeros (null dynamics — patient made no change)
+#   Hold / no response → zeros
+function _effective_action_features(rec::MemoryRecord) :: Vector{Float32}
+    a = WorldModule.action_to_features(rec.action)
+    response = rec.user_response
+    if isnothing(response) || response == Reject
+        return zeros(Float32, length(a))
+    elseif response == Partial
+        return 0.5f0 .* a
+    else  # Accept
+        return a
+    end
+end
+
+# Build a MemoryTransitionDataset from all completed records that
+# have both latent snapshots populated.
+function _build_latent_triples(mem::MemoryBuffer) :: Perception.MemoryTransitionDataset
+    z_t_list     = Vector{Float32}[]
+    a_feats_list = Vector{Float32}[]
+    z_tH_list    = Vector{Float32}[]
+
+    for rec in mem.records
+        isnothing(rec.latent_μ_at_rec)     && continue
+        isnothing(rec.latent_μ_at_outcome) && continue
+        push!(z_t_list,     rec.latent_μ_at_rec)
+        push!(a_feats_list, _effective_action_features(rec))
+        push!(z_tH_list,    rec.latent_μ_at_outcome)
+    end
+
+    return Perception.MemoryTransitionDataset(z_t_list, a_feats_list, z_tH_list)
+end
+
+function maybe_train_predictor!(system::ChameliaSystem) :: Nothing
+    # Only meaningful when a JEPA predictor is loaded
+    isnothing(system.predictor) && return nothing
+
+    # Count records with both latent snapshots
+    n = count(
+        r -> !isnothing(r.latent_μ_at_rec) && !isnothing(r.latent_μ_at_outcome),
+        system.mem.records
+    )
+
+    n < _MIN_PREDICTOR_TRAINING_SAMPLES && return nothing
+
+    # Retrain every _PREDICTOR_TRAINING_INTERVAL new triples, not every call
+    n % _PREDICTOR_TRAINING_INTERVAL == 0 || return nothing
+
+    dataset = _build_latent_triples(system.mem)
+    Perception.train_predictor!(system.predictor, dataset)
     return nothing
 end
 
@@ -669,7 +760,7 @@ Base.@ccallable function chamelia_initialize_patient(weights_dir::Cstring)::Clon
         system = initialize_patient(
             UserPreferences(),
             Main.InSiteSimulator();
-            adapter=Main.InSiteDomainAdapter(),
+            adapter=Main.DefaultDomainAdapter(),
             weights_dir=_string_or_nothing(weights_dir)
         )
         return Clonglong(_register_system!(system))

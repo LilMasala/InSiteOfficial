@@ -79,24 +79,33 @@ end
 
 # ─────────────────────────────────────────────────────────────────
 # Fill in outcome fields
-# Called delta days after recommendation when outcomes arrive
+# Called delta days after recommendation when outcomes arrive.
+#
+# latent_μ_at_outcome should be the μ of the current JEPA belief at
+# outcome time — i.e. the latent state AFTER the observation windows
+# following the recommendation have been encoded.  Together with
+# latent_μ_at_rec and action this forms the (z_t, a_eff, z_{t+H})
+# triple used to train the JEPA predictor.  Pass nothing for
+# non-JEPA belief types; store_outcome! handles it gracefully.
 # ─────────────────────────────────────────────────────────────────
 
 function store_outcome!(
-    mem      :: MemoryBuffer,
-    rec_id   :: Int,
-    response :: Union{UserResponse, Nothing},
-    signals  :: Dict{Symbol, Any},
-    cost     :: Float64
+    mem                  :: MemoryBuffer,
+    rec_id               :: Int,
+    response             :: Union{UserResponse, Nothing},
+    signals              :: Dict{Symbol, Any},
+    cost                 :: Float64;
+    latent_μ_at_outcome  :: Union{Vector{Float32}, Nothing} = nothing
 ) :: Nothing
 
     idx = findfirst(r -> r.id == rec_id, mem.records)
     isnothing(idx) && return nothing
 
     rec = mem.records[idx]
-    rec.user_response    = response
-    rec.realized_signals = signals
-    rec.realized_cost    = cost
+    rec.user_response       = response
+    rec.realized_signals    = signals
+    rec.realized_cost       = cost
+    rec.latent_μ_at_outcome = latent_μ_at_outcome
 
     return nothing
 end

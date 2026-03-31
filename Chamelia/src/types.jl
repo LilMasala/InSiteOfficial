@@ -9,6 +9,8 @@ using Distributions
 using LinearAlgebra
 using Statistics
 
+if !isdefined(@__MODULE__, :AbstractSimulator)
+
 # ─────────────────────────────────────────────────────────────────
 # constants 
 # ─────────────────────────────────────────────────────────────────
@@ -58,6 +60,8 @@ abstract type AbstractBeliefState end
 
 abstract type AbstractDomainAdapter end
 
+struct DefaultDomainAdapter <: AbstractDomainAdapter end
+
 """
     default_physical_weights(adapter, prefs) :: Dict{Symbol, Float64}
 
@@ -76,6 +80,15 @@ Human-readable identifier for logging and diagnostics.
 """
 function domain_name(adapter :: AbstractDomainAdapter) :: String
     error("$(typeof(adapter)) must implement domain_name")
+end
+
+function default_physical_weights(:: DefaultDomainAdapter, prefs) :: Dict{Symbol, Float64}
+    _ = prefs
+    return Dict{Symbol, Float64}()
+end
+
+function domain_name(:: DefaultDomainAdapter) :: String
+    return "default"
 end
 
 
@@ -238,9 +251,7 @@ Base.@kwdef struct SegmentSurface
     segment_id::String
     start_min::Int
     end_min::Int
-    isf::Float64
-    cr::Float64
-    basal::Float64
+    parameter_values::Dict{Symbol, Float64} = Dict{Symbol, Float64}()
 end
 
 const ProfileSummary = NamedTuple{(:id, :name, :segment_count), Tuple{String, String, Int}}
@@ -258,9 +269,7 @@ end
 
 Base.@kwdef struct SegmentDelta
     segment_id::String
-    isf_delta::Float64 = 0.0
-    cr_delta::Float64 = 0.0
-    basal_delta::Float64 = 0.0
+    parameter_deltas::Dict{Symbol, Float64} = Dict{Symbol, Float64}()
 end
 
 Base.@kwdef struct StructureEdit
@@ -292,9 +301,7 @@ ScheduledAction(
 
 function is_null(a::ScheduledAction) :: Bool
     no_segment_change = all(delta ->
-        abs(delta.isf_delta) < 1e-8 &&
-        abs(delta.cr_delta) < 1e-8 &&
-        abs(delta.basal_delta) < 1e-8,
+        all(abs(value) < 1e-8 for value in values(delta.parameter_deltas)),
         a.segment_deltas
     )
     return no_segment_change && isempty(a.structural_edits)
@@ -304,8 +311,8 @@ function magnitude(a::ScheduledAction) :: Float64
     n_components = 0
     total = 0.0
     for delta in a.segment_deltas
-        total += abs(delta.isf_delta) + abs(delta.cr_delta) + abs(delta.basal_delta)
-        n_components += 3
+        total += sum(abs(value) for value in values(delta.parameter_deltas))
+        n_components += length(delta.parameter_deltas)
     end
     total += length(a.structural_edits)
     n_components += length(a.structural_edits)
@@ -630,6 +637,7 @@ Base.@kwdef struct UserPreferences
     persona            :: String  = "default"
     physical_priors    :: Dict{String, Vector{Float64}} = Dict{String, Vector{Float64}}()
     calibration_targets :: Dict{String, Float64} = Dict{String, Float64}()
+    minimum_action_delta_thresholds :: Dict{String, Float64} = Dict{String, Float64}()
 end
 
 # -------------------------------------------------------------------
@@ -667,6 +675,12 @@ Base.@kwdef mutable struct MemoryRecord
     latent_μ_at_rec :: Union{Vector{Float32}, Nothing} = nothing
     latent_log_σ_at_rec :: Union{Vector{Float32}, Nothing} = nothing
     configurator_mode   :: Symbol = :rules
+
+    # Outcome-time latent snapshot (filled in by record_outcome!).
+    # Together with latent_μ_at_rec and action, this forms the (z_t, a_eff, z_{t+H})
+    # triple used to train the JEPA predictor on real shadow-period transitions.
+    # Nothing when the belief is non-JEPA or before the outcome is recorded.
+    latent_μ_at_outcome :: Union{Vector{Float32}, Nothing} = nothing
 end
 
 mutable struct MemoryBuffer
@@ -738,6 +752,20 @@ function calibrate_posterior!(
     return nothing
 end
 
+"""
+    minimum_action_delta_threshold(adapter, prefs, dimension) :: Float64
+
+Return the user-specific minimum worthwhile change threshold for an opaque
+action-delta label. Chamelia core never interprets the label's domain meaning.
+"""
+function minimum_action_delta_threshold(
+    adapter   :: AbstractDomainAdapter,
+    prefs     :: UserPreferences,
+    dimension :: Symbol
+) :: Float64
+    return max(0.0, get(prefs.minimum_action_delta_thresholds, String(dimension), 0.0))
+end
+
 
 # -------------------------------------------------------------------
 # Output Types
@@ -780,8 +808,8 @@ Base.@kwdef struct RecommendationPackage
     } = nothing
     action_level          :: Int = 1
     action_family         :: Union{ActionFamily, Nothing} = nothing
-    segment_summaries     :: Vector{NamedTuple{(:segment_id, :label, :isf, :cr, :basal), Tuple{String, String, String, String, String}}} =
-        NamedTuple{(:segment_id, :label, :isf, :cr, :basal), Tuple{String, String, String, String, String}}[]
+    segment_summaries     :: Vector{NamedTuple{(:segment_id, :label, :parameter_summaries), Tuple{String, String, Dict{String, String}}}} =
+        NamedTuple{(:segment_id, :label, :parameter_summaries), Tuple{String, String, Dict{String, String}}}[]
     structure_summaries   :: Vector{String} = String[]
     # Profile targeting — which profile this recommendation applies to.
     # "patch_current"  : edit the currently active profile (default, existing behavior)
@@ -805,4 +833,6 @@ struct AnomalyResult
     severity       :: Float64    # [0,1] — how anomalous?
     z_score        :: Float64    # how many SDs from expected?
     flagged_signals :: Vector{Symbol}  # which signals were anomalous?
+end
+
 end

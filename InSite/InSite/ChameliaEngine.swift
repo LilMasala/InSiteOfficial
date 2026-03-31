@@ -221,18 +221,50 @@ struct ConnectedAppState: Codable, Equatable {
 
 struct SegmentDeltaPayload: Codable, Equatable, Identifiable {
     let segmentId: String
-    let isfDelta: Double
-    let crDelta: Double
-    let basalDelta: Double
+    let parameterDeltas: [String: Double]
 
     var id: String { segmentId }
 
     enum CodingKeys: String, CodingKey {
         case segmentId = "segment_id"
+        case parameterDeltas = "parameter_deltas"
         case isfDelta = "isf_delta"
         case crDelta = "cr_delta"
         case basalDelta = "basal_delta"
     }
+
+    init(segmentId: String, parameterDeltas: [String: Double] = [:]) {
+        self.segmentId = segmentId
+        self.parameterDeltas = parameterDeltas
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        segmentId = try container.decode(String.self, forKey: .segmentId)
+        if let generic = try container.decodeIfPresent([String: Double].self, forKey: .parameterDeltas) {
+            parameterDeltas = generic
+        } else {
+            let isfDelta = try container.decodeIfPresent(Double.self, forKey: .isfDelta) ?? 0
+            let crDelta = try container.decodeIfPresent(Double.self, forKey: .crDelta) ?? 0
+            let basalDelta = try container.decodeIfPresent(Double.self, forKey: .basalDelta) ?? 0
+            let decodedDeltas: [String: Double] = [
+                "isf_delta": isfDelta,
+                "cr_delta": crDelta,
+                "basal_delta": basalDelta,
+            ]
+            parameterDeltas = decodedDeltas.filter { abs($0.value) > 0 }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(segmentId, forKey: .segmentId)
+        try container.encode(parameterDeltas, forKey: .parameterDeltas)
+    }
+
+    var isfDelta: Double { parameterDeltas["isf_delta"] ?? 0 }
+    var crDelta: Double { parameterDeltas["cr_delta"] ?? 0 }
+    var basalDelta: Double { parameterDeltas["basal_delta"] ?? 0 }
 }
 
 struct StructureEditPayload: Codable, Equatable, Identifiable {
@@ -279,19 +311,50 @@ struct ScheduledActionPayload: Codable, Equatable {
 struct RecommendationSegmentSummary: Codable, Equatable, Identifiable {
     let segmentId: String
     let label: String
-    let isf: String
-    let cr: String
-    let basal: String
+    let parameterSummaries: [String: String]
 
     var id: String { segmentId }
 
     enum CodingKeys: String, CodingKey {
         case segmentId = "segment_id"
         case label
+        case parameterSummaries = "parameter_summaries"
         case isf
         case cr
         case basal
     }
+
+    init(segmentId: String, label: String, parameterSummaries: [String: String]) {
+        self.segmentId = segmentId
+        self.label = label
+        self.parameterSummaries = parameterSummaries
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        segmentId = try container.decode(String.self, forKey: .segmentId)
+        label = try container.decode(String.self, forKey: .label)
+        if let generic = try container.decodeIfPresent([String: String].self, forKey: .parameterSummaries) {
+            parameterSummaries = generic
+        } else {
+            parameterSummaries = [
+                "isf": try container.decodeIfPresent(String.self, forKey: .isf) ?? "",
+                "cr": try container.decodeIfPresent(String.self, forKey: .cr) ?? "",
+                "basal": try container.decodeIfPresent(String.self, forKey: .basal) ?? ""
+            ].filter { !$0.value.isEmpty }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(segmentId, forKey: .segmentId)
+        try container.encode(label, forKey: .label)
+        try container.encode(parameterSummaries, forKey: .parameterSummaries)
+    }
+
+    var isf: String { parameterSummaries["isf"] ?? parameterSummaries["isf_delta"] ?? "" }
+    var cr: String { parameterSummaries["cr"] ?? parameterSummaries["cr_delta"] ?? "" }
+    var basal: String { parameterSummaries["basal"] ?? parameterSummaries["basal_delta"] ?? "" }
 }
 
 struct TherapyAction: Codable, Equatable {
@@ -531,6 +594,7 @@ struct ChameliaPreferences: Codable, Equatable {
     let persona: String
     let physicalPriors: [String: [Double]]
     let calibrationTargets: [String: Double]
+    let minimumActionDeltaThresholds: [String: Double]
 
     enum CodingKeys: String, CodingKey {
         case aggressiveness
@@ -539,6 +603,10 @@ struct ChameliaPreferences: Codable, Equatable {
         case persona
         case physicalPriors = "physical_priors"
         case calibrationTargets = "calibration_targets"
+        case minimumActionDeltaThresholds = "minimum_action_delta_thresholds"
+        case minimumAcceptableISFDelta = "minimum_acceptable_isf_delta"
+        case minimumAcceptableCRDelta = "minimum_acceptable_cr_delta"
+        case minimumAcceptableBasalDelta = "minimum_acceptable_basal_delta"
     }
 
     init(
@@ -547,7 +615,8 @@ struct ChameliaPreferences: Codable, Equatable {
         burdenSensitivity: Double,
         persona: String,
         physicalPriors: [String: [Double]] = [:],
-        calibrationTargets: [String: Double] = [:]
+        calibrationTargets: [String: Double] = [:],
+        minimumActionDeltaThresholds: [String: Double] = [:]
     ) {
         self.aggressiveness = aggressiveness
         self.hypoglycemiaFear = hypoglycemiaFear
@@ -555,6 +624,41 @@ struct ChameliaPreferences: Codable, Equatable {
         self.persona = persona
         self.physicalPriors = physicalPriors
         self.calibrationTargets = calibrationTargets
+        self.minimumActionDeltaThresholds = minimumActionDeltaThresholds
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        aggressiveness = try container.decode(Double.self, forKey: .aggressiveness)
+        hypoglycemiaFear = try container.decode(Double.self, forKey: .hypoglycemiaFear)
+        burdenSensitivity = try container.decode(Double.self, forKey: .burdenSensitivity)
+        persona = try container.decode(String.self, forKey: .persona)
+        physicalPriors = try container.decodeIfPresent([String: [Double]].self, forKey: .physicalPriors) ?? [:]
+        calibrationTargets = try container.decodeIfPresent([String: Double].self, forKey: .calibrationTargets) ?? [:]
+        if let thresholds = try container.decodeIfPresent([String: Double].self, forKey: .minimumActionDeltaThresholds) {
+            minimumActionDeltaThresholds = thresholds
+        } else {
+            let minimumISFDelta = try container.decodeIfPresent(Double.self, forKey: .minimumAcceptableISFDelta) ?? 0
+            let minimumCRDelta = try container.decodeIfPresent(Double.self, forKey: .minimumAcceptableCRDelta) ?? 0
+            let minimumBasalDelta = try container.decodeIfPresent(Double.self, forKey: .minimumAcceptableBasalDelta) ?? 0
+            let decodedThresholds: [String: Double] = [
+                "isf_delta": minimumISFDelta,
+                "cr_delta": minimumCRDelta,
+                "basal_delta": minimumBasalDelta,
+            ]
+            minimumActionDeltaThresholds = decodedThresholds.filter { $0.value > 0 }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(aggressiveness, forKey: .aggressiveness)
+        try container.encode(hypoglycemiaFear, forKey: .hypoglycemiaFear)
+        try container.encode(burdenSensitivity, forKey: .burdenSensitivity)
+        try container.encode(persona, forKey: .persona)
+        try container.encode(physicalPriors, forKey: .physicalPriors)
+        try container.encode(calibrationTargets, forKey: .calibrationTargets)
+        try container.encode(minimumActionDeltaThresholds, forKey: .minimumActionDeltaThresholds)
     }
 }
 

@@ -162,6 +162,9 @@ export
     save_jepa_weights,
     load_jepa_weights!,
     LAST_JEPA_TRAINING_LOSS,
+    MemoryTransitionDataset,
+    train_predictor!,
+    LAST_PREDICTOR_TRAINING_LOSS,
 
     # epistemic
     compute_epistemic_state,

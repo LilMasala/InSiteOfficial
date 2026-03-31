@@ -718,14 +718,19 @@ struct HomeScreen: View {
                                     return
                                 }
                                 isSyncing = true
-                                DataManager.shared.syncHealthData {
+                                DataManager.shared.syncHealthData { result in
                                     isSyncing = false
-                                    refreshLastSyncText()
-                                    syncTick &+= 1
-                                    Task {
-                                        await refreshChameliaDashboard()
-                                        await refreshChameliaInsights()
-                                        await refreshLatestTherapySnapshot()
+                                    switch result {
+                                    case .success:
+                                        refreshLastSyncText()
+                                        syncTick &+= 1
+                                        Task {
+                                            await refreshChameliaDashboard()
+                                            await refreshChameliaInsights()
+                                            await refreshLatestTherapySnapshot()
+                                        }
+                                    case .failure(let error):
+                                        presentBanner(readableMessage(for: error), tone: .warning)
                                     }
                                 }
                             } label: {
@@ -1368,15 +1373,20 @@ private extension HomeScreen {
         guard !isSyncing else { return }
         isSyncing = true
         let configuration = backfillConfiguration
-        DataManager.shared.syncHealthData(initialBackfill: configuration) {
+        DataManager.shared.syncHealthData(initialBackfill: configuration) { result in
             isSyncing = false
-            showBackfillSetupSheet = false
-            refreshLastSyncText()
-            syncTick &+= 1
-            Task {
-                await refreshChameliaDashboard()
-                await refreshChameliaInsights()
-                await refreshLatestTherapySnapshot()
+            switch result {
+            case .success:
+                showBackfillSetupSheet = false
+                refreshLastSyncText()
+                syncTick &+= 1
+                Task {
+                    await refreshChameliaDashboard()
+                    await refreshChameliaInsights()
+                    await refreshLatestTherapySnapshot()
+                }
+            case .failure(let error):
+                presentBanner(readableMessage(for: error), tone: .warning)
             }
         }
     }

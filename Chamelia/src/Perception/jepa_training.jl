@@ -49,23 +49,39 @@ _sql_ident(name::AbstractString) = "\"" * replace(String(name), "\"" => "\"\"") 
 
 function _row_value(row, col::String) :: Float32
     sym = Symbol(col)
-    value = hasproperty(row, sym) ? getproperty(row, sym) : row[sym]
-    return value isa Number ? Float32(value) : 0.0f0
+    hasproperty(row, sym) || return 0.0f0
+    value = getproperty(row, sym)
+    (ismissing(value) || !(value isa Number)) && return 0.0f0
+    return Float32(value)
+end
+
+# Returns the set of column names that actually exist in the target table.
+# Columns requested by the dataset but absent from the DB silently return 0.
+function _existing_cols(db_path::String, table_name::String) :: Set{String}
+    db   = SQLite.DB(db_path)
+    rows = map(NamedTuple, SQLite.DBInterface.execute(db, "PRAGMA table_info($('"' * table_name * '"'))"))
+    SQLite.close(db)
+    return Set{String}(String(r.name) for r in rows)
 end
 
 function _window_refs(dataset::SQLiteTrainingDataset)
-    cols = unique(vcat(
+    existing = _existing_cols(dataset.db_path, dataset.table_name)
+
+    # Only SELECT columns that exist; missing signal columns will read as 0 via _row_value.
+    wanted = unique(vcat(
         [dataset.user_col, dataset.time_col],
         dataset.subhourly_cols,
         dataset.ctx_cols,
         dataset.daily_cols
     ))
+    cols = filter(c -> c in existing, wanted)
+
     sql = "SELECT " * join(_sql_ident.(cols), ", ") *
           " FROM " * _sql_ident(dataset.table_name) *
           " ORDER BY " * _sql_ident(dataset.user_col) * ", " * _sql_ident(dataset.time_col)
 
     db = SQLite.DB(dataset.db_path)
-    rows = collect(SQLite.DBInterface.execute(db, sql))
+    rows = map(NamedTuple, SQLite.DBInterface.execute(db, sql))
     SQLite.close(db)
 
     grouped = Dict{Any, Vector{Any}}()
@@ -176,21 +192,31 @@ function _encode_training_batch(
     n_days = size(subhourly, 4)
     batch  = size(subhourly, 5)
 
-    hourly_by_day = [
-        begin
-            hourly_tokens = [
-                reshape(
-                    encoder.hourly(subhourly[:, :, hour_idx, day_idx, :]),
-                    :,
-                    1,
-                    batch
-                )
-                for hour_idx in 1:24
-            ]
-            length(hourly_tokens) == 1 ? first(hourly_tokens) : cat(hourly_tokens..., dims=2)
-        end
-        for day_idx in 1:n_days
-    ]
+    # When there are no sub-hourly signals, skip the hourly encoder and use
+    # zero summaries.  Calling Dense(0, d) through Zygote's backward pass on
+    # zero-size arrays is unsupported and raises a DimensionMismatch.
+    n_subhourly = size(subhourly, 1)
+    d_hourly    = length(encoder.hourly.cls_token)
+
+    hourly_by_day = if n_subhourly == 0
+        [zeros(Float32, d_hourly, 24, batch) for _ in 1:n_days]
+    else
+        [
+            begin
+                hourly_tokens = [
+                    reshape(
+                        encoder.hourly(subhourly[:, :, hour_idx, day_idx, :]),
+                        :,
+                        1,
+                        batch
+                    )
+                    for hour_idx in 1:24
+                ]
+                length(hourly_tokens) == 1 ? first(hourly_tokens) : cat(hourly_tokens..., dims=2)
+            end
+            for day_idx in 1:n_days
+        ]
+    end
 
     daily_tokens = [
         reshape(
@@ -265,5 +291,113 @@ function load_jepa_weights!(encoder, predictor, dir::String) :: Nothing
     predictor_state = BSON.load(joinpath(dir, "jepa_predictor.bson"))
     Flux.loadmodel!(encoder, encoder_state[:encoder])
     Flux.loadmodel!(predictor, predictor_state[:predictor])
+    return nothing
+end
+
+# ─────────────────────────────────────────────────────────────────
+# MemoryTransitionDataset
+#
+# Training dataset for PHASE 2 predictor fine-tuning.
+# Built from real shadow-period MemoryRecords by Chamelia.jl, which
+# has access to both MemoryBuffer and WorldModule.action_to_features.
+# Keeping that conversion outside this struct avoids a cross-module
+# dependency between Perception and WorldModule.
+#
+# Each triple is causally grounded:
+#   z_t     — latent belief μ at recommendation time
+#   a_feats — effective action features (scaled by patient response;
+#             see _effective_action_features in Chamelia.jl)
+#   z_tH    — latent belief μ at outcome time, after the subsequent
+#             observe/step calls have updated the encoder's belief
+#
+# Contrast with train_encoder! which uses null actions and VICReg to
+# learn the latent space structure: this dataset teaches the predictor
+# what ACTIONS do to that structure, using real patient behaviour.
+# ─────────────────────────────────────────────────────────────────
+
+struct MemoryTransitionDataset <: AbstractTrainingDataset
+    z_t     :: Vector{Vector{Float32}}   # latent at recommendation time
+    a_feats :: Vector{Vector{Float32}}   # effective action features
+    z_tH    :: Vector{Vector{Float32}}   # latent at outcome time
+end
+
+function n_samples(dataset::MemoryTransitionDataset) :: Int
+    return length(dataset.z_t)
+end
+
+# Returns three matrices of shape (dim, batch_size) sampled with replacement.
+function get_training_batch(
+    dataset    :: MemoryTransitionDataset,
+    batch_size :: Int
+) :: Tuple{Matrix{Float32}, Matrix{Float32}, Matrix{Float32}}
+    n = n_samples(dataset)
+    n == 0 && error("MemoryTransitionDataset has no samples")
+
+    z_dim = length(dataset.z_t[1])
+    a_dim = length(dataset.a_feats[1])
+
+    z_t_batch    = zeros(Float32, z_dim, batch_size)
+    a_feats_batch = zeros(Float32, a_dim, batch_size)
+    z_tH_batch   = zeros(Float32, z_dim, batch_size)
+
+    for i in 1:batch_size
+        idx = rand(1:n)
+        z_t_batch[:, i]     = dataset.z_t[idx]
+        a_feats_batch[:, i] = dataset.a_feats[idx]
+        z_tH_batch[:, i]    = dataset.z_tH[idx]
+    end
+
+    return z_t_batch, a_feats_batch, z_tH_batch
+end
+
+# ─────────────────────────────────────────────────────────────────
+# train_predictor!
+#
+# Fine-tunes the JEPA predictor on real action-conditioned latent
+# transitions accumulated during the shadow period.
+#
+# Loss: MSE in latent space  L = ||ẑ_{t+H} - z_{t+H}||²
+#
+# Why MSE and not VICReg here:
+#   train_encoder! uses VICReg because there is no supervision signal
+#   — we need the variance/covariance terms to prevent collapse.
+#   Here z_{t+H} is the GROUND TRUTH from the encoder, so this is
+#   ordinary supervised regression.  Collapse cannot occur because
+#   the encoder (not the predictor) defines the latent geometry.
+#
+# Horizon: :med — patient outcomes are recorded at medium horizon
+#   (~7 days).  The short and long heads share the trunk so they
+#   benefit indirectly from every update.
+# ─────────────────────────────────────────────────────────────────
+
+const LAST_PREDICTOR_TRAINING_LOSS = Ref{Float64}(NaN)
+
+function train_predictor!(
+    predictor,                          # JEPAPredictor — untyped to avoid WorldModule dependency
+    dataset    :: MemoryTransitionDataset;
+    n_epochs   :: Int    = 20,
+    lr         :: Float64 = 1e-3,
+    batch_size :: Int    = 16
+) :: Nothing
+    n_samples(dataset) == 0 && return nothing
+
+    opt = Flux.setup(Adam(lr), predictor)
+
+    for epoch in 1:n_epochs
+        z_t_batch, a_feats_batch, z_tH_batch = get_training_batch(dataset, batch_size)
+
+        loss, grads = Flux.withgradient(predictor) do pred
+            z_pred = pred(z_t_batch, a_feats_batch, :med)
+            mean((z_pred .- z_tH_batch).^2)
+        end
+
+        LAST_PREDICTOR_TRAINING_LOSS[] = Float64(loss)
+        Flux.update!(opt, predictor, grads[1])
+
+        if epoch % 10 == 0 || epoch == n_epochs
+            @info "Predictor epoch $epoch, MSE=$(round(Float64(loss), digits=4))"
+        end
+    end
+
     return nothing
 end

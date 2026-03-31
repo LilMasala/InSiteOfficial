@@ -112,6 +112,12 @@ enum LastMealTime: String, CaseIterable, Codable {
     case veryLate = "midnight_snacks"
 }
 
+enum MinimumRecommendationChange: String, CaseIterable, Codable {
+    case tiny = "tiny"
+    case meaningful = "meaningful"
+    case substantial = "substantial"
+}
+
 enum StressLevel: String, CaseIterable, Codable {
     case rarely = "rarely"
     case sometimes = "sometimes"
@@ -270,4 +276,7 @@ struct QuestionnaireAnswers: Codable, Equatable {
 struct QuestionnairePreferenceDraft: Codable, Equatable {
     var hypoglycemiaFear: HypoglycemiaFearLevel? = nil
     var recommendationCadence: RecommendationCadence? = nil
+    var minimumAcceptableISFChange: MinimumRecommendationChange? = nil
+    var minimumAcceptableCRChange: MinimumRecommendationChange? = nil
+    var minimumAcceptableBasalChange: MinimumRecommendationChange? = nil
 }

@@ -1,0 +1,19 @@
+[Unit]
+Description=InSite Tandem Adapter Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tandem
+Group=tandem
+WorkingDirectory=/opt/insite/InSiteOfficial
+Environment=GOOGLE_CLOUD_PROJECT=insitev2
+Environment=TANDEM_SECRET_PREFIX=tandem-conn-
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/insite/InSiteOfficial/.venv/bin/python -m tconnectsync_adapter.service --host 0.0.0.0 --port 8091
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

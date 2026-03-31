@@ -40,13 +40,13 @@ using Main: AbstractSimulator, AbstractAction, AbstractBeliefState,
             ActionFamily, parameter_adjustment, structure_edit, continuous_schedule,
             ConnectedAppCapabilities, ConnectedAppState,
             SegmentSurface, SegmentDelta, StructureEdit, ScheduledAction,
-            AbstractDomainAdapter, RegimeDetectionResult
+            AbstractDomainAdapter, RegimeDetectionResult, UserPreferences
 
-import Main: is_null, magnitude, detect_regime   
+import Main: is_null, magnitude, detect_regime, minimum_action_delta_threshold
 
 using Main.WorldModule: MockSimulator, run_rollouts, run_paired_rollouts,
                         JEPA_PREDICTOR, run_latent_rollouts, run_paired_latent_rollouts,
-                        action_to_features, min_clinical_delta
+                        action_to_features, min_clinical_delta, action_dimensions
 using Main.Cost: compute_energies, compute_cvar, compute_effect_size,
                  ZeroCritic, decode_latent_summary
 
@@ -74,7 +74,8 @@ function decide(
     current_day :: Int = 0,
     capabilities::ConnectedAppCapabilities = ConnectedAppCapabilities(),
     app_state   :: ConnectedAppState = ConnectedAppState(),
-    adapter     :: AbstractDomainAdapter = Main.InSiteDomainAdapter(),
+    adapter     :: AbstractDomainAdapter = Main.DefaultDomainAdapter(),
+    prefs       :: UserPreferences = UserPreferences(),
     signals     :: Dict{Symbol, Any} = Dict{Symbol, Any}(),
     memory      :: MemoryBuffer = MemoryBuffer(),
 ) :: Tuple{Union{RecommendationPackage, Nothing}, Symbol, Any}
@@ -127,7 +128,7 @@ function decide(
         ) || continue
 
         # clinical delta gate: is the action magnitude physically meaningful?
-        passes_clinical_delta_gate(result.action, sim) || continue
+        passes_clinical_delta_gate(result.action, sim, adapter, prefs) || continue
 
         push!(survivors, result)
     end
@@ -261,7 +262,8 @@ function decide(
     current_day :: Int = 0,
     capabilities::ConnectedAppCapabilities = ConnectedAppCapabilities(),
     app_state   :: ConnectedAppState = ConnectedAppState(),
-    adapter     :: AbstractDomainAdapter = Main.InSiteDomainAdapter(),
+    adapter     :: AbstractDomainAdapter = Main.DefaultDomainAdapter(),
+    prefs       :: UserPreferences = UserPreferences(),
     signals     :: Dict{Symbol, Any} = Dict{Symbol, Any}(),
     memory      :: MemoryBuffer = MemoryBuffer(),
 ) :: Tuple{Union{RecommendationPackage, Nothing}, Symbol, Any}
@@ -300,7 +302,7 @@ function decide(
         end
         push!(safe_results, result)
         passes_effect_size_gate(result.energies, baseline_energies, config) || continue
-        passes_clinical_delta_gate(result.action, sim) || continue
+        passes_clinical_delta_gate(result.action, sim, adapter, prefs) || continue
         push!(survivors, result)
     end
 
@@ -712,21 +714,23 @@ function _segment_summaries(
     action    :: AbstractAction,
     app_state :: ConnectedAppState
 )
-    action isa ScheduledAction || return NamedTuple{(:segment_id, :label, :isf, :cr, :basal), Tuple{String, String, String, String, String}}[]
+    action isa ScheduledAction || return NamedTuple{(:segment_id, :label, :parameter_summaries), Tuple{String, String, Dict{String, String}}}[]
 
     segment_source = isempty(action.segments) ? app_state.current_segments : action.segments
     segment_lookup = Dict(segment.segment_id => segment for segment in segment_source)
-    summaries = NamedTuple{(:segment_id, :label, :isf, :cr, :basal), Tuple{String, String, String, String, String}}[]
+    summaries = NamedTuple{(:segment_id, :label, :parameter_summaries), Tuple{String, String, Dict{String, String}}}[]
     for delta in action.segment_deltas
-        abs(delta.isf_delta) < 1e-8 && abs(delta.cr_delta) < 1e-8 && abs(delta.basal_delta) < 1e-8 && continue
+        isempty(delta.parameter_deltas) && continue
+        all(abs(value) < 1e-8 for value in values(delta.parameter_deltas)) && continue
         segment = get(segment_lookup, delta.segment_id, nothing)
         label = isnothing(segment) ? delta.segment_id : _segment_label(segment)
         push!(summaries, (
             segment_id = delta.segment_id,
             label = label,
-            isf = _delta_summary("ISF", delta.isf_delta),
-            cr = _delta_summary("CR", delta.cr_delta),
-            basal = _delta_summary("Basal", delta.basal_delta),
+            parameter_summaries = Dict(
+                String(key) => _delta_summary(String(key), value)
+                for (key, value) in delta.parameter_deltas
+            ),
         ))
     end
     return summaries

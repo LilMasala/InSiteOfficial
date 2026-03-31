@@ -140,7 +140,8 @@ function _weighted_schedule_delta(
         hasproperty(delta, :segment_id) || continue
         segment_id = getproperty(delta, :segment_id)
         segment = get(segment_lookup, segment_id, nothing)
-        value = hasproperty(delta, field_name) ? Float64(getproperty(delta, field_name)) : 0.0
+        parameter_deltas = hasproperty(delta, :parameter_deltas) ? getproperty(delta, :parameter_deltas) : nothing
+        value = parameter_deltas isa AbstractDict ? Float64(get(parameter_deltas, field_name, 0.0)) : 0.0
         weight = isnothing(segment) ? 1.0 : max(1.0, Float64(getproperty(segment, :end_min) - getproperty(segment, :start_min)))
         weighted_total += weight * value
         total_weight += weight
@@ -164,26 +165,51 @@ function _action_family_flags(action::AbstractAction) :: Tuple{Float32, Float32}
     )
 end
 
+function _feature_dimensions(action::AbstractAction) :: NTuple{3, Symbol}
+    dims = Symbol[]
+    if hasproperty(action, :deltas)
+        deltas = getproperty(action, :deltas)
+        deltas isa AbstractDict && append!(dims, keys(deltas))
+    end
+    if hasproperty(action, :segment_deltas)
+        segment_deltas = getproperty(action, :segment_deltas)
+        if segment_deltas isa AbstractVector
+            for delta in segment_deltas
+                hasproperty(delta, :parameter_deltas) || continue
+                parameter_deltas = getproperty(delta, :parameter_deltas)
+                parameter_deltas isa AbstractDict || continue
+                append!(dims, keys(parameter_deltas))
+            end
+        end
+    end
+    unique_dims = sort!(unique(dims), by=string)
+    while length(unique_dims) < 3
+        push!(unique_dims, Symbol("dim$(length(unique_dims)+1)"))
+    end
+    return (unique_dims[1], unique_dims[2], unique_dims[3])
+end
+
 function action_to_features(action::AbstractAction) :: Vector{Float32}
     family_parameter, family_structure = _action_family_flags(action)
-    isf_feature = hasproperty(action, :segment_deltas) ?
-        _weighted_schedule_delta(action, :isf_delta) :
-        _delta_value(action, :isf_delta, :isf)
-    cr_feature = hasproperty(action, :segment_deltas) ?
-        _weighted_schedule_delta(action, :cr_delta) :
-        _delta_value(action, :cr_delta, :cr)
-    basal_feature = hasproperty(action, :segment_deltas) ?
-        _weighted_schedule_delta(action, :basal_delta) :
-        _delta_value(action, :basal_delta, :basal)
+    dim1, dim2, dim3 = _feature_dimensions(action)
+    feature1 = hasproperty(action, :segment_deltas) ?
+        _weighted_schedule_delta(action, dim1) :
+        _delta_value(action, dim1, dim1)
+    feature2 = hasproperty(action, :segment_deltas) ?
+        _weighted_schedule_delta(action, dim2) :
+        _delta_value(action, dim2, dim2)
+    feature3 = hasproperty(action, :segment_deltas) ?
+        _weighted_schedule_delta(action, dim3) :
+        _delta_value(action, dim3, dim3)
     Float32[
         is_null(action) ? 0.0f0 : 1.0f0,
         Float32(magnitude(action)),
         _action_level_feature(action),
         family_parameter,
         family_structure,
-        isf_feature,
-        cr_feature,
-        basal_feature,
+        feature1,
+        feature2,
+        feature3,
     ]
 end
 

@@ -20,8 +20,7 @@ using LinearAlgebra
 # ─────────────────────────────────────────────────────────────────
 # CandidateAction
 # Concrete action type for grid/beam/gradient search.
-# Stores relative changes per dimension.
-# e.g. :isf => +0.10 means +10% ISF from current value
+# Stores relative changes per opaque action dimension.
 # ─────────────────────────────────────────────────────────────────
 
 struct CandidateAction <: AbstractAction
@@ -81,7 +80,7 @@ function search_scheduled_actions(
         )
     end
 
-    candidates = _generate_level1_scheduled_candidates(config, app_state)
+    candidates = _generate_level1_scheduled_candidates(config, app_state, action_dimensions(sim))
     if _level2_eligible(belief, capabilities, app_state, current_day)
         append!(candidates, generate_structure_edit_candidates(config, capabilities, app_state))
     end
@@ -99,7 +98,8 @@ end
 
 function _generate_level1_scheduled_candidates(
     config    :: ConfiguratorState,
-    app_state :: ConnectedAppState
+    app_state :: ConnectedAppState,
+    dimensions :: Vector{Symbol}
 ) :: Vector{ScheduledAction}
     isempty(app_state.current_segments) && return ScheduledAction[]
 
@@ -110,52 +110,28 @@ function _generate_level1_scheduled_candidates(
 
     for segment in app_state.current_segments
         for level in levels
-            push!(candidates, ScheduledAction(
-                1,
-                parameter_adjustment,
-                base_segments,
-                [SegmentDelta(segment_id=segment.segment_id, isf_delta=level)],
-                StructureEdit[],
-            ))
-            push!(candidates, ScheduledAction(
-                1,
-                parameter_adjustment,
-                base_segments,
-                [SegmentDelta(segment_id=segment.segment_id, cr_delta=level)],
-                StructureEdit[],
-            ))
-            push!(candidates, ScheduledAction(
-                1,
-                parameter_adjustment,
-                base_segments,
-                [SegmentDelta(segment_id=segment.segment_id, basal_delta=level)],
-                StructureEdit[],
-            ))
+            for dimension in dimensions
+                push!(candidates, ScheduledAction(
+                    1,
+                    parameter_adjustment,
+                    base_segments,
+                    [SegmentDelta(segment_id=segment.segment_id, parameter_deltas=Dict(dimension => level))],
+                    StructureEdit[],
+                ))
+            end
         end
     end
 
     for level in levels
-        push!(candidates, ScheduledAction(
-            1,
-            parameter_adjustment,
-            base_segments,
-            [SegmentDelta(segment_id=segment.segment_id, isf_delta=level) for segment in app_state.current_segments],
-            StructureEdit[],
-        ))
-        push!(candidates, ScheduledAction(
-            1,
-            parameter_adjustment,
-            base_segments,
-            [SegmentDelta(segment_id=segment.segment_id, cr_delta=level) for segment in app_state.current_segments],
-            StructureEdit[],
-        ))
-        push!(candidates, ScheduledAction(
-            1,
-            parameter_adjustment,
-            base_segments,
-            [SegmentDelta(segment_id=segment.segment_id, basal_delta=level) for segment in app_state.current_segments],
-            StructureEdit[],
-        ))
+        for dimension in dimensions
+            push!(candidates, ScheduledAction(
+                1,
+                parameter_adjustment,
+                base_segments,
+                [SegmentDelta(segment_id=segment.segment_id, parameter_deltas=Dict(dimension => level)) for segment in app_state.current_segments],
+                StructureEdit[],
+            ))
+        end
     end
 
     if length(candidates) > config.φ_act.N_search
@@ -221,17 +197,13 @@ function _apply_structure_edits(
                 segment_id = "$(segment.segment_id)_a",
                 start_min = segment.start_min,
                 end_min = split_at,
-                isf = segment.isf,
-                cr = segment.cr,
-                basal = segment.basal,
+                parameter_values = deepcopy(segment.parameter_values),
             )
             right = SegmentSurface(
                 segment_id = "$(segment.segment_id)_b",
                 start_min = split_at,
                 end_min = segment.end_min,
-                isf = segment.isf,
-                cr = segment.cr,
-                basal = segment.basal,
+                parameter_values = deepcopy(segment.parameter_values),
             )
             prefix = idx > 1 ? current[1:idx-1] : SegmentSurface[]
             suffix = idx < length(current) ? current[idx+1:end] : SegmentSurface[]
@@ -251,9 +223,10 @@ function _apply_structure_edits(
                 segment_id = "$(first.segment_id)__$(second.segment_id)",
                 start_min = first.start_min,
                 end_min = second.end_min,
-                isf = (first.isf + second.isf) / 2,
-                cr = (first.cr + second.cr) / 2,
-                basal = (first.basal + second.basal) / 2,
+                parameter_values = Dict(
+                    key => (get(first.parameter_values, key, 0.0) + get(second.parameter_values, key, 0.0)) / 2
+                    for key in union(keys(first.parameter_values), keys(second.parameter_values))
+                ),
             )
             current = sort(
                 [seg for seg in current if seg.segment_id != first.segment_id && seg.segment_id != second.segment_id];
@@ -278,7 +251,7 @@ function _segments_valid(
     for segment in sort(segments, by = seg -> seg.start_min)
         segment.start_min == prev_end || return false
         (segment.end_min - segment.start_min) >= capabilities.min_segment_duration_min || return false
-        min(segment.isf, segment.cr, segment.basal) > 0 || return false
+        all(value > 0 for value in values(segment.parameter_values)) || return false
         prev_end = segment.end_min
     end
     return true
@@ -294,6 +267,7 @@ function generate_structure_edit_candidates(
     candidates = ScheduledAction[]
     Δ = config.φ_act.Δ_max / 2
     segments = sort(deepcopy(app_state.current_segments), by = seg -> seg.start_min)
+    dimensions = unique(vcat([collect(keys(segment.parameter_values)) for segment in segments]...))
 
     for segment in segments
         width = segment.end_min - segment.start_min
@@ -305,36 +279,27 @@ function generate_structure_edit_candidates(
 
         child_ids = [seg.segment_id for seg in edited_segments if startswith(seg.segment_id, "$(segment.segment_id)_")]
         for child_id in child_ids
-            push!(candidates, ScheduledAction(
-                2,
-                structure_edit,
-                edited_segments,
-                [SegmentDelta(segment_id=child_id, basal_delta=Δ)],
-                [edit],
-            ))
-            push!(candidates, ScheduledAction(
-                2,
-                structure_edit,
-                edited_segments,
-                [SegmentDelta(segment_id=child_id, isf_delta=Δ)],
-                [edit],
-            ))
-            push!(candidates, ScheduledAction(
-                2,
-                structure_edit,
-                edited_segments,
-                [SegmentDelta(segment_id=child_id, cr_delta=-Δ)],
-                [edit],
-            ))
+            for dimension in dimensions
+                push!(candidates, ScheduledAction(
+                    2,
+                    structure_edit,
+                    edited_segments,
+                    [SegmentDelta(segment_id=child_id, parameter_deltas=Dict(dimension => Δ))],
+                    [edit],
+                ))
+            end
         end
     end
 
     for idx in 1:length(segments)-1
         a = segments[idx]
         b = segments[idx + 1]
-        similar = abs(a.isf - b.isf) / max(a.isf, 1e-6) < 0.05 &&
-            abs(a.cr - b.cr) / max(a.cr, 1e-6) < 0.05 &&
-            abs(a.basal - b.basal) / max(a.basal, 1e-6) < 0.05
+        overlap_keys = intersect(collect(keys(a.parameter_values)), collect(keys(b.parameter_values)))
+        similar = !isempty(overlap_keys) && all(
+            abs(get(a.parameter_values, key, 0.0) - get(b.parameter_values, key, 0.0)) /
+            max(abs(get(a.parameter_values, key, 0.0)), 1e-6) < 0.05
+            for key in overlap_keys
+        )
         similar || continue
 
         edit = StructureEdit(edit_type=:merge, target_segment_id=a.segment_id, neighbor_segment_id=b.segment_id)

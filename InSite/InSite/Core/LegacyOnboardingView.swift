@@ -303,7 +303,8 @@ struct OnboardingView: View {
                     aggressiveness: aggressiveness,
                     hypoglycemiaFear: hypoglycemiaFear,
                     burdenSensitivity: burdenSensitivity,
-                    persona: persona
+                    persona: persona,
+                    minimumActionDeltaThresholds: [:]
                 )
                 try await engine.initialize(patientId: authUser.uid, preferences: preferences)
                 ChameliaOnboardingStore.savePreferences(preferences, for: authUser.uid)

@@ -173,6 +173,23 @@ struct QuestionnaireToPriors {
         }
     }
 
+    static func minimumRecommendationDeltaValue(_ value: MinimumRecommendationChange?) -> Double {
+        switch value {
+        case .tiny: return 0.03
+        case .meaningful: return 0.05
+        case .substantial: return 0.08
+        case nil: return 0.0
+        }
+    }
+
+    static func minimumActionDeltaThresholds(from draft: QuestionnairePreferenceDraft) -> [String: Double] {
+        [
+            "isf_delta": minimumRecommendationDeltaValue(draft.minimumAcceptableISFChange),
+            "cr_delta": minimumRecommendationDeltaValue(draft.minimumAcceptableCRChange),
+            "basal_delta": minimumRecommendationDeltaValue(draft.minimumAcceptableBasalChange)
+        ].filter { $0.value > 0 }
+    }
+
     private static func populationDefaults() -> [String: (mean: Double, std: Double)] {
         [
             "isf_multiplier": (1.00, 0.12),
