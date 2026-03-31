@@ -1,0 +1,76 @@
+# Chamelia V2 Configuration
+# HJEPA backbone + Configurator + Actor + Cost + Memory
+
+model:
+  # HJEPA backbone (do not change without retraining)
+  encoder_type: "vit_base_patch16_224"
+  embed_dim: 512
+  num_hierarchies: 3
+  use_fpn: true
+  fpn_feature_dim: 512
+  fpn_fusion_method: "add"
+  use_rope: true
+  use_flash_attention: true
+  use_layerscale: true
+  layerscale_init: 1.0e-5
+  use_gradient_checkpointing: false
+  predictor_depth: 6
+  predictor_num_heads: 8
+
+  # Configurator
+  configurator:
+    num_ctx_tokens: 16
+    num_heads: 8
+    num_layers: 4
+    mlp_ratio: 4.0
+    dropout: 0.1
+    memory_read_k: 8
+
+  # Actor
+  actor:
+    action_dim: 64
+    num_heads: 8
+    num_layers: 3
+    mlp_ratio: 4.0
+    dropout: 0.1
+
+  # Cost
+  cost:
+    critic_num_heads: 8
+    critic_num_layers: 3
+    critic_mlp_ratio: 4.0
+    critic_dropout: 0.1
+    critic_horizon: 30
+
+  # Memory
+  memory:
+    max_episodes: 10000
+    retrieval_k: 8
+    device: "cpu"
+
+training:
+  # Inherited from HJEPA trainer for backbone training
+  epochs: 100
+  batch_size: 256
+  learning_rate: 1.5e-4
+  weight_decay: 0.05
+  optimizer: "adamw"
+  lr_schedule: "cosine"
+  warmup_epochs: 10
+  use_amp: true
+  clip_grad: 1.0
+
+  # Chamelia-specific
+  critic_train_interval: 100
+  mode1_distill_interval: 500
+  memory_outcome_delay: 30
+
+loss:
+  type: "combined"
+  hierarchy_weights: [1.0, 0.7, 0.5]
+  vicreg_weight: 0.1
+
+checkpoint:
+  checkpoint_dir: "checkpoints/chamelia"
+  save_every_n_epochs: 5
+  keep_last_n: 3

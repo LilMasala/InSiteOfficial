@@ -584,19 +584,28 @@ class ContextEncoder(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
+        pre_embedded: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass through the context encoder.
 
         Args:
-            x: Input images [B, C, H, W]
-            mask: Optional mask for patches [B, N] where True indicates masked patches
+            x: Input images [B, C, H, W] when pre_embedded=False, or pre-embedded tokens
+               [B, N, D] when pre_embedded=True.
+            mask: Optional mask for patches [B, N] where True indicates masked patches.
+            pre_embedded: If True, skip vit.patch_embed and treat x as tokens [B, N, D].
 
         Returns:
             Encoded features [B, N, D] where N is number of patches, D is embed_dim
         """
         # Get patch embeddings
-        x = self.vit.patch_embed(x)
+        if pre_embedded:
+            if x.dim() != 3:
+                raise ValueError(
+                    f"Expected pre-embedded tokens [B, N, D], got shape {tuple(x.shape)}."
+                )
+        else:
+            x = self.vit.patch_embed(x)
 
         # Add class token
         cls_token = self.vit.cls_token.expand(x.shape[0], -1, -1)
