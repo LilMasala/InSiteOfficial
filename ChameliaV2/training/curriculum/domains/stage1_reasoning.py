@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -9,6 +10,10 @@ import torch.nn.functional as F
 
 from src.chamelia.plugins.base import AbstractDomain
 from src.chamelia.tokenizers import SequenceTokenizer
+from training.curriculum.data.public_reasoning import (
+    DEFAULT_CURRICULUM_ROOT,
+    load_public_reasoning_samples,
+)
 from training.curriculum.domains.base import (
     BaseCurriculumDomain,
     DomainSpec,
@@ -201,6 +206,7 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
         batch_size: int = 16,
         seq_len: int = 48,
         vocab_size: int | None = None,
+        data_root: str | Path | None = None,
     ) -> None:
         """Initialize a reasoning domain variant.
 
@@ -214,6 +220,7 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
         resolved_vocab_size = vocab_size
         if resolved_vocab_size is None:
             resolved_vocab_size = 128 if domain_variant == "basic_arithmetic" else 8192
+        self.data_root = Path(data_root) if data_root is not None else DEFAULT_CURRICULUM_ROOT
 
         def outcome_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
             _ = action
@@ -265,19 +272,34 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
                 "generalization": min(0.99, accuracy - 0.01),
             }
 
+        def sample_builder(level: int, split: str, spec: DomainSpec) -> list[dict[str, torch.Tensor]]:
+            if domain_variant != "basic_arithmetic":
+                public_samples = load_public_reasoning_samples(
+                    domain_variant=domain_variant,
+                    split=split,
+                    vocab_size=spec.vocab_size,
+                    seq_len=spec.seq_len,
+                    max_samples=spec.dataset_size,
+                    data_root=self.data_root,
+                )
+                if public_samples:
+                    return public_samples
+            return _reasoning_samples(level, split, spec)
+
         super().__init__(
             spec=DomainSpec(
                 name=domain_variant,
                 stage_idx=1,
-                action_dim=(resolved_vocab_size if domain_variant == "basic_arithmetic" else 16),
+                action_dim=resolved_vocab_size,
                 vocab_size=resolved_vocab_size,
                 batch_size=batch_size,
                 seq_len=seq_len,
+                dataset_size=(64 if domain_variant == "basic_arithmetic" else 256),
             ),
             masking_strategy=ReasoningMaskingStrategy(domain_variant=domain_variant),
             cost_schedule=schedule,
             probe_fn=probe_fn,
-            sample_builder=_reasoning_samples,
+            sample_builder=sample_builder,
         )
 
     def build_runtime_domain(self, embed_dim: int) -> AbstractDomain | None:
@@ -290,7 +312,12 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
             ``AbstractDomain`` for arithmetic, otherwise ``None``.
         """
         if self.spec.name != "basic_arithmetic":
-            return self.build_sequence_runtime_domain(embed_dim)
+            return PublicReasoningRuntimeDomain(
+                domain_name=self.spec.name,
+                vocab_size=self.spec.vocab_size,
+                max_seq_len=self.spec.seq_len,
+                embed_dim=embed_dim,
+            )
         return ArithmeticRuntimeDomain(
             vocab_size=self.spec.vocab_size,
             max_seq_len=self.spec.seq_len,
@@ -316,9 +343,20 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
         answers = raw_batch["answer"].long() if "answer" in raw_batch else raw_batch["target"][:, -1].long()
         premises = tokens[:, : min(4, tokens.shape[1])].float().unsqueeze(-1).repeat(1, 1, 8)
         batch.targets["answer"] = answers
+        batch.targets["answer_token"] = answers
         batch.domain_state["answer"] = answers
+        batch.domain_state["answer_token"] = answers
         batch.domain_state["premises"] = premises
         batch.domain_state["target"] = raw_batch["target"]
+        if "choice_tokens" in raw_batch:
+            batch.targets["choice_tokens"] = raw_batch["choice_tokens"].long()
+            batch.domain_state["choice_tokens"] = raw_batch["choice_tokens"].long()
+        if "choice_mask" in raw_batch:
+            batch.targets["choice_mask"] = raw_batch["choice_mask"].bool()
+            batch.domain_state["choice_mask"] = raw_batch["choice_mask"].bool()
+        if "correct_choice" in raw_batch:
+            batch.targets["correct_choice"] = raw_batch["correct_choice"].long()
+            batch.domain_state["correct_choice"] = raw_batch["correct_choice"].long()
         return batch
 
     def run_advancement_probe(self, model: Any, level: int) -> dict[str, float]:
@@ -331,19 +369,60 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
         Returns:
             Probe metrics dictionary.
         """
-        if self.spec.name != "basic_arithmetic" or model is None:
+        if model is None:
             return super().run_advancement_probe(model, level)
 
         runtime_domain = getattr(model, "domain", None)
-        if runtime_domain is None or getattr(runtime_domain, "domain_name", "") != "basic_arithmetic":
+        if runtime_domain is None or getattr(runtime_domain, "domain_name", "") != self.spec.name:
             return super().run_advancement_probe(model, level)
 
         device = next(model.parameters()).device
         previous_domain = getattr(model, "domain", None)
-        loader = self.get_data_loader(level, split="train")
+        if self.spec.name == "basic_arithmetic":
+            accuracy = self._probe_split_accuracy(model, runtime_domain, level, split="train", device=device)
+            if previous_domain is not None:
+                model.set_domain(previous_domain)
+            return {
+                "accuracy": accuracy,
+                "consistency": min(0.99, accuracy + 0.03),
+                "generalization": min(0.99, accuracy + 0.02),
+            }
+
+        train_acc = self._probe_split_accuracy(model, runtime_domain, level, split="train", device=device)
+        val_acc = self._probe_split_accuracy(model, runtime_domain, level, split="val", device=device)
+        if previous_domain is not None:
+            model.set_domain(previous_domain)
+
+        accuracy = val_acc
+        return {
+            "accuracy": accuracy,
+            "consistency": max(0.0, 1.0 - abs(train_acc - val_acc)),
+            "generalization": val_acc,
+        }
+
+    def _probe_split_accuracy(
+        self,
+        model: Any,
+        runtime_domain: AbstractDomain,
+        level: int,
+        split: str,
+        device: torch.device,
+    ) -> float:
+        """Evaluate answer-token accuracy on one split.
+
+        Args:
+            model: Active model.
+            runtime_domain: Runtime domain plugin.
+            level: Active curriculum level.
+            split: Split name.
+            device: Device.
+
+        Returns:
+            Scalar accuracy in ``[0, 1]``.
+        """
+        loader = self.get_data_loader(level, split=split)
         correct = 0
         total = 0
-
         model.eval()
         with torch.no_grad():
             for batch in loader:
@@ -358,20 +437,30 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
                     store_to_memory=False,
                     input_kind="embedded_tokens",
                 )
-                pred = outputs["action_vec"].argmax(dim=-1)
-                answers = batch.domain_state["answer"].long()
-                correct += int((pred == answers).sum().item())
-                total += int(answers.numel())
-        model.train()
-        if previous_domain is not None:
-            model.set_domain(previous_domain)
-
-        accuracy = correct / max(1, total)
-        return {
-            "accuracy": accuracy,
-            "consistency": min(0.99, accuracy + 0.03),
-            "generalization": min(0.99, accuracy + 0.02),
-        }
+                action_vec = outputs["action_vec"]
+                choice_mask = batch.domain_state.get("choice_mask")
+                correct_choice = batch.domain_state.get("correct_choice")
+                if (
+                    choice_mask is not None
+                    and correct_choice is not None
+                    and choice_mask.any()
+                    and (correct_choice >= 0).any()
+                ):
+                    choice_tokens = batch.domain_state["choice_tokens"].long().clamp(min=0, max=action_vec.shape[1] - 1)
+                    gathered = action_vec.gather(1, choice_tokens)
+                    gathered = gathered.masked_fill(~choice_mask.bool(), float("-inf"))
+                    pred = action_vec.argmax(dim=-1)
+                    target = batch.domain_state["answer_token"].long()
+                    valid = (correct_choice >= 0).bool()
+                    if valid.any():
+                        pred[valid] = gathered[valid].argmax(dim=-1)
+                        target[valid] = correct_choice[valid].long()
+                else:
+                    pred = action_vec.argmax(dim=-1)
+                    target = batch.domain_state["answer_token"].long()
+                correct += int((pred == target).sum().item())
+                total += int(target.numel())
+        return correct / max(1, total)
 
 
 class ArithmeticRuntimeDomain(AbstractDomain):
@@ -436,4 +525,133 @@ class ArithmeticRuntimeDomain(AbstractDomain):
     @property
     def vocab_size(self) -> int:
         """Return tokenizer vocabulary size."""
+        return self._vocab_size
+
+
+class PublicReasoningRuntimeDomain(AbstractDomain):
+    """Runtime Chamelia domain plugin for public Stage-1 reasoning data."""
+
+    def __init__(self, domain_name: str, vocab_size: int, max_seq_len: int, embed_dim: int) -> None:
+        """Initialize the runtime reasoning plugin.
+
+        Args:
+            domain_name: Domain identifier.
+            vocab_size: Vocabulary size V.
+            max_seq_len: Maximum sequence length N.
+            embed_dim: Token embedding size D.
+        """
+        self._domain_name = domain_name
+        self._tokenizer = SequenceTokenizer(
+            vocab_size=vocab_size,
+            embed_dim=embed_dim,
+            max_seq_len=max_seq_len,
+            domain_name=f"{domain_name}_runtime",
+            pad_token_id=0,
+        )
+        self._vocab_size = vocab_size
+
+    def get_tokenizer(self) -> SequenceTokenizer:
+        """Return the reasoning tokenizer."""
+        return self._tokenizer
+
+    def get_action_dim(self) -> int:
+        """Return the answer-token action dimension.
+
+        Returns:
+            Integer action dimension ``A = vocab_size``.
+        """
+        return self._vocab_size
+
+    def decode_action(self, action_vec: torch.Tensor) -> torch.Tensor:
+        """Decode logits to answer-token ids.
+
+        Args:
+            action_vec: Action logits ``[B, A]``.
+
+        Returns:
+            Integer ids ``[B]``.
+        """
+        return action_vec.argmax(dim=-1)
+
+    def get_intrinsic_cost_fns(self):
+        """Return supervised reasoning intrinsic costs.
+
+        Returns:
+            List of (cost_fn, weight) tuples, each returning ``[B]``.
+        """
+
+        def answer_supervision(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
+            _ = z
+            choice_mask = domain_state.get("choice_mask")
+            correct_choice = domain_state.get("correct_choice")
+            if (
+                isinstance(choice_mask, torch.Tensor)
+                and isinstance(correct_choice, torch.Tensor)
+                and choice_mask.any()
+                and (correct_choice >= 0).any()
+            ):
+                choice_tokens = domain_state["choice_tokens"].long().clamp(min=0, max=action.shape[1] - 1)
+                selected = action.gather(1, choice_tokens)
+                selected = selected.masked_fill(~choice_mask.bool(), -1.0e9)
+                valid = (correct_choice >= 0).bool()
+                loss = torch.zeros(action.shape[0], device=action.device)
+                if valid.any():
+                    loss[valid] = F.cross_entropy(
+                        selected[valid],
+                        correct_choice[valid].long(),
+                        reduction="none",
+                    )
+                return loss
+            answers = domain_state["answer_token"].long().clamp(min=0, max=action.shape[1] - 1)
+            return F.cross_entropy(action, answers, reduction="none")
+
+        def representation_alignment(
+            z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]
+        ) -> torch.Tensor:
+            _ = action
+            targets = domain_state["target"].float().mean(dim=-1)
+            return (z.mean(dim=-1) - targets).abs()
+
+        return [(answer_supervision, 0.85), (representation_alignment, 0.15)]
+
+    def get_domain_state(self, observation: Any) -> dict:
+        """Build a generic reasoning domain state.
+
+        Args:
+            observation: Raw token observation ``[B, N]`` or compatible.
+
+        Returns:
+            Domain-state dictionary.
+        """
+        tokens = observation if torch.is_tensor(observation) else torch.tensor(observation)
+        return {"tokens": tokens}
+
+    def compute_regime_embedding(self, domain_state: dict) -> torch.Tensor | None:
+        """Reasoning domains expose no explicit regime embedding.
+
+        Args:
+            domain_state: Opaque state.
+
+        Returns:
+            ``None``.
+        """
+        _ = domain_state
+        return None
+
+    @property
+    def domain_name(self) -> str:
+        """Return domain name.
+
+        Returns:
+            String identifier.
+        """
+        return self._domain_name
+
+    @property
+    def vocab_size(self) -> int:
+        """Return tokenizer vocabulary size.
+
+        Returns:
+            Vocabulary size V.
+        """
         return self._vocab_size

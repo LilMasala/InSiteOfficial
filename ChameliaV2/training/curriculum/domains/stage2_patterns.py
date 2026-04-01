@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import torch
 
+from training.curriculum.data.public_patterns import (
+    DEFAULT_CURRICULUM_ROOT,
+    load_public_pattern_samples,
+)
 from training.curriculum.domains.base import BaseCurriculumDomain, DomainSpec, MaskingStrategy, make_level
 from training.curriculum.generators.sequence_gen import (
     ArithmeticSequenceGenerator,
@@ -56,8 +61,22 @@ def _pattern_samples(level: int, split: str, spec: DomainSpec) -> list[dict[str,
 class PatternCurriculumDomain(BaseCurriculumDomain):
     """Stage 2 pattern and causality domain scaffold."""
 
-    def __init__(self, domain_variant: str = "oeis_sequences", batch_size: int = 16, seq_len: int = 32) -> None:
-        """Initialize a pattern-learning domain variant."""
+    def __init__(
+        self,
+        domain_variant: str = "oeis_sequences",
+        batch_size: int = 16,
+        seq_len: int = 32,
+        data_root: str | Path | None = None,
+    ) -> None:
+        """Initialize a pattern-learning domain variant.
+
+        Args:
+            domain_variant: Stage-2 subtype.
+            batch_size: Batch size B.
+            seq_len: Sequence length N.
+            data_root: Optional curriculum data root override.
+        """
+        self.data_root = Path(data_root) if data_root is not None else DEFAULT_CURRICULUM_ROOT
 
         def prediction_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
             _ = action
@@ -110,6 +129,18 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
                 "counterfactual": min(0.99, base + 0.02),
             }
 
+        def sample_builder(level: int, split: str, spec: DomainSpec) -> list[dict[str, torch.Tensor]]:
+            public_samples = load_public_pattern_samples(
+                domain_variant=domain_variant,
+                split=split,
+                seq_len=spec.seq_len,
+                max_samples=spec.dataset_size,
+                data_root=self.data_root,
+            )
+            if public_samples:
+                return public_samples
+            return _pattern_samples(level, split, spec)
+
         super().__init__(
             spec=DomainSpec(
                 name=domain_variant,
@@ -118,11 +149,12 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
                 vocab_size=4096,
                 batch_size=batch_size,
                 seq_len=seq_len,
+                dataset_size=256,
             ),
             masking_strategy=PatternMaskingStrategy(),
             cost_schedule=schedule,
             probe_fn=probe_fn,
-            sample_builder=_pattern_samples,
+            sample_builder=sample_builder,
         )
 
     def build_runtime_domain(self, embed_dim: int):
