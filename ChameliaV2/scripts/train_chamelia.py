@@ -410,6 +410,37 @@ def build_optimizer(model: Chamelia, training_cfg: dict[str, Any], lr: float) ->
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 
+def initialize_from_checkpoint(
+    model: Chamelia,
+    checkpoint_path: str | Path,
+    *,
+    device: torch.device,
+) -> None:
+    """Initialize one model from a saved training or bridge artifact checkpoint.
+
+    Args:
+        model: Model to initialize.
+        checkpoint_path: Path to checkpoint payload.
+        device: Active runtime device.
+
+    Returns:
+        None.
+    """
+    payload = torch.load(checkpoint_path, map_location=device)
+    if isinstance(payload, dict) and isinstance(payload.get("model_state_dict"), dict):
+        state_dict = payload["model_state_dict"]
+    elif isinstance(payload, dict) and all(isinstance(key, str) for key in payload):
+        state_dict = payload
+    else:
+        raise ValueError(f"Checkpoint '{checkpoint_path}' does not contain a model_state_dict.")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=True)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint '{checkpoint_path}' failed strict load; missing={missing}, unexpected={unexpected}"
+        )
+
+
 def choose_device(device_arg: str) -> torch.device:
     """Choose the runtime device.
 
@@ -829,6 +860,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--checkpoint-dir", default=str(PROJECT_ROOT / "checkpoints" / "chamelia_curriculum"))
     parser.add_argument("--model-version", default=None)
+    parser.add_argument("--init-checkpoint", default=None)
     return parser
 
 
@@ -861,6 +893,8 @@ def run_training(args: argparse.Namespace) -> int:
         device=device,
         backbone_mode=args.backbone_mode,
     )
+    if getattr(args, "init_checkpoint", None):
+        initialize_from_checkpoint(model, args.init_checkpoint, device=device)
 
     training_cfg = _resolve_training_config(chamelia_config, args.backbone_mode)
     base_lr = float(args.lr if args.lr is not None else training_cfg.get("learning_rate", 1.5e-4))

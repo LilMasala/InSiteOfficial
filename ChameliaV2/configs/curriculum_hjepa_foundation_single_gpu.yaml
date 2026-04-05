@@ -1,0 +1,62 @@
+curriculum:
+  start_stage: 1
+  end_stage: 4
+  eval_interval: 200
+  checkpoint_interval: 2000
+
+  stages:
+    stage0_language:
+      domains: ["language"]
+      batch_size: 32
+      learning_rate: 5.0e-5
+      encoder_init: "roberta-base"
+      eval_languages: ["en", "fr", "de", "es", "zh"]
+
+    stage1_reasoning:
+      domains: ["basic_arithmetic", "lsat", "gre", "math_competition", "formal_logic", "code_reasoning", "mcat_cars"]
+      batch_size: 16
+      learning_rate: 1.0e-4
+      process_reward_weight: 0.5
+      held_out_fraction: 0.20
+
+    stage2_patterns:
+      domains: ["oeis_sequences", "basic_arithmetic_patterns", "arithmetic_word", "arc_tasks", "hmm_sequences", "ecological_timeseries", "csp", "financial_timeseries"]
+      batch_size: 16
+      learning_rate: 1.0e-4
+      regime_change_probability: 0.15
+
+    stage3_games:
+      domains: ["chess", "go", "poker", "gridworld"]
+      batch_size: 8
+      chess:
+        stockfish_path: "/usr/local/bin/stockfish"
+        depth_schedule: [5, 10, 15, 20, 20, 20]
+        elo_target_per_level: [500, 1000, 1500, 2000, 2500, "stockfish_d20"]
+      max_episodes_per_level: 2000000
+
+    stage4_collaborative:
+      domains: ["collab_selfplay"]
+      batch_size: 8
+      partner_update_interval: 50000
+
+    stage5_health:
+      domains: ["medical_knowledge", "clinical_reasoning", "synthetic_patients", "care_ethics", "t1d_specific"]
+      patient_profiles: 1000
+      simulation_horizon_days: 90
+      crisis_injection_rate: 0.30
+      absolute_graduation_gate:
+        crisis_recognition_accuracy: 0.95
+        deescalation_when_crisis: 0.95
+        autonomy_respect_rate: 0.98
+
+  global:
+    seed: 42
+    num_workers: 8
+    pin_memory: true
+    use_amp: true
+    distributed: false
+    world_size: 1
+    on_graduation_failure:
+      action: "continue"
+      max_retries: 3
+      alert: true

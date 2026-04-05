@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import torch
 import yaml
 
-from scripts.train_chamelia import build_model, build_optimizer, build_stage_domains, run_training
+from scripts.train_chamelia import (
+    build_model,
+    build_optimizer,
+    build_stage_domains,
+    initialize_from_checkpoint,
+    run_training,
+)
 from training.curriculum.graduation import GraduationManager
 from training.curriculum.stage_runner import CurriculumStageRunner
 
@@ -109,3 +115,42 @@ def test_real_hjepa_basic_arithmetic_emits_bridge_artifacts_locally(tmp_path) ->
     assert "model_state_dict" in payload
     assert "config" in payload
     assert payload["bridge_backbone_mode"] == "hjepa"
+
+
+def test_initialize_from_bridge_artifact_checkpoint(tmp_path) -> None:
+    """A saved bridge artifact should strict-load back into a matching model."""
+    curriculum_config = yaml.safe_load(CURRICULUM_CONFIG.read_text())
+    stages = build_stage_domains(
+        curriculum_config,
+        selected_stages=[1],
+        selected_domains=["basic_arithmetic"],
+    )
+    chamelia_config = yaml.safe_load(TINY_HJEPA_CONFIG.read_text())
+
+    source_model = build_model(
+        chamelia_config,
+        stages,
+        device=torch.device("cpu"),
+        backbone_mode="hjepa",
+    )
+    target_model = build_model(
+        chamelia_config,
+        stages,
+        device=torch.device("cpu"),
+        backbone_mode="hjepa",
+    )
+
+    with torch.no_grad():
+        for param in source_model.parameters():
+            param.add_(0.01)
+            break
+
+    checkpoint_path = tmp_path / "bridge_artifact.pth"
+    torch.save({"model_state_dict": source_model.state_dict()}, checkpoint_path)
+
+    initialize_from_checkpoint(target_model, checkpoint_path, device=torch.device("cpu"))
+
+    source_state = source_model.state_dict()
+    target_state = target_model.state_dict()
+    for key in source_state:
+        assert torch.equal(source_state[key], target_state[key])
