@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 import random
@@ -95,6 +96,18 @@ class StubSequenceHJEPA(torch.nn.Module):
             "context_features": target_features,
             "target_features": target_features,
         }
+
+
+def _log(message: str) -> None:
+    """Emit a line-buffered training log message."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[train_chamelia {timestamp}] {message}", flush=True)
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 
 
 @dataclass
@@ -482,7 +495,7 @@ def choose_device(device_arg: str) -> torch.device:
         if device_arg == "mps":
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 return torch.device("mps")
-            print("warning: requested mps, but this runtime cannot use MPS; falling back to cpu")
+            _log("warning: requested mps, but this runtime cannot use MPS; falling back to cpu")
             return torch.device("cpu")
         return torch.device(device_arg)
     if torch.cuda.is_available():
@@ -598,7 +611,7 @@ def build_model(
         hjepa = StubSequenceHJEPA(embed_dim=embed_dim)
     elif backbone_mode == "hjepa":
         if configured_embed_dim != embed_dim:
-            print(
+            _log(
                 f"warning: overriding configured embed_dim={configured_embed_dim} with encoder-native embed_dim={embed_dim} "
                 f"for {model_cfg.get('encoder_type', 'unknown encoder')}"
             )
@@ -721,6 +734,7 @@ def train_stage(
         domain.domain_name(): runner._domain_iterator(domain)
         for domain in stage_domains
     }
+    heartbeat_steps = max(10, eval_every // 4)
     history: list[EvalPoint] = []
     stage_steps = 0
     budget_steps = initial_stage_steps
@@ -757,6 +771,23 @@ def train_stage(
                 stage_steps += 1
                 inner_steps += 1
                 recent_losses.append(float(loss.item()))
+                if stage_steps % heartbeat_steps == 0 or inner_steps == 1:
+                    avg_recent_loss = sum(recent_losses[-heartbeat_steps:]) / max(
+                        1,
+                        min(len(recent_losses), heartbeat_steps),
+                    )
+                    level_summary = ", ".join(
+                        f"{domain.domain_name()}:L{domain.cost.current_level}/"
+                        f"{max(1, len(domain.get_cost_schedule()) - 1)}"
+                        for domain in stage_domains
+                    )
+                    _log(
+                        f"stage={stage_label if stage_label is not None else stage_idx} "
+                        f"heartbeat steps={stage_steps}/{budget_steps} "
+                        f"global_step={runner.global_step} "
+                        f"loss_avg={avg_recent_loss:.4f} "
+                        f"levels=[{level_summary}]"
+                    )
                 if inner_steps >= eval_every or stage_steps >= budget_steps:
                     break
 
@@ -802,7 +833,7 @@ def train_stage(
             f"{domain_name}:{', '.join(f'{key}={value:.3f}' for key, value in domain_metrics.items())}"
             for domain_name, domain_metrics in metrics.items()
         )
-        print(
+        _log(
             f"stage={display_stage} steps={stage_steps} score={score:.3f} loss={mean_loss:.4f} "
             f"decision={decision.action} reason={decision.reason} metrics=[{metric_summary}]"
         )
@@ -923,6 +954,7 @@ def run_training(args: argparse.Namespace) -> int:
     )
     if getattr(args, "init_checkpoint", None):
         initialize_from_checkpoint(model, args.init_checkpoint, device=device)
+        _log(f"initialized model from checkpoint={args.init_checkpoint}")
 
     training_cfg = _resolve_training_config(chamelia_config, args.backbone_mode)
     base_lr = float(args.lr if args.lr is not None else training_cfg.get("learning_rate", 1.5e-4))
@@ -954,9 +986,18 @@ def run_training(args: argparse.Namespace) -> int:
     controller = AdaptiveTrainingController(extension_factor=args.extension_factor)
     retune_lrs = [float(value) for value in parse_csv_arg([args.retune_lr_factors])]
 
+    _log(
+        "training configured "
+        f"device={device} "
+        f"backbone_mode={args.backbone_mode} "
+        f"selected_stages={selected_stages or 'config_default'} "
+        f"selected_domains={selected_domains or 'all'} "
+        f"checkpoint_dir={args.checkpoint_dir}"
+    )
+
     for stage_idx, stage_domains in enumerate(stages):
         stage_label = stage_domains[0].stage() if stage_domains else stage_idx
-        print(f"=== stage {stage_label} :: {', '.join(domain.domain_name() for domain in stage_domains)} ===")
+        _log(f"=== stage {stage_label} :: {', '.join(domain.domain_name() for domain in stage_domains)} ===")
         passed, _history = train_stage(
             model,
             runner,
@@ -976,10 +1017,10 @@ def run_training(args: argparse.Namespace) -> int:
             stage_label=stage_label,
         )
         if not passed:
-            print(f"stage {stage_label} failed")
+            _log(f"stage {stage_label} failed")
             return 1
 
-    print("all selected stages passed")
+    _log("all selected stages passed")
     return 0
 
 

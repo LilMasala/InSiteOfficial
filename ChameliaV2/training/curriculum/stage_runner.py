@@ -18,6 +18,12 @@ from training.curriculum.graduation import GraduationManager
 from training.curriculum.batch import ChameliaStepBatch, CurriculumBatch
 
 
+def _runner_log(message: str) -> None:
+    """Emit a flushed stage-runner log line."""
+    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[stage_runner {timestamp}] {message}", flush=True)
+
+
 class CurriculumStageRunner:
     """Orchestrate curriculum stages, probes, and checkpointing.
 
@@ -667,6 +673,13 @@ class CurriculumStageRunner:
         if bridge_artifact_path is not None:
             payload["bridge_artifact_path"] = str(bridge_artifact_path)
         torch.save(payload, status_path)
+        _runner_log(
+            f"checkpoint_saved stage={stage_idx} "
+            f"event={metrics.get('event', 'checkpoint')} "
+            f"global_step={self.global_step} "
+            f"status_path={status_path} "
+            f"bridge_artifact_path={bridge_artifact_path}"
+        )
 
     def _save_bridge_artifact(
         self,

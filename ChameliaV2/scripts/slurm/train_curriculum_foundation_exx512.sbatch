@@ -50,6 +50,7 @@ fi
 
 export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 RUN_TAG="${RUN_TAG:-foundation-$(date +%Y%m%dT%H%M%S)}"
 MODEL_VERSION="${MODEL_VERSION:-${RUN_TAG}}"
@@ -57,7 +58,8 @@ CURRICULUM_CONFIG="${CURRICULUM_CONFIG:-${ROOT_DIR}/configs/curriculum_hjepa_fou
 CHAMELIA_CONFIG="${CHAMELIA_CONFIG:-${ROOT_DIR}/configs/chamelia.yaml}"
 DATA_ROOT="${DATA_ROOT:-${ROOT_DIR}/data/curriculum}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${ROOT_DIR}/checkpoints/${RUN_TAG}}"
-STAGES="${STAGES:-0,1,2,3,4}"
+STAGES="${STAGES:-}"
+DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-42}"
 INITIAL_STAGE_STEPS="${INITIAL_STAGE_STEPS:-2000}"
 EVAL_EVERY="${EVAL_EVERY:-200}"
@@ -74,7 +76,8 @@ echo "  root:            ${ROOT_DIR}"
 echo "  python:          ${PYTHON_BIN}"
 echo "  curriculum:      ${CURRICULUM_CONFIG}"
 echo "  chamelia config: ${CHAMELIA_CONFIG}"
-echo "  stages:          ${STAGES}"
+echo "  stages:          ${STAGES:-<config default>}"
+echo "  device:          ${DEVICE}"
 echo "  data root:       ${DATA_ROOT}"
 echo "  checkpoint dir:  ${CHECKPOINT_DIR}"
 echo "  log dir:         ${LOG_DIR}"
@@ -85,22 +88,36 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi
 fi
 
-"${PYTHON_BIN}" scripts/train_chamelia.py \
-  --curriculum-config "${CURRICULUM_CONFIG}" \
-  --chamelia-config "${CHAMELIA_CONFIG}" \
-  --stage "${STAGES}" \
-  --device cuda \
-  --data-root "${DATA_ROOT}" \
-  --seed "${SEED}" \
-  --backbone-mode hjepa \
-  --lr "${LR}" \
-  --initial-stage-steps "${INITIAL_STAGE_STEPS}" \
-  --eval-every "${EVAL_EVERY}" \
-  --max-total-stage-steps "${MAX_TOTAL_STAGE_STEPS}" \
-  --max-extensions "${MAX_EXTENSIONS}" \
-  --max-retunes "${MAX_RETUNES}" \
-  --extension-factor "${EXTENSION_FACTOR}" \
-  --retune-lr-factors "${RETUNE_LR_FACTORS}" \
-  --clip-grad "${CLIP_GRAD}" \
-  --checkpoint-dir "${CHECKPOINT_DIR}" \
+TRAIN_CMD=(
+  "${PYTHON_BIN}" scripts/train_chamelia.py
+  --curriculum-config "${CURRICULUM_CONFIG}"
+  --chamelia-config "${CHAMELIA_CONFIG}"
+  --device "${DEVICE}"
+  --data-root "${DATA_ROOT}"
+  --seed "${SEED}"
+  --backbone-mode hjepa
+  --lr "${LR}"
+  --initial-stage-steps "${INITIAL_STAGE_STEPS}"
+  --eval-every "${EVAL_EVERY}"
+  --max-total-stage-steps "${MAX_TOTAL_STAGE_STEPS}"
+  --max-extensions "${MAX_EXTENSIONS}"
+  --max-retunes "${MAX_RETUNES}"
+  --extension-factor "${EXTENSION_FACTOR}"
+  --retune-lr-factors "${RETUNE_LR_FACTORS}"
+  --clip-grad "${CLIP_GRAD}"
+  --checkpoint-dir "${CHECKPOINT_DIR}"
   --model-version "${MODEL_VERSION}"
+)
+
+if [[ -n "${STAGES}" ]]; then
+  IFS=',' read -r -a STAGE_LIST <<< "${STAGES}"
+  for STAGE in "${STAGE_LIST[@]}"; do
+    TRAIN_CMD+=(--stage "${STAGE}")
+  done
+fi
+
+printf '  train cmd:       '
+printf '%q ' "${TRAIN_CMD[@]}"
+printf '\n'
+
+"${TRAIN_CMD[@]}"
