@@ -41,6 +41,7 @@ def test_train_chamelia_arithmetic_stage_passes_locally(tmp_path) -> None:
         stage=["1"],
         domain=["basic_arithmetic"],
         device="cpu",
+        data_root=None,
         seed=11,
         backbone_mode="stub",
         lr=3e-3,

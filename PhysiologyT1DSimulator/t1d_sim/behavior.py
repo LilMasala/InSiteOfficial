@@ -189,8 +189,9 @@ def generate_day_behavior(
         for h in mood_event_hours
     ]
 
-    # ── Illness: event-driven replaces random coin flip ──
-    is_ill = ev.get("is_ill_override", False) or bool(rng.random() < 0.01)
+    # Illness is driven by the sampled event schedule. Avoid layering an extra
+    # unscheduled severe illness day on top of the event system.
+    is_ill = bool(ev.get("is_ill_override", False))
 
     # Persona-driven site change interval with per-patient ±1 day jitter so
     # patients don't all change on the same cycle offset.

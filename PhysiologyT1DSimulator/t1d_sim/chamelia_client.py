@@ -33,6 +33,11 @@ class ChameliaClient:
         patient_id: str,
         preferences: dict[str, Any],
         weights_dir: str | None = None,
+        *,
+        bridge_url: str | None = None,
+        bridge_mode: str | None = None,
+        bridge_model_version: str | None = None,
+        legacy_jepa_compat: bool | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "patient_id": patient_id,
@@ -40,6 +45,14 @@ class ChameliaClient:
         }
         if weights_dir is not None:
             body["weights_dir"] = weights_dir
+        if bridge_url is not None:
+            body["bridge_url"] = bridge_url
+        if bridge_mode is not None:
+            body["bridge_mode"] = bridge_mode
+        if bridge_model_version is not None:
+            body["bridge_model_version"] = bridge_model_version
+        if legacy_jepa_compat is not None:
+            body["legacy_jepa_compat"] = legacy_jepa_compat
         return self._post("/chamelia_initialize_patient", body)
 
     def observe(self, patient_id: str, timestamp: float, signals: dict[str, Any]) -> dict[str, Any]:
@@ -89,8 +102,25 @@ class ChameliaClient:
     def save(self, patient_id: str) -> dict[str, Any]:
         return self._post("/chamelia_save_patient", {"patient_id": patient_id})
 
-    def load(self, patient_id: str) -> dict[str, Any]:
-        return self._post("/chamelia_load_patient", {"patient_id": patient_id})
+    def load(
+        self,
+        patient_id: str,
+        *,
+        bridge_url: str | None = None,
+        bridge_mode: str | None = None,
+        bridge_model_version: str | None = None,
+        legacy_jepa_compat: bool | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"patient_id": patient_id}
+        if bridge_url is not None:
+            body["bridge_url"] = bridge_url
+        if bridge_mode is not None:
+            body["bridge_mode"] = bridge_mode
+        if bridge_model_version is not None:
+            body["bridge_model_version"] = bridge_model_version
+        if legacy_jepa_compat is not None:
+            body["legacy_jepa_compat"] = legacy_jepa_compat
+        return self._post("/chamelia_load_patient", body)
 
     def graduation_status(self, patient_id: str) -> dict[str, Any]:
         return self._post("/chamelia_graduation_status", {"patient_id": patient_id})

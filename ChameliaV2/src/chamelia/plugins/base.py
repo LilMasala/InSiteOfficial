@@ -41,6 +41,24 @@ class AbstractDomain(ABC):
             Domain-specific action object(s).
         """
 
+    def decode_action_path(self, action_path: torch.Tensor) -> Any:
+        """Decode a whole candidate path.
+
+        Args:
+            action_path: Tensor of shape [B, P, A], [P, A], or [A].
+
+        Returns:
+            Domain-specific path object(s).
+
+        Default behavior delegates to ``decode_action`` on the first action of the path.
+        Plugins may override this when path-level semantics matter.
+        """
+        if action_path.dim() == 3:
+            return self.decode_action(action_path[:, 0, :])
+        if action_path.dim() == 2:
+            return self.decode_action(action_path[0, :].unsqueeze(0))
+        return self.decode_action(action_path)
+
     @abstractmethod
     def get_intrinsic_cost_fns(self) -> list[tuple[Callable, float]]:
         """Return domain intrinsic cost functions and fixed weights.
@@ -61,6 +79,36 @@ class AbstractDomain(ABC):
             Domain-state dict consumed opaquely by cost functions.
         """
 
+    def prepare_bridge_observation(self, observation: Any) -> Any:
+        """Convert a bridge observation payload into tokenizer input.
+
+        Args:
+            observation: Plugin-owned bridge observation payload.
+
+        Returns:
+            Tokenizer input object compatible with ``get_tokenizer()``.
+
+        Default behavior passes the payload through unchanged.
+        Plugins should override this when the bridge observation format differs from the
+        tokenizer's native input format.
+        """
+        return observation
+
+    def get_persistable_domain_state(self, domain_state: dict) -> dict[str, Any] | None:
+        """Optionally filter domain state for persistence outside the plugin.
+
+        Args:
+            domain_state: Plugin-owned opaque domain-state payload.
+
+        Returns:
+            Optional filtered payload safe to persist or transport as plugin-owned state.
+
+        Default behavior returns ``None`` so core does not assume the full domain state
+        is portable or persistence-safe.
+        """
+        _ = domain_state
+        return None
+
     @abstractmethod
     def compute_regime_embedding(self, domain_state: dict) -> torch.Tensor | None:
         """Optionally return a regime embedding.
@@ -71,6 +119,72 @@ class AbstractDomain(ABC):
         Returns:
             Tensor of shape [D] or [B, D], or None if unavailable.
         """
+
+    def simulate_delayed_outcome(
+        self,
+        action_vec: torch.Tensor,
+        domain_state: dict,
+    ) -> dict[str, torch.Tensor] | None:
+        """Optionally simulate a delayed outcome for training-time memory filling.
+
+        Args:
+            action_vec: Selected action tensor [B, A].
+            domain_state: Opaque domain-state dict from the current batch.
+
+        Returns:
+            Optional dict with:
+                - ``outcome_observation``: raw observation payload for ``fill_outcome``
+                - ``realized_intrinsic_cost``: tensor [B]
+            Domains that cannot provide a delayed outcome should return ``None``.
+        """
+        _ = action_vec
+        _ = domain_state
+        return None
+
+    def simulate_path_outcome(
+        self,
+        action_path: torch.Tensor,
+        domain_state: dict,
+    ) -> dict[str, torch.Tensor] | None:
+        """Optionally simulate the delayed outcome of a whole candidate path.
+
+        Args:
+            action_path: Candidate path tensor [B, P, A] or [B, A].
+            domain_state: Opaque domain-state dict from the current batch.
+
+        Returns:
+            Optional dict with:
+                - ``outcome_observation``: raw observation payload for ``fill_outcome``
+                - ``realized_intrinsic_cost``: tensor [B]
+
+        Default behavior falls back to the first action of the path when possible.
+        """
+        if action_path.dim() == 3:
+            return self.simulate_delayed_outcome(action_path[:, 0, :], domain_state)
+        return self.simulate_delayed_outcome(action_path, domain_state)
+
+    def render_recommendation(
+        self,
+        action: Any,
+        action_path: torch.Tensor | None = None,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> Any | None:
+        """Optionally render a human-facing recommendation package.
+
+        Args:
+            action: Plugin-decoded selected action.
+            action_path: Optional raw selected path tensor.
+            diagnostics: Optional planner diagnostics.
+
+        Returns:
+            Optional plugin-owned presentation object. Core should treat this as opaque.
+
+        Default behavior returns ``None`` because presentation belongs outside core.
+        """
+        _ = action
+        _ = action_path
+        _ = diagnostics
+        return None
 
     @property
     @abstractmethod
@@ -130,4 +244,3 @@ class DomainRegistry:
             Python list of registry keys.
         """
         return list(DomainRegistry._registry.keys())
-

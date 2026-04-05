@@ -155,11 +155,13 @@ def apply_context_effectors(
 
     # ── Illness: event-driven EGP/ISF replaces binary check ──
     if ev.get("is_ill_override", False):
-        params["EGP0"] *= ev.get("egp_mult", 1.40)
+        params["EGP0"] *= ev.get("egp_mult", 1.16)
         # ISF already applied via isf_mult_factor above
     elif ctx.is_ill:
-        params["EGP0"] *= 1.40
-        params["k1"] *= 0.75
+        # Compatibility path for callers that still pass an explicit illness
+        # flag without event modifiers. Keep it milder than a scheduled event.
+        params["EGP0"] *= 1.12
+        params["k1"] *= 0.92
 
     # Gap 2: post-exercise late hypoglycemia window (MacDonald 1987)
     # 6-15h after aerobic exercise: reduced nadir EGP

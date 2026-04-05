@@ -138,14 +138,18 @@ class Configurator(nn.Module):
     def forward(
         self,
         hjepa_outputs: dict,
-        memory_keys: torch.Tensor | None,
+        memory_tokens: torch.Tensor | None,
+        memory_scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate context tokens from hierarchical latent state and memory.
 
         Args:
             hjepa_outputs: Dict containing "target_features_per_level" as a list of 3 tensors,
                 each of shape [B, N_i, D].
-            memory_keys: Optional memory tensor of shape [B, K, D], where K <= memory_read_k.
+            memory_tokens: Optional memory-summary tensor of shape [B, K, D], where
+                K <= memory_read_k.
+            memory_scores: Optional memory quality scores [B, K] used to emphasize
+                better retrieved summaries.
 
         Returns:
             Context tensor of shape [B, num_ctx_tokens, D].
@@ -181,8 +185,20 @@ class Configurator(nn.Module):
             value=all_latents,
         )[0]
 
-        if memory_keys is not None:
-            mem = self.memory_proj(memory_keys)
+        if memory_tokens is not None:
+            mem = self.memory_proj(memory_tokens)
+            if memory_scores is not None:
+                if memory_scores.dim() != 2:
+                    raise ValueError("memory_scores must have shape [B, K].")
+                valid_mask = torch.isfinite(memory_scores)
+                safe_scores = memory_scores.masked_fill(~valid_mask, -1.0e4)
+                weights = torch.softmax(safe_scores, dim=1) * valid_mask.float()
+                weights = torch.where(
+                    weights.sum(dim=1, keepdim=True) > 0,
+                    weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0e-6),
+                    weights,
+                )
+                mem = mem * weights.unsqueeze(-1)
             mem = self.norm_memory(mem)
             ctx = ctx + self.cross_attn_to_memory(
                 query=ctx,
@@ -193,4 +209,3 @@ class Configurator(nn.Module):
         ctx = self.norm_out(ctx)
         ctx = self.output_proj(ctx)
         return ctx
-

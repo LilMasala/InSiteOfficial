@@ -206,11 +206,33 @@ def main() -> None:
 
     if args.append:
         try:
-            chamelia.load(uid)
+            chamelia.load(
+                uid,
+                bridge_url=args.python_bridge_url,
+                bridge_mode=args.bridge_mode,
+                bridge_model_version=args.bridge_model_version,
+                legacy_jepa_compat=args.legacy_jepa_compat,
+            )
         except ChameliaError:
-            chamelia.initialize(uid, preferences, weights_dir=args.weights_dir)
+            chamelia.initialize(
+                uid,
+                preferences,
+                weights_dir=args.weights_dir,
+                bridge_url=args.python_bridge_url,
+                bridge_mode=args.bridge_mode,
+                bridge_model_version=args.bridge_model_version,
+                legacy_jepa_compat=args.legacy_jepa_compat,
+            )
     else:
-        chamelia.initialize(uid, preferences, weights_dir=args.weights_dir)
+        chamelia.initialize(
+            uid,
+            preferences,
+            weights_dir=args.weights_dir,
+            bridge_url=args.python_bridge_url,
+            bridge_mode=args.bridge_mode,
+            bridge_model_version=args.bridge_model_version,
+            legacy_jepa_compat=args.legacy_jepa_compat,
+        )
         bootstrap_now = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         bootstrap_start = bootstrap_now - timedelta(days=args.days)
         writer.write_therapy_snapshot(sim_state.current_schedule, timestamp=bootstrap_start)
@@ -312,6 +334,7 @@ def main() -> None:
         log_entries.append({
             "run_id": run_id,
             "namespace": args.namespace,
+            "experiment_label": args.experiment_label,
             "day": cumulative_day,
             "date": current_date.isoformat(),
             "bg_avg": signals.get("bg_avg"),
@@ -342,7 +365,17 @@ def main() -> None:
             "jepa_status": status.get("belief_mode"),
             "jepa_active": status.get("jepa_active"),
             "jepa_weights_loaded": status.get("jepa_weights_loaded"),
+            "python_bridge_enabled": status.get("python_bridge_enabled"),
+            "python_bridge_mode": status.get("python_bridge_mode"),
+            "python_bridge_model_version": status.get("python_bridge_model_version"),
+            "python_bridge_session_id": status.get("python_bridge_session_id"),
+            "legacy_jepa_mode": status.get("legacy_jepa_mode"),
+            "legacy_jepa_compat_enabled": status.get("legacy_jepa_compat_enabled"),
             "configurator_mode": status.get("configurator_mode"),
+            "requested_bridge_mode": args.bridge_mode,
+            "requested_bridge_model_version": args.bridge_model_version,
+            "requested_python_bridge_url_present": bool(args.python_bridge_url),
+            "requested_legacy_jepa_compat": bool(args.legacy_jepa_compat),
             "belief_entropy": status.get("belief_entropy"),
             "familiarity": status.get("familiarity"),
             "concordance": status.get("concordance"),
@@ -376,6 +409,13 @@ def main() -> None:
     if email and args.password and not args.no_firebase:
         print(f"Login with: {email} / {args.password}")
     print(f"Final status: {report['final_status']}")
+    print(
+        "Runtime: "
+        f"requested={args.bridge_mode}"
+        f"{' + legacy-compat' if args.legacy_jepa_compat else ''} | "
+        f"resolved={report.get('python_bridge_mode') or report.get('legacy_jepa_mode') or 'none'} | "
+        f"bridge_enabled={report.get('python_bridge_enabled', False)}"
+    )
     print(f"Accept+partial rate: {report['accept_or_partial_rate']:.3f}")
     print(f"Realized positive outcome rate: {report['realized_positive_outcome_rate']:.3f}")
     print(f"Graduated on day: {report['graduated_day']}")
@@ -408,6 +448,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coldstart-targets", choices=["synthetic", "none"], default="synthetic")
     parser.add_argument("--weights-dir")
     parser.add_argument("--report-file")
+    parser.add_argument("--bridge-mode", choices=["v1.1", "v1.5", "v3"], default="v3")
+    parser.add_argument("--bridge-model-version", default="unknown")
+    parser.add_argument("--python-bridge-url")
+    parser.add_argument("--legacy-jepa-compat", action="store_true")
+    parser.add_argument("--experiment-label")
     return parser
 
 
@@ -577,6 +622,7 @@ def build_run_report(
         "email": email,
         "namespace": namespace,
         "persona": persona,
+        "experiment_label": log_entries[-1].get("experiment_label") if log_entries else None,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "days_total": len(log_entries),
         "days_this_run": days_this_run,
@@ -608,6 +654,17 @@ def build_run_report(
         "jepa_active_days": len(jepa_entries),
         "first_jepa_day": first_jepa_day,
         "jepa_weights_loaded": bool(final_status.get("jepa_weights_loaded")),
+        "python_bridge_enabled": bool(final_status.get("python_bridge_enabled")),
+        "python_bridge_mode": final_status.get("python_bridge_mode"),
+        "python_bridge_model_version": final_status.get("python_bridge_model_version"),
+        "legacy_jepa_mode": final_status.get("legacy_jepa_mode"),
+        "legacy_jepa_compat_enabled": bool(final_status.get("legacy_jepa_compat_enabled")),
+        "requested_runtime": {
+            "bridge_mode": log_entries[-1].get("requested_bridge_mode") if log_entries else None,
+            "bridge_model_version": log_entries[-1].get("requested_bridge_model_version") if log_entries else None,
+            "python_bridge_url_present": bool(log_entries[-1].get("requested_python_bridge_url_present")) if log_entries else False,
+            "legacy_jepa_compat": bool(log_entries[-1].get("requested_legacy_jepa_compat")) if log_entries else False,
+        },
         "competence_snapshot": {
             "belief_entropy": final_status.get("belief_entropy"),
             "familiarity": final_status.get("familiarity"),
@@ -672,32 +729,6 @@ def _calibration_summary(
         for item in realized_outcomes
         if item.get("day") is not None
     }
-
-
-def _uncertainty_summary(recommendations: list[dict[str, Any]]) -> dict[str, Any]:
-    uncertainty_items = [
-        recommendation.get("predicted_uncertainty") or {}
-        for recommendation in recommendations
-        if recommendation.get("predicted_uncertainty")
-    ]
-    confidence_items = [
-        recommendation.get("confidence_breakdown") or {}
-        for recommendation in recommendations
-        if recommendation.get("confidence_breakdown")
-    ]
-    return {
-        "count": len(uncertainty_items),
-        "tir_std_mean": _safe_mean([float(item.get("tir_std", 0.0)) for item in uncertainty_items]),
-        "pct_low_std_mean": _safe_mean([float(item.get("pct_low_std", 0.0)) for item in uncertainty_items]),
-        "pct_high_std_mean": _safe_mean([float(item.get("pct_high_std", 0.0)) for item in uncertainty_items]),
-        "bg_avg_std_mean": _safe_mean([float(item.get("bg_avg_std", 0.0)) for item in uncertainty_items]),
-        "cost_std_mean": _safe_mean([float(item.get("cost_std", 0.0)) for item in uncertainty_items]),
-        "mean_confidence": _safe_mean([float(item.get("final_confidence", 0.0)) for item in confidence_items]),
-        "mean_familiarity": _safe_mean([float(item.get("familiarity", 0.0)) for item in confidence_items]),
-        "mean_concordance": _safe_mean([float(item.get("concordance", 0.0)) for item in confidence_items]),
-        "mean_calibration": _safe_mean([float(item.get("calibration", 0.0)) for item in confidence_items]),
-        "mean_effect_support": _safe_mean([float(item.get("effect_support", 0.0)) for item in confidence_items]),
-    }
     paired: list[dict[str, float | bool | int]] = []
 
     for recommendation in recommendations:
@@ -740,6 +771,32 @@ def _uncertainty_summary(recommendations: list[dict[str, Any]]) -> dict[str, Any
         "tir_direction_match_rate": _safe_mean([1.0 if item["tir_direction_match"] else 0.0 for item in paired]),
         "pct_low_direction_match_rate": _safe_mean([1.0 if item["pct_low_direction_match"] else 0.0 for item in paired]),
         "pct_high_direction_match_rate": _safe_mean([1.0 if item["pct_high_direction_match"] else 0.0 for item in paired]),
+    }
+
+
+def _uncertainty_summary(recommendations: list[dict[str, Any]]) -> dict[str, Any]:
+    uncertainty_items = [
+        recommendation.get("predicted_uncertainty") or {}
+        for recommendation in recommendations
+        if recommendation.get("predicted_uncertainty")
+    ]
+    confidence_items = [
+        recommendation.get("confidence_breakdown") or {}
+        for recommendation in recommendations
+        if recommendation.get("confidence_breakdown")
+    ]
+    return {
+        "count": len(uncertainty_items),
+        "tir_std_mean": _safe_mean([float(item.get("tir_std", 0.0)) for item in uncertainty_items]),
+        "pct_low_std_mean": _safe_mean([float(item.get("pct_low_std", 0.0)) for item in uncertainty_items]),
+        "pct_high_std_mean": _safe_mean([float(item.get("pct_high_std", 0.0)) for item in uncertainty_items]),
+        "bg_avg_std_mean": _safe_mean([float(item.get("bg_avg_std", 0.0)) for item in uncertainty_items]),
+        "cost_std_mean": _safe_mean([float(item.get("cost_std", 0.0)) for item in uncertainty_items]),
+        "mean_confidence": _safe_mean([float(item.get("final_confidence", 0.0)) for item in confidence_items]),
+        "mean_familiarity": _safe_mean([float(item.get("familiarity", 0.0)) for item in confidence_items]),
+        "mean_concordance": _safe_mean([float(item.get("concordance", 0.0)) for item in confidence_items]),
+        "mean_calibration": _safe_mean([float(item.get("calibration", 0.0)) for item in confidence_items]),
+        "mean_effect_support": _safe_mean([float(item.get("effect_support", 0.0)) for item in confidence_items]),
     }
 
 
@@ -972,7 +1029,11 @@ def _successful_day(result) -> bool:
 
 def _run_id(uid: str, args, existing_entries: list[dict[str, Any]]) -> str:
     ordinal = len(existing_entries) + args.seed
-    payload = f"{uid}|{args.namespace}|{args.seed}|{ordinal}|{datetime.now(timezone.utc).isoformat()}"
+    payload = (
+        f"{uid}|{args.namespace}|{args.seed}|{ordinal}|"
+        f"{args.bridge_mode}|{args.bridge_model_version}|{args.legacy_jepa_compat}|"
+        f"{getattr(args, 'experiment_label', None)}|{datetime.now(timezone.utc).isoformat()}"
+    )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
@@ -1010,7 +1071,12 @@ def _write_report_artifact(args, uid: str, report: dict[str, Any]) -> Path:
     else:
         reports_dir = Path(__file__).resolve().parent / "reports"
         reports_dir.mkdir(parents=True, exist_ok=True)
-        path = reports_dir / f"{args.namespace}_{uid}_{report['run_id']}.json"
+        label = getattr(args, "experiment_label", None)
+        label_slug = ""
+        if label:
+            safe_label = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(label))
+            label_slug = f"_{safe_label.strip('-_')}" if safe_label.strip("-_") else ""
+        path = reports_dir / f"{args.namespace}_{uid}{label_slug}_{report['run_id']}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     return path

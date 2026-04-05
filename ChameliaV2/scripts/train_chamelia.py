@@ -241,6 +241,7 @@ def build_stage_domains(
     *,
     selected_stages: list[int],
     selected_domains: list[str],
+    data_root: str | None = None,
 ) -> list[list[CurriculumDomain]]:
     """Instantiate curriculum domains from config selectors.
 
@@ -252,12 +253,18 @@ def build_stage_domains(
     Returns:
         Nested stage/domain list.
     """
-    cfg = curriculum_config["curriculum"]["stages"]
+    curriculum_root = curriculum_config["curriculum"]
+    cfg = curriculum_root["stages"]
+    configured_start_stage = int(curriculum_root.get("start_stage", 0))
+    configured_end_stage = int(curriculum_root.get("end_stage", len(cfg) - 1))
     stage_specs: list[tuple[int, str, list[CurriculumDomain]]] = []
 
     stage0_cfg = cfg["stage0_language"]
     stage0_domains = [
-        LanguageCurriculumDomain(batch_size=_domain_batch_size(stage0_cfg, 16))
+        LanguageCurriculumDomain(
+            batch_size=_domain_batch_size(stage0_cfg, 16),
+            data_root=data_root,
+        )
         for domain_name in stage0_cfg["domains"]
         if not selected_domains or domain_name in selected_domains
     ]
@@ -273,6 +280,7 @@ def build_stage_domains(
                 else _domain_batch_size(stage1_cfg, 16)
             ),
             seq_len=(8 if domain_name == "basic_arithmetic" else 48),
+            data_root=data_root,
         )
         for domain_name in stage1_cfg["domains"]
         if not selected_domains or domain_name in selected_domains
@@ -284,6 +292,7 @@ def build_stage_domains(
         PatternCurriculumDomain(
             domain_variant=domain_name,
             batch_size=_domain_batch_size(stage2_cfg, 16),
+            data_root=data_root,
         )
         for domain_name in stage2_cfg["domains"]
         if not selected_domains or domain_name in selected_domains
@@ -295,6 +304,7 @@ def build_stage_domains(
         GamesCurriculumDomain(
             domain_variant=domain_name,
             batch_size=_domain_batch_size(stage3_cfg, 8),
+            data_root=data_root,
         )
         for domain_name in stage3_cfg["domains"]
         if not selected_domains or domain_name in selected_domains
@@ -306,6 +316,7 @@ def build_stage_domains(
         CollaborativeCurriculumDomain(
             domain_variant=domain_name,
             batch_size=_domain_batch_size(stage4_cfg, 8),
+            data_root=data_root,
         )
         for domain_name in stage4_cfg["domains"]
         if not selected_domains or domain_name in selected_domains
@@ -325,7 +336,10 @@ def build_stage_domains(
 
     stages: list[list[CurriculumDomain]] = []
     for stage_idx, _name, domains in stage_specs:
-        if selected_stages and stage_idx not in selected_stages:
+        if selected_stages:
+            if stage_idx not in selected_stages:
+                continue
+        elif stage_idx < configured_start_stage or stage_idx > configured_end_stage:
             continue
         if domains:
             stages.append(domains)
@@ -801,6 +815,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage", action="append", default=[], help="Stage selector; may repeat or use csv.")
     parser.add_argument("--domain", action="append", default=[], help="Domain selector; may repeat or use csv.")
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--data-root", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backbone-mode", default="stub", choices=["stub", "hjepa"])
     parser.add_argument("--lr", type=float, default=None)
@@ -813,6 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retune-lr-factors", default="0.5,1.5")
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--checkpoint-dir", default=str(PROJECT_ROOT / "checkpoints" / "chamelia_curriculum"))
+    parser.add_argument("--model-version", default=None)
     return parser
 
 
@@ -836,6 +852,7 @@ def run_training(args: argparse.Namespace) -> int:
         curriculum_config,
         selected_stages=selected_stages,
         selected_domains=selected_domains,
+        data_root=args.data_root,
     )
     effective_model_cfg = _resolve_model_config(chamelia_config, args.backbone_mode)
     model = build_model(
@@ -866,6 +883,9 @@ def run_training(args: argparse.Namespace) -> int:
         critic_loss_weight=float(training_cfg.get("critic_loss_weight", 1.0)),
         mode1_distill_interval=int(training_cfg.get("mode1_distill_interval", 0)),
         mode1_distill_weight=float(training_cfg.get("mode1_distill_weight", 0.0)),
+        export_model_config=effective_model_cfg,
+        export_backbone_mode=args.backbone_mode,
+        export_model_version=getattr(args, "model_version", None),
     )
     if stages and stages[0]:
         runner._runtime_domains[stages[0][0].domain_name()] = model.domain

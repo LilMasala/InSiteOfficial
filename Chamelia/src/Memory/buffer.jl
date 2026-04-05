@@ -39,6 +39,8 @@ function store_record!(
     latent_snapshot   :: Union{Vector{Float32}, Nothing} = nothing,
     predicted_cvar    :: Union{Float64, Nothing} = nothing,
     configurator_mode :: Symbol = :rules,
+    bridge_trace      :: Union{Dict{String, Any}, Nothing} = nothing,
+    bridge_diagnostics :: Union{Dict{String, Any}, Nothing} = nothing,
 ) :: Int   # returns record id
 
     id = mem.next_id
@@ -67,6 +69,8 @@ function store_record!(
         latent_μ_at_rec = latent_μ_at_rec,
         latent_log_σ_at_rec = latent_log_σ_at_rec,
         configurator_mode   = configurator_mode,
+        bridge_trace        = isnothing(bridge_trace) ? nothing : deepcopy(bridge_trace),
+        bridge_diagnostics  = isnothing(bridge_diagnostics) ? nothing : deepcopy(bridge_diagnostics),
     )
 
     push!(mem.records, record)
@@ -106,6 +110,18 @@ function store_outcome!(
     rec.realized_signals    = signals
     rec.realized_cost       = cost
     rec.latent_μ_at_outcome = latent_μ_at_outcome
+    rec.bridge_outcome = Dict{String, Any}(
+        "realized_cost" => cost,
+        "user_response" => isnothing(response) ? nothing : Int(response),
+        "realized_signals" => deepcopy(signals),
+        "latent_μ_at_outcome" => isnothing(latent_μ_at_outcome) ? nothing : copy(latent_μ_at_outcome),
+    )
+    if rec.bridge_trace isa AbstractDict
+        julia_selection = get(rec.bridge_trace, "julia_selection", nothing)
+        if julia_selection isa AbstractDict
+            rec.bridge_outcome["julia_selection"] = deepcopy(Dict{String, Any}(String(key) => value for (key, value) in pairs(julia_selection)))
+        end
+    end
 
     return nothing
 end
@@ -123,14 +139,18 @@ function store_hold!(
     reason    :: Symbol,
     config    :: ConfiguratorState,
     psy       :: PsyState;
-    configurator_mode :: Symbol = :rules
+    configurator_mode :: Symbol = :rules,
+    bridge_trace      :: Union{Dict{String, Any}, Nothing} = nothing,
+    bridge_diagnostics :: Union{Dict{String, Any}, Nothing} = nothing,
 ) :: Int
 
     # null action represents hold
     null_action = NullAction()
 
     return store_record!(mem, day, belief, null_action, epistemic, config, psy;
-                         configurator_mode = configurator_mode)
+                         configurator_mode = configurator_mode,
+                         bridge_trace = bridge_trace,
+                         bridge_diagnostics = bridge_diagnostics)
 end
 
 # ─────────────────────────────────────────────────────────────────

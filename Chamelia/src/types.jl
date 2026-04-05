@@ -91,9 +91,29 @@ function domain_name(:: DefaultDomainAdapter) :: String
     return "default"
 end
 
-
 #Actions
 abstract type AbstractAction end
+
+struct BridgeDecodedCandidate
+    bridge_candidate_idx :: Int
+    bridge_candidate_slot :: Int
+    action :: AbstractAction
+    decode_metadata :: Union{Dict{String, Any}, Nothing}
+end
+
+struct BridgeDecodedAction
+    action :: AbstractAction
+    metadata :: Union{Dict{String, Any}, Nothing}
+end
+
+Base.@kwdef struct BridgeProposalAdvisory
+    bridge_candidate_idx :: Int
+    bridge_candidate_slot :: Int
+    python_ic :: Union{Float64, Nothing} = nothing
+    python_tc :: Union{Float64, Nothing} = nothing
+    python_total :: Union{Float64, Nothing} = nothing
+    python_rank :: Union{Int, Nothing} = nothing
+end
 
 #abstract critic interfaces
 abstract type AbstractCriticModel end
@@ -202,6 +222,82 @@ end
 Base.@kwdef struct Observation
     timestamp :: Float64
     signals :: Dict{Symbol, Any}
+end
+
+function _bridge_json_value(value::Nothing)
+    return nothing
+end
+
+function _bridge_json_value(value::Bool)
+    return value
+end
+
+function _bridge_json_value(value::Number)
+    return value
+end
+
+function _bridge_json_value(value::AbstractString)
+    return String(value)
+end
+
+function _bridge_json_value(value::Symbol)
+    return String(value)
+end
+
+function _bridge_json_value(value::AbstractVector)
+    return [_bridge_json_value(item) for item in value]
+end
+
+function _bridge_json_value(value::Dict)
+    return Dict(String(key) => _bridge_json_value(item) for (key, item) in value)
+end
+
+function _bridge_json_value(value)
+    return string(value)
+end
+
+"""
+    bridge_domain_name(adapter) :: String
+
+Return the domain name carried over the Julia ↔ Python bridge.
+The default bridge name matches the adapter's domain name.
+"""
+function bridge_domain_name(adapter::AbstractDomainAdapter) :: String
+    return domain_name(adapter)
+end
+
+"""
+    bridge_domain_state(adapter, obs) :: Dict{String,Any}
+
+Build the plugin-owned opaque domain-state payload sent to the Python bridge.
+Chamelia core does not interpret the returned fields.
+"""
+function bridge_domain_state(
+    adapter::AbstractDomainAdapter,
+    obs::Observation,
+) :: Dict{String, Any}
+    _ = adapter
+    return Dict{String, Any}(
+        "timestamp" => obs.timestamp,
+        "signals" => Dict(String(key) => _bridge_json_value(value) for (key, value) in obs.signals),
+    )
+end
+
+"""
+    bridge_encode_payload(adapter, obs) :: Dict{String,Any}
+
+Build the encode payload for the Python bridge.
+Adapters own how raw observations are surfaced to the bridge. The default path
+ships a plugin observation payload and lets the Python-side plugin tokenize it.
+"""
+function bridge_encode_payload(
+    adapter::AbstractDomainAdapter,
+    obs::Observation,
+) :: Dict{String, Any}
+    return Dict{String, Any}(
+        "input_kind" => "plugin_observation",
+        "observation" => bridge_domain_state(adapter, obs),
+    )
 end
 
 # -------------------------------------------------------------------
@@ -317,6 +413,122 @@ function magnitude(a::ScheduledAction) :: Float64
     total += length(a.structural_edits)
     n_components += length(a.structural_edits)
     return n_components == 0 ? 0.0 : total / n_components
+end
+
+"""
+    bridge_decode_action_path(adapter, action_path, capabilities, app_state) -> Union{AbstractAction, Nothing}
+
+Plugin-owned decoding of a bridge candidate path into a Julia action.
+Core Chamelia does not interpret the path semantics itself.
+The default implementation returns `nothing`, which tells Julia to ignore the
+bridge path for action-selection purposes and fall back to legacy search.
+"""
+function bridge_decode_action_path(
+    adapter::AbstractDomainAdapter,
+    action_path,
+    capabilities::ConnectedAppCapabilities,
+    app_state::ConnectedAppState,
+) :: Union{AbstractAction, Nothing}
+    _ = adapter
+    _ = action_path
+    _ = capabilities
+    _ = app_state
+    return nothing
+end
+
+"""
+    bridge_decode_action_path_result(adapter, action_path, capabilities, app_state)
+
+Plugin-owned bridge decode that can attach structured metadata explaining how a
+bridge path became a Julia-native action. The default implementation preserves
+the legacy `bridge_decode_action_path(...)` hook and wraps its result.
+"""
+function bridge_decode_action_path_result(
+    adapter::AbstractDomainAdapter,
+    action_path,
+    capabilities::ConnectedAppCapabilities,
+    app_state::ConnectedAppState,
+) :: Union{BridgeDecodedAction, Nothing}
+    action = bridge_decode_action_path(adapter, action_path, capabilities, app_state)
+    isnothing(action) && return nothing
+    return BridgeDecodedAction(action, Dict{String, Any}(
+        "decoder" => "default_bridge_decoder",
+        "returned_action_kind" => string(nameof(typeof(action))),
+    ))
+end
+
+"""
+    bridge_decode_candidate_proposals(adapter, proposal_bundle, capabilities, app_state)
+
+Decode the non-baseline bridge candidates into Julia actions together with
+their original proposal indices. Candidate slot 1 is reserved for the explicit
+bridge baseline and is skipped because Julia owns the null-baseline comparison.
+"""
+function bridge_decode_candidate_proposals(
+    adapter::AbstractDomainAdapter,
+    proposal_bundle::Dict{String, Any},
+    capabilities::ConnectedAppCapabilities,
+    app_state::ConnectedAppState,
+) :: Vector{BridgeDecodedCandidate}
+    candidate_paths = get(proposal_bundle, "candidate_paths", nothing)
+    candidate_paths isa AbstractVector || return BridgeDecodedCandidate[]
+
+    decoded = BridgeDecodedCandidate[]
+    for (idx, action_path) in pairs(candidate_paths)
+        idx == 1 && continue
+        decoded_action = bridge_decode_action_path_result(adapter, action_path, capabilities, app_state)
+        isnothing(decoded_action) && continue
+        push!(decoded, BridgeDecodedCandidate(idx - 1, idx, decoded_action.action, decoded_action.metadata))
+    end
+    return decoded
+end
+
+"""
+    bridge_decode_candidate_actions(adapter, proposal_bundle, capabilities, app_state)
+
+Decode the non-baseline bridge candidates into Julia actions.
+Candidate slot 1 is reserved for the explicit bridge baseline and is skipped
+because Julia owns the null-baseline comparison.
+"""
+function bridge_decode_candidate_actions(
+    adapter::AbstractDomainAdapter,
+    proposal_bundle::Dict{String, Any},
+    capabilities::ConnectedAppCapabilities,
+    app_state::ConnectedAppState,
+) :: Vector{AbstractAction}
+    return AbstractAction[decoded.action for decoded in bridge_decode_candidate_proposals(adapter, proposal_bundle, capabilities, app_state)]
+end
+
+function bridge_action_summary(action::AbstractAction) :: Dict{String, Any}
+    return Dict("kind" => string(nameof(typeof(action))))
+end
+
+function bridge_action_summary(::NullAction) :: Dict{String, Any}
+    return Dict("kind" => "null", "deltas" => Dict{String, Float64}())
+end
+
+function bridge_action_summary(action::ScheduledAction) :: Dict{String, Any}
+    return Dict(
+        "kind" => "scheduled",
+        "level" => action.level,
+        "family" => string(action.family),
+        "segment_deltas" => [
+            Dict(
+                "segment_id" => delta.segment_id,
+                "parameter_deltas" => Dict(String(key) => value for (key, value) in delta.parameter_deltas),
+            )
+            for delta in action.segment_deltas
+        ],
+        "structural_edits" => [
+            Dict(
+                "edit_type" => String(edit.edit_type),
+                "target_segment_id" => edit.target_segment_id,
+                "split_at_minute" => edit.split_at_minute,
+                "neighbor_segment_id" => edit.neighbor_segment_id,
+            )
+            for edit in action.structural_edits
+        ]
+    )
 end
 
 
@@ -675,6 +887,13 @@ Base.@kwdef mutable struct MemoryRecord
     latent_μ_at_rec :: Union{Vector{Float32}, Nothing} = nothing
     latent_log_σ_at_rec :: Union{Vector{Float32}, Nothing} = nothing
     configurator_mode   :: Symbol = :rules
+
+    # Python bridge artifacts (transport-stable, per-patient durable truth).
+    # These are persisted in Julia-owned state so bridge restarts do not erase
+    # the decision-time reasoning trace for a patient.
+    bridge_trace :: Union{Dict{String, Any}, Nothing} = nothing
+    bridge_diagnostics :: Union{Dict{String, Any}, Nothing} = nothing
+    bridge_outcome :: Union{Dict{String, Any}, Nothing} = nothing
 
     # Outcome-time latent snapshot (filled in by record_outcome!).
     # Together with latent_μ_at_rec and action, this forms the (z_t, a_eff, z_{t+H})

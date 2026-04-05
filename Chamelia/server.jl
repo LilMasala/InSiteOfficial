@@ -324,6 +324,31 @@ function _optional_string(payload::Dict{String, Any}, key::String) :: Union{Stri
     return isempty(stripped) ? nothing : stripped
 end
 
+function _resolved_bridge_url_for_payload(payload::Union{Dict{String, Any}, Nothing}) :: Union{String, Nothing}
+    payload_url = payload isa Dict{String, Any} ? _optional_string(payload, "bridge_url") : nothing
+    return isnothing(payload_url) ? _nonempty_env("CHAMELIA_PYTHON_BRIDGE_URL") : payload_url
+end
+
+function _resolved_bridge_model_version_for_payload(payload::Union{Dict{String, Any}, Nothing}) :: String
+    payload_version = payload isa Dict{String, Any} ? _optional_string(payload, "bridge_model_version") : nothing
+    return isnothing(payload_version) ? something(_nonempty_env("CHAMELIA_PYTHON_BRIDGE_MODEL_VERSION"), "unknown") : payload_version
+end
+
+function _resolved_bridge_mode_for_payload(payload::Union{Dict{String, Any}, Nothing}) :: String
+    payload_mode = payload isa Dict{String, Any} ? _optional_string(payload, "bridge_mode") : nothing
+    return isnothing(payload_mode) ? something(_nonempty_env("CHAMELIA_PYTHON_BRIDGE_MODE"), "v3") : payload_mode
+end
+
+function _resolved_legacy_jepa_compat_for_payload(payload::Union{Dict{String, Any}, Nothing}) :: Bool
+    value = payload isa Dict{String, Any} ? get(payload, "legacy_jepa_compat", nothing) : nothing
+    if value === nothing
+        env_value = lowercase(strip(get(ENV, "CHAMELIA_LEGACY_JEPA_COMPAT", "")))
+        return env_value in ("1", "true", "yes", "on")
+    end
+    value isa Bool || throw(ArgumentError("`legacy_jepa_compat` must be a boolean"))
+    return Bool(value)
+end
+
 function _as_float(value, key::String) :: Float64
     value isa Real || throw(ArgumentError("`$key` must be numeric"))
     return Float64(value)
@@ -917,6 +942,21 @@ function _lookup_patient(
         if autoload
             loaded = _try_load_from_backend(patient_id; ctx=ctx, route_stage="patient.lookup")
             if !isnothing(loaded)
+                Chamelia.set_legacy_jepa_compat!(
+                    loaded;
+                    enabled=_resolved_legacy_jepa_compat_for_payload(nothing),
+                )
+                bridge_url = _resolved_bridge_url_for_payload(nothing)
+                if !isnothing(bridge_url)
+                    Chamelia.configure_python_bridge!(
+                        loaded;
+                        base_url=bridge_url,
+                        mode=_resolved_bridge_mode_for_payload(nothing),
+                        session_id=patient_id,
+                        model_version=_resolved_bridge_model_version_for_payload(nothing),
+                    )
+                    _maybe_sync_python_bridge_replay!(loaded, patient_id, ctx; full_resync=true)
+                end
                 PATIENTS[patient_id] = loaded
                 _emit_log("INFO", "patient_autoloaded"; ctx=ctx, stage="patient.lookup", fields=fields)
                 return loaded
@@ -924,6 +964,40 @@ function _lookup_patient(
         end
 
         throw(NotFoundError("patient state not found for `$patient_id`"))
+    end
+end
+
+function _maybe_sync_python_bridge_replay!(
+    system::Chamelia.ChameliaSystem,
+    patient_id::String,
+    ctx::Union{Nothing, Dict{String, Any}};
+    full_resync::Bool=false,
+) :: Union{Dict{String, Any}, Nothing}
+    patient_fields = _patient_fields(patient_id)
+    try
+        return _with_stage_logging(
+            ctx,
+            "bridge.replay_sync";
+            fields=_merge_fields(patient_fields, Dict("full_resync" => full_resync)),
+        ) do
+            return Chamelia.sync_python_bridge_replay!(system; full_resync=full_resync)
+        end
+    catch err
+        _emit_log(
+            "WARNING",
+            "bridge_replay_sync_failed";
+            ctx=ctx,
+            stage="bridge.replay_sync",
+            fields=_merge_fields(
+                patient_fields,
+                Dict(
+                    "full_resync" => full_resync,
+                    "error_type" => string(typeof(err)),
+                    "error_message" => sprint(showerror, err),
+                ),
+            ),
+        )
+        return nothing
     end
 end
 
@@ -950,7 +1024,14 @@ function _status_payload(system::Chamelia.ChameliaSystem) :: Dict{String, Any}
         "configurator_mode" => String(status.configurator_mode),
         "jepa_weights_loaded" => status.jepa_weights_loaded,
         "jepa_active" => status.jepa_active,
+        "legacy_jepa_mode" => status.legacy_jepa_mode,
+        "legacy_jepa_compat_enabled" => status.legacy_jepa_compat_enabled,
         "belief_mode" => String(status.belief_mode),
+        "python_bridge_enabled" => status.python_bridge_enabled,
+        "python_bridge_mode" => status.python_bridge_mode,
+        "python_bridge_model_version" => status.python_bridge_model_version,
+        "python_bridge_session_id" => status.python_bridge_session_id,
+        "last_bridge_diagnostics" => _json_ready(status.last_bridge_diagnostics),
         "config" => _json_ready(status.config),
     )
 end
@@ -1096,6 +1177,10 @@ function _initialize_handler(payload::Dict{String, Any}, ctx::Dict{String, Any})
             end
 
             weights_dir = _optional_string(payload, "weights_dir")
+            bridge_url = _resolved_bridge_url_for_payload(payload)
+            bridge_mode = _resolved_bridge_mode_for_payload(payload)
+            bridge_model_version = _resolved_bridge_model_version_for_payload(payload)
+            legacy_jepa_compat = _resolved_legacy_jepa_compat_for_payload(payload)
             _emit_log(
                 "INFO",
                 "initializing_new_patient";
@@ -1105,7 +1190,11 @@ function _initialize_handler(payload::Dict{String, Any}, ctx::Dict{String, Any})
                     patient_fields,
                     Dict(
                         "persona" => prefs.persona,
-                        "weights_dir_present" => !isnothing(weights_dir)
+                        "weights_dir_present" => !isnothing(weights_dir),
+                        "bridge_url_present" => !isnothing(bridge_url),
+                        "bridge_mode" => bridge_mode,
+                        "legacy_jepa_compat" => legacy_jepa_compat,
+                        "bridge_model_version" => bridge_model_version,
                     )
                 )
             )
@@ -1118,10 +1207,31 @@ function _initialize_handler(payload::Dict{String, Any}, ctx::Dict{String, Any})
                     prefs,
                     Main.InSiteSimulator(prefs.persona);
                     adapter=InSiteDomainAdapter(),
-                    weights_dir=weights_dir
+                    weights_dir=weights_dir,
+                    legacy_jepa_compat=legacy_jepa_compat,
+                    bridge_url=bridge_url,
+                    bridge_mode=bridge_mode,
+                    bridge_session_id=patient_id,
+                    bridge_model_version=bridge_model_version,
                 )
             end
             _persist_state!(patient_id, system; ctx=ctx)
+        else
+            bridge_url = _resolved_bridge_url_for_payload(payload)
+            bridge_mode = _resolved_bridge_mode_for_payload(payload)
+            bridge_model_version = _resolved_bridge_model_version_for_payload(payload)
+            legacy_jepa_compat = _resolved_legacy_jepa_compat_for_payload(payload)
+            Chamelia.set_legacy_jepa_compat!(system; enabled=legacy_jepa_compat)
+            if !isnothing(bridge_url)
+                Chamelia.configure_python_bridge!(
+                    system;
+                    base_url=bridge_url,
+                    mode=bridge_mode,
+                    session_id=patient_id,
+                    model_version=bridge_model_version,
+                )
+                _maybe_sync_python_bridge_replay!(system, patient_id, ctx; full_resync=true)
+            end
         end
 
         PATIENTS[patient_id] = system
@@ -1220,10 +1330,57 @@ function _record_outcome_handler(payload::Dict{String, Any}, ctx::Dict{String, A
             Chamelia.record_outcome!(system, rec_id, _response_enum(payload), _signals(payload), cost)
             return nothing
         end
+        _maybe_sync_python_bridge_replay!(system, patient_id, ctx; full_resync=false)
         _persist_state!(patient_id, system; ctx=ctx)
 
         status = _status_payload(system)
         return _json_response(200, Dict("ok" => true, "patient_id" => patient_id, "status" => status))
+    end
+end
+
+function _export_bridge_replay_handler(payload::Dict{String, Any}, ctx::Dict{String, Any}) :: HTTP.Response
+    return _with_stage_logging(ctx, "route.chamelia_export_bridge_replay"; fields=Dict("route_name" => "chamelia_export_bridge_replay")) do
+        patient_id = _require_string(payload, "patient_id")
+        patient_fields = _patient_fields(patient_id)
+        system = _lookup_patient(patient_id; ctx=ctx)
+        limit = begin
+            raw = get(payload, "limit", nothing)
+            isnothing(raw) ? nothing : Int(round(_as_float(raw, "limit")))
+        end
+        since_record_id = begin
+            raw = get(payload, "since_record_id", nothing)
+            isnothing(raw) ? nothing : Int(round(_as_float(raw, "since_record_id")))
+        end
+
+        examples = _with_stage_logging(
+            ctx,
+            "route.export_bridge_replay.build_examples";
+            fields=_merge_fields(
+                patient_fields,
+                Dict(
+                    "limit" => limit,
+                    "since_record_id" => since_record_id,
+                ),
+            ),
+        ) do
+            return Chamelia.export_bridge_replay_examples(
+                system;
+                limit=limit,
+                since_record_id=since_record_id,
+            )
+        end
+        for example in examples
+            example["source_patient_id"] = patient_id
+        end
+
+        last_record_id = isempty(examples) ? nothing : get(examples[end], "record_id", nothing)
+        return _json_response(200, Dict(
+            "ok" => true,
+            "patient_id" => patient_id,
+            "count" => length(examples),
+            "last_record_id" => last_record_id,
+            "examples" => examples,
+        ))
     end
 end
 
@@ -1244,6 +1401,22 @@ function _load_handler(payload::Dict{String, Any}, ctx::Dict{String, Any}) :: HT
         patient_fields = _patient_fields(patient_id)
         system = _load_from_backend(patient_id; ctx=ctx)
         isnothing(system) && throw(NotFoundError("patient state not found for `$patient_id`"))
+        Chamelia.set_legacy_jepa_compat!(
+            system;
+            enabled=_resolved_legacy_jepa_compat_for_payload(payload),
+        )
+        bridge_url = _resolved_bridge_url_for_payload(payload)
+        bridge_mode = _resolved_bridge_mode_for_payload(payload)
+        if !isnothing(bridge_url)
+            Chamelia.configure_python_bridge!(
+                system;
+                base_url=bridge_url,
+                mode=bridge_mode,
+                session_id=patient_id,
+                model_version=_resolved_bridge_model_version_for_payload(payload),
+            )
+            _maybe_sync_python_bridge_replay!(system, patient_id, ctx; full_resync=true)
+        end
         PATIENTS[patient_id] = system
         status = _status_payload(system)
         _emit_log(
@@ -1354,6 +1527,8 @@ function handle_request(req::HTTP.Request) :: HTTP.Response
             response = _step_handler(payload, ctx)
         elseif path == "/chamelia_record_outcome"
             response = _record_outcome_handler(payload, ctx)
+        elseif path == "/chamelia_export_bridge_replay"
+            response = _export_bridge_replay_handler(payload, ctx)
         elseif path == "/chamelia_save_patient"
             response = _save_handler(payload, ctx)
         elseif path == "/chamelia_load_patient"

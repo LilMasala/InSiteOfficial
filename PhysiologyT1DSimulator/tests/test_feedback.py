@@ -5,6 +5,7 @@ import pytest
 from t1d_sim.feedback import (
     EventSchedule,
     EventType,
+    LifeEvent,
     PatientState,
     YesterdayOutcome,
     apply_daily_feedback,
@@ -15,6 +16,7 @@ from t1d_sim.feedback import (
     update_patient_state,
 )
 from t1d_sim.population import sample_population
+from t1d_sim.simulate import SimulationCarryState, simulate_day
 
 
 def _make_outcome(**overrides) -> YesterdayOutcome:
@@ -141,6 +143,26 @@ def test_life_events_seasonal_always_present():
     assert len(seasonal) == 1
 
 
+def test_illness_duration_is_short_and_front_loaded():
+    cfg = sample_population(1, seed=2)[0]
+    durations: list[int] = []
+    for seed in range(300):
+        schedule = sample_life_events(cfg, 180, np.random.default_rng(seed))
+        durations.extend(
+            event.duration_days
+            for event in schedule.events
+            if event.event_type == EventType.ILLNESS
+        )
+
+    assert durations
+    assert min(durations) >= 3
+    assert max(durations) <= 10
+    assert float(np.mean(durations)) < 5.2
+    short = sum(1 for duration in durations if duration <= 4)
+    long = sum(1 for duration in durations if duration >= 7)
+    assert short > long
+
+
 def test_life_events_menstrual_male_excluded():
     cfgs = sample_population(5, seed=10)
     for cfg in cfgs:
@@ -155,7 +177,6 @@ def test_life_events_menstrual_male_excluded():
 # ── Event taper ──
 
 def test_event_taper_decay():
-    from t1d_sim.feedback import LifeEvent, ActiveEvent
     event = LifeEvent(
         event_type=EventType.ILLNESS, start_day=10, duration_days=5,
         severity=1.0, taper_days=5, is_major=True,
@@ -178,19 +199,90 @@ def test_event_taper_decay():
 # ── apply_event_modifiers ──
 
 def test_illness_modifiers():
-    from t1d_sim.feedback import LifeEvent, ActiveEvent
     event = LifeEvent(
         event_type=EventType.ILLNESS, start_day=0, duration_days=5,
         severity=0.8, taper_days=2, is_major=True,
-        params={"egp_mult": 1.4, "isf_factor": 0.75, "appetite_direction": -1},
+        params={
+            "egp_mult": 1.16,
+            "isf_factor": 0.90,
+            "exercise_prob_mult": 0.25,
+            "stress_bump": 0.08,
+            "appetite_swing": 0.08,
+            "appetite_direction": -1,
+        },
     )
     schedule = EventSchedule(events=[event])
     actives = get_active_events(schedule, 2)
     mods = apply_event_modifiers(actives, 2)
     assert mods["is_ill_override"] is True
-    assert mods["exercise_prob_mult"] == pytest.approx(0.0)
+    assert 0.05 <= mods["exercise_prob_mult"] < 1.0
     assert mods["egp_mult"] > 1.0
     assert mods["isf_mult_factor"] < 1.0
+    assert mods["egp_mult"] < 1.35
+    assert mods["isf_mult_factor"] >= 0.75
+
+
+def test_illness_recovery_returns_close_to_baseline():
+    from datetime import datetime, timedelta, timezone
+    import copy
+
+    cfg = next(c for c in sample_population(300, seed=11) if c.persona == "solid_sleeper")
+    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+    base_cfg = copy.deepcopy(cfg)
+    base_cfg.event_schedule = EventSchedule(events=[])
+
+    illness_cfg = copy.deepcopy(cfg)
+    illness_cfg.event_schedule = EventSchedule(events=[
+        LifeEvent(
+            event_type=EventType.ILLNESS,
+            start_day=10,
+            duration_days=3,
+            severity=0.6,
+            taper_days=0,
+            is_major=True,
+            params={
+                "egp_mult": 1.14,
+                "isf_factor": 0.92,
+                "exercise_prob_mult": 0.35,
+                "stress_bump": 0.06,
+                "appetite_swing": 0.06,
+                "appetite_direction": -1,
+            },
+        )
+    ])
+
+    def _run(run_cfg):
+        carry = SimulationCarryState()
+        rows = []
+        for day in range(20):
+            result = simulate_day(
+                run_cfg,
+                run_cfg.therapy_schedule,
+                start + timedelta(days=day),
+                day_index=day,
+                carry_state=carry,
+            )
+            carry = result.carry_state
+            bg = result.true_bg
+            rows.append((
+                float(np.mean(bg)),
+                float(np.mean((bg >= 70) & (bg <= 180))),
+            ))
+        return rows
+
+    base_rows = _run(base_cfg)
+    illness_rows = _run(illness_cfg)
+
+    illness_bg = float(np.mean([mean_bg for mean_bg, _ in illness_rows[10:13]]))
+    recovery_bg = float(np.mean([mean_bg for mean_bg, _ in illness_rows[13:16]]))
+    base_recovery_bg = float(np.mean([mean_bg for mean_bg, _ in base_rows[13:16]]))
+    recovery_tir = float(np.mean([tir for _, tir in illness_rows[13:16]]))
+    base_recovery_tir = float(np.mean([tir for _, tir in base_rows[13:16]]))
+
+    assert recovery_bg < illness_bg - 25.0
+    assert abs(recovery_bg - base_recovery_bg) < 5.0
+    assert abs(recovery_tir - base_recovery_tir) < 0.05
 
 
 # ── Integration: patient simulation with feedback ──

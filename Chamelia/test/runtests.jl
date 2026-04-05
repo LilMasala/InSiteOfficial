@@ -58,6 +58,44 @@ end
     @test isdefined(Main, :Chamelia)
 end
 
+@testset "Python Bridge Timeout Coercion" begin
+    @test Main.PythonBridge._http_readtimeout(5.0) == 5
+    @test Main.PythonBridge._http_readtimeout(5.1) == 6
+    @test Main.PythonBridge._http_readtimeout(0.2) == 1
+end
+
+@testset "Rollout Signal Sampling Handles Nothing" begin
+    psy = PsyState(
+        trust=ScalarTrust(0.5),
+        burden=ScalarBurden(0.2),
+        engagement=ScalarEngagement(0.6),
+        burnout=ScalarBurnout(0.1),
+    )
+    rollout = RolloutResult(
+        action=NullAction(),
+        initial_psy=psy,
+        terminal_state=PatientState(phys=PhysState(variables=Dict{Symbol, Float64}()), psy=psy),
+        terminal_psy=psy,
+        total_cost=0.0,
+        psy_trajectory=PsyState[],
+        phys_signals=[Dict{Symbol, Any}(
+            :tir_7d => nothing,
+            :tir => 0.71,
+            :pct_low_7d => nothing,
+            :pct_low => 0.02,
+            :pct_high_7d => nothing,
+            :pct_high => 0.11,
+            :bg_avg => nothing,
+        )],
+    )
+    samples = Main.Actor._rollout_signal_samples([rollout])
+    @test samples !== nothing
+    @test samples.tir == [0.71]
+    @test samples.pct_low == [0.02]
+    @test samples.pct_high == [0.11]
+    @test samples.bg_avg == [0.0]
+end
+
 function server_request(method::String, path::String, payload=nothing)
     headers = payload === nothing ? Pair{String, String}[] : ["Content-Type" => "application/json"]
     body = payload === nothing ? UInt8[] : Vector{UInt8}(codeunits(JSON3.write(payload)))
@@ -66,6 +104,127 @@ end
 
 function server_json(response::HTTP.Response)
     return JSON3.read(String(response.body), Dict{String, Any})
+end
+
+function make_mock_bridge_request(;
+    mode::String="v3",
+    model_version::String="bridge-test-model-v1",
+    candidate_paths=nothing,
+    candidate_actions=nothing,
+    candidate_postures=nothing,
+    candidate_reasoning_states=nothing,
+    candidate_ic=nothing,
+    candidate_tc=nothing,
+    candidate_total=nothing,
+)
+    calls = Vector{Tuple{String, Dict{String, Any}}}()
+    default_candidate_paths = [
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+        [[0.2, 0.4, -0.3, 0.5, 0.1, 0.0, 0.2, 0.1], [0.1, 0.3, -0.2, 0.4, 0.1, 0.0, 0.1, 0.1]],
+    ]
+    default_candidate_actions = [
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.2, 0.4, -0.3, 0.5, 0.1, 0.0, 0.2, 0.1],
+    ]
+    default_candidate_postures = [[0.0, 0.0], [0.6, 0.2]]
+    default_candidate_reasoning_states = [[0.0, 0.0, 0.0, 0.0], [0.4, 0.3, 0.2, 0.1]]
+    default_candidate_ic = [0.4, 0.2]
+    default_candidate_tc = [0.2, 0.1]
+    default_candidate_total = [0.6, 0.3]
+    function request(endpoint::String, payload::Dict{String, Any})
+        push!(calls, (endpoint, deepcopy(payload)))
+        if endpoint == "/encode"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => model_version,
+                "z_t" => [0.1, 0.2, 0.3, 0.4],
+                "hierarchy_tokens" => Dict(
+                    "level0" => [[0.1, 0.2, 0.3, 0.4]],
+                    "level1" => [[0.1, 0.2, 0.3, 0.4]],
+                    "level2" => [[0.1, 0.2, 0.3, 0.4]],
+                ),
+                "encoder_diagnostics" => Dict(
+                    "token_count" => 1,
+                    "embed_dim" => 4,
+                ),
+            )
+        elseif endpoint == "/retrieve"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => model_version,
+                "retrieved_episode_summaries" => Any[],
+                "retrieved_episode_scores" => Any[],
+                "retrieved_postures" => nothing,
+                "retrieved_posture_scores" => nothing,
+                "retrieval_base_scores" => nothing,
+                "retrieval_base_quality_scores" => nothing,
+                "retrieval_relevance_scores" => nothing,
+                "retrieval_relevance_weights" => nothing,
+            )
+        elseif endpoint == "/configure"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => model_version,
+                "ctx_tokens" => [[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
+                "config_diagnostics" => Dict("num_ctx_tokens" => 2, "embed_dim" => 4),
+            )
+        elseif endpoint == "/propose"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => model_version,
+                "candidate_paths" => isnothing(candidate_paths) ? default_candidate_paths : candidate_paths,
+                "candidate_actions" => isnothing(candidate_actions) ? default_candidate_actions : candidate_actions,
+                "candidate_postures" => isnothing(candidate_postures) ? default_candidate_postures : candidate_postures,
+                "candidate_reasoning_states" => isnothing(candidate_reasoning_states) ? default_candidate_reasoning_states : candidate_reasoning_states,
+                "proposal_diagnostics" => Dict(
+                    "num_candidates" => 2,
+                    "path_length" => 2,
+                    "action_dim" => 8,
+                    "contains_explicit_baseline" => true,
+                ),
+            )
+        elseif endpoint == "/rollout"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => model_version,
+                "trajectory" => [
+                    [[0.1, 0.1, 0.1, 0.1], [0.1, 0.1, 0.1, 0.1]],
+                    [[0.2, 0.2, 0.2, 0.2], [0.3, 0.3, 0.3, 0.3]],
+                ],
+                "terminal_latents" => [[0.1, 0.1, 0.1, 0.1], [0.3, 0.3, 0.3, 0.3]],
+                "summary_tokens" => [[0.1, 0.1, 0.1, 0.1], [0.3, 0.3, 0.3, 0.3]],
+                "rollout_diagnostics" => Dict("horizon" => 2, "rollout_dim" => 4),
+            )
+        elseif endpoint == "/critic"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => model_version,
+                "candidate_ic" => isnothing(candidate_ic) ? default_candidate_ic : candidate_ic,
+                "candidate_tc" => isnothing(candidate_tc) ? default_candidate_tc : candidate_tc,
+                "candidate_total" => isnothing(candidate_total) ? default_candidate_total : candidate_total,
+                "critic_diagnostics" => Dict("num_candidates" => 2),
+            )
+        elseif endpoint == "/replay_ingest"
+            examples = get(payload, "examples", Any[])
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => get(payload, "domain_name", "insite_t1d"),
+                "model_version" => get(payload, "model_version", model_version),
+                "ingested" => length(examples),
+                "duplicates" => 0,
+                "skipped" => 0,
+                "memory_size" => length(examples),
+            )
+        end
+        error("unexpected endpoint: $endpoint")
+    end
+    return request, calls
 end
 
 @testset "HTTP Server Smoke" begin
@@ -146,7 +305,14 @@ end
     @test haskey(status_payload, "configurator_mode")
     @test haskey(status_payload, "jepa_weights_loaded")
     @test haskey(status_payload, "jepa_active")
+    @test haskey(status_payload, "legacy_jepa_mode")
+    @test haskey(status_payload, "legacy_jepa_compat_enabled")
     @test haskey(status_payload, "belief_mode")
+    @test haskey(status_payload, "python_bridge_enabled")
+    @test haskey(status_payload, "python_bridge_mode")
+    @test haskey(status_payload, "python_bridge_model_version")
+    @test haskey(status_payload, "python_bridge_session_id")
+    @test haskey(status_payload, "last_bridge_diagnostics")
     @test haskey(status_payload, "familiarity")
     @test haskey(status_payload, "concordance")
     @test haskey(status_payload, "calibration")
@@ -158,6 +324,991 @@ end
     load = server_request("POST", "/chamelia_load_patient", Dict("patient_id" => patient_id))
     @test load.status == 200
     @test server_json(load)["status"]["n_days"] == 1
+end
+
+@testset "Python Bridge Shadow Mode Smoke" begin
+    Main.ChameliaServer.reset_patient_cache!()
+    Main.ChameliaServer.set_state_backend!(Main.ChameliaServer.InMemoryStateBackend())
+
+    patient_id = "bridge-shadow-smoke"
+    init = server_request(
+        "POST",
+        "/chamelia_initialize_patient",
+        Dict(
+            "patient_id" => patient_id,
+            "preferences" => Dict("persona" => "test"),
+            "bridge_url" => "http://bridge.test",
+            "bridge_mode" => "v1.5",
+            "bridge_model_version" => "bridge-shadow-model-v1",
+        ),
+    )
+    @test init.status == 200
+    init_status = server_json(init)["status"]
+    @test init_status["graduated"] == false
+    @test init_status["python_bridge_enabled"] == true
+    @test init_status["python_bridge_mode"] == "v1.5"
+    @test init_status["python_bridge_model_version"] == "bridge-shadow-model-v1"
+    @test init_status["python_bridge_session_id"] == patient_id
+
+    system = Main.ChameliaServer.PATIENTS[patient_id]
+    mock_request, calls = make_mock_bridge_request(; mode="v1.5", model_version="bridge-shadow-model-v1")
+    Chamelia.set_python_bridge_request_fn!(system, mock_request)
+
+    step = server_request(
+        "POST",
+        "/chamelia_step",
+        Dict(
+            "patient_id" => patient_id,
+            "timestamp" => 1.0,
+            "signals" => Dict("bg_avg" => 112.0, "tir_7d" => 0.72, "pct_low_7d" => 0.01),
+        ),
+    )
+    @test step.status == 200
+    step_payload = server_json(step)
+    @test step_payload["recommendation"] === nothing
+    @test !isnothing(step_payload["rec_id"])
+    @test step_payload["status"]["graduated"] == false
+    @test step_payload["status"]["python_bridge_enabled"] == true
+    @test step_payload["status"]["python_bridge_mode"] == "v1.5"
+    @test step_payload["status"]["python_bridge_model_version"] == "bridge-shadow-model-v1"
+    @test step_payload["status"]["python_bridge_session_id"] == patient_id
+    @test step_payload["status"]["last_bridge_diagnostics"]["mode"] == "v1.5"
+    @test step_payload["status"]["last_bridge_diagnostics"]["model_version"] == "bridge-shadow-model-v1"
+
+    rec = system.mem.records[end]
+    @test rec.id == step_payload["rec_id"]
+    @test rec.bridge_trace isa Dict
+    @test rec.bridge_trace["mode"] == "v1.5"
+    @test rec.bridge_trace["model_version"] == "bridge-shadow-model-v1"
+    @test rec.bridge_diagnostics["bridge_ok"] == true
+    @test rec.bridge_diagnostics["mode"] == "v1.5"
+    @test rec.bridge_outcome === nothing
+    @test rec.bridge_trace["julia_selection"] isa Dict
+    @test rec.bridge_trace["julia_selection"]["selection_stage"] in ("epistemic_gate", "actor_selection")
+    if rec.bridge_trace["julia_selection"]["selection_stage"] == "actor_selection"
+        @test rec.bridge_trace["julia_selection"]["candidate_source_used"] in ("python_bridge", "legacy_fallback")
+    else
+        @test rec.bridge_trace["julia_selection"]["candidate_source_used"] === nothing
+    end
+
+    step_endpoints = [endpoint for (endpoint, _) in calls]
+    @test step_endpoints == ["/encode", "/retrieve", "/configure", "/propose", "/rollout", "/critic"]
+
+    outcome = server_request(
+        "POST",
+        "/chamelia_record_outcome",
+        Dict(
+            "patient_id" => patient_id,
+            "rec_id" => step_payload["rec_id"],
+            "signals" => Dict("bg_avg" => 108.0, "tir_7d" => 0.76, "pct_low_7d" => 0.0),
+            "cost" => 0.24,
+        ),
+    )
+    @test outcome.status == 200
+    @test rec.bridge_outcome isa Dict
+    @test rec.bridge_outcome["realized_cost"] == 0.24
+
+    replay_calls = [payload for (endpoint, payload) in calls if endpoint == "/replay_ingest"]
+    if rec.bridge_trace["julia_selection"]["selection_stage"] == "actor_selection" &&
+       rec.bridge_trace["julia_selection"]["candidate_source_used"] == "python_bridge"
+        @test length(replay_calls) == 1
+        @test replay_calls[1]["mode"] == "v1.5"
+        @test replay_calls[1]["model_version"] == "bridge-shadow-model-v1"
+        @test replay_calls[1]["session_id"] == patient_id
+        @test length(replay_calls[1]["examples"]) == 1
+        @test replay_calls[1]["examples"][1]["record_id"] == step_payload["rec_id"]
+    else
+        @test isempty(replay_calls)
+    end
+end
+
+@testset "Python Bridge Epistemic Hold Regression" begin
+    Main.ChameliaServer.reset_patient_cache!()
+    Main.ChameliaServer.set_state_backend!(Main.ChameliaServer.InMemoryStateBackend())
+
+    patient_id = "bridge-epistemic-hold"
+    init = server_request(
+        "POST",
+        "/chamelia_initialize_patient",
+        Dict(
+            "patient_id" => patient_id,
+            "preferences" => Dict("persona" => "test"),
+            "bridge_url" => "http://bridge.test",
+            "bridge_mode" => "v3",
+            "bridge_model_version" => "bridge-epistemic-model-v1",
+        ),
+    )
+    @test init.status == 200
+
+    system = Main.ChameliaServer.PATIENTS[patient_id]
+    mock_request, calls = make_mock_bridge_request(; mode="v3", model_version="bridge-epistemic-model-v1")
+    Chamelia.set_python_bridge_request_fn!(system, mock_request)
+    system.config.φ_cost.thresholds = EpistemicThresholds(κ_min=1.1, ρ_min=1.1, η_min=1.1)
+
+    step = server_request(
+        "POST",
+        "/chamelia_step",
+        Dict(
+            "patient_id" => patient_id,
+            "timestamp" => 1.0,
+            "signals" => Dict("bg_avg" => 112.0, "tir_7d" => 0.72, "pct_low_7d" => 0.01),
+        ),
+    )
+    @test step.status == 200
+    step_payload = server_json(step)
+    @test step_payload["recommendation"] === nothing
+    @test !isnothing(step_payload["rec_id"])
+    @test step_payload["status"]["last_decision_reason"] == "epistemic_failed"
+    @test step_payload["status"]["last_bridge_diagnostics"]["selection_stage"] == "epistemic_gate"
+    @test get(step_payload["status"]["last_bridge_diagnostics"], "candidate_source_used", nothing) === nothing
+    @test step_payload["status"]["python_bridge_mode"] == "v3"
+    @test step_payload["status"]["python_bridge_model_version"] == "bridge-epistemic-model-v1"
+
+    rec = system.mem.records[end]
+    @test rec.id == step_payload["rec_id"]
+    @test rec.action isa NullAction
+    @test rec.bridge_trace isa Dict
+    @test rec.bridge_trace["julia_selection"]["selection_stage"] == "epistemic_gate"
+    @test rec.bridge_trace["julia_selection"]["candidate_source_used"] === nothing
+    @test rec.bridge_diagnostics["selection_stage"] == "epistemic_gate"
+    @test get(rec.bridge_diagnostics, "candidate_source_used", nothing) === nothing
+
+    @test [endpoint for (endpoint, _) in calls] == [
+        "/encode",
+        "/retrieve",
+        "/configure",
+        "/propose",
+        "/rollout",
+        "/critic",
+    ]
+end
+
+@testset "Python Bridge Actor-Selection Hold Regression" begin
+    Main.ChameliaServer.reset_patient_cache!()
+    Main.ChameliaServer.set_state_backend!(Main.ChameliaServer.InMemoryStateBackend())
+
+    patient_id = "bridge-effect-size-hold"
+    init = server_request(
+        "POST",
+        "/chamelia_initialize_patient",
+        Dict(
+            "patient_id" => patient_id,
+            "preferences" => Dict("persona" => "test"),
+            "bridge_url" => "http://bridge.test",
+            "bridge_mode" => "v3",
+            "bridge_model_version" => "bridge-effect-model-v1",
+        ),
+    )
+    @test init.status == 200
+
+    system = Main.ChameliaServer.PATIENTS[patient_id]
+    safe_candidate_path = [
+        [0.0, 0.03, -0.02, 0.02, 0.05, 0.10, 0.0, 0.10],
+        [0.0, 0.02, -0.01, 0.01, 0.05, 0.10, 0.0, 0.10],
+    ]
+    mock_request, calls = make_mock_bridge_request(
+        ;
+        mode="v3",
+        model_version="bridge-effect-model-v1",
+        candidate_paths=[
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            safe_candidate_path,
+        ],
+        candidate_actions=[
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            safe_candidate_path[1],
+        ],
+        candidate_ic=[0.4, 0.35],
+        candidate_tc=[0.2, 0.18],
+        candidate_total=[0.6, 0.53],
+    )
+    Chamelia.set_python_bridge_request_fn!(system, mock_request)
+    system.config.φ_cost.thresholds = EpistemicThresholds(κ_min=0.0, ρ_min=0.0, η_min=0.0)
+    system.config.φ_act.δ_min_effect = 1.0e9
+
+    step = server_request(
+        "POST",
+        "/chamelia_step",
+        Dict(
+            "patient_id" => patient_id,
+            "timestamp" => 1.0,
+            "signals" => Dict("bg_avg" => 112.0, "tir_7d" => 0.72, "pct_low_7d" => 0.01),
+        ),
+    )
+    @test step.status == 200
+    step_payload = server_json(step)
+    @test step_payload["recommendation"] === nothing
+    @test !isnothing(step_payload["rec_id"])
+    @test step_payload["status"]["last_decision_reason"] in ("effect_size_insufficient", "safety_violated")
+    @test step_payload["status"]["last_bridge_diagnostics"]["selection_stage"] == "actor_selection"
+    @test get(step_payload["status"]["last_bridge_diagnostics"], "candidate_source_used", nothing) == "python_bridge"
+    @test step_payload["status"]["python_bridge_mode"] == "v3"
+    @test step_payload["status"]["python_bridge_model_version"] == "bridge-effect-model-v1"
+
+    rec = system.mem.records[end]
+    @test rec.id == step_payload["rec_id"]
+    @test rec.action isa NullAction
+    @test rec.bridge_trace isa Dict
+    @test rec.bridge_trace["julia_selection"]["selection_stage"] == "actor_selection"
+    @test rec.bridge_trace["julia_selection"]["candidate_source_used"] == "python_bridge"
+    @test rec.bridge_trace["julia_selection"]["decision_reason"] in ("effect_size_insufficient", "safety_violated")
+    @test rec.bridge_diagnostics["selection_stage"] == "actor_selection"
+    @test get(rec.bridge_diagnostics, "candidate_source_used", nothing) == "python_bridge"
+
+    @test [endpoint for (endpoint, _) in calls] == [
+        "/encode",
+        "/retrieve",
+        "/configure",
+        "/propose",
+        "/rollout",
+        "/critic",
+    ]
+end
+
+@testset "Python Bridge Integration Slice" begin
+    prefs = UserPreferences()
+    system = Chamelia.initialize_patient(
+        prefs,
+        Main.InSiteSimulator();
+        adapter=Main.InSiteDomainAdapter(),
+        bridge_url="http://bridge.test",
+        bridge_session_id="bridge-test-session",
+        bridge_model_version="bridge-test-model-v1",
+    )
+
+    calls = Vector{Tuple{String, Dict{String, Any}}}()
+    function mock_bridge_request(endpoint::String, payload::Dict{String, Any})
+        push!(calls, (endpoint, deepcopy(payload)))
+        if endpoint == "/encode"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => "bridge-test-model-v1",
+                "z_t" => [0.1, 0.2, 0.3, 0.4],
+                "hierarchy_tokens" => Dict(
+                    "level0" => [[0.1, 0.2, 0.3, 0.4]],
+                    "level1" => [[0.1, 0.2, 0.3, 0.4]],
+                    "level2" => [[0.1, 0.2, 0.3, 0.4]],
+                ),
+                "encoder_diagnostics" => Dict(
+                    "token_count" => 1,
+                    "embed_dim" => 4,
+                ),
+            )
+        elseif endpoint == "/retrieve"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => "bridge-test-model-v1",
+                "retrieved_episode_summaries" => Any[],
+                "retrieved_episode_scores" => Any[],
+                "retrieved_postures" => nothing,
+                "retrieved_posture_scores" => nothing,
+                "retrieval_base_scores" => nothing,
+                "retrieval_base_quality_scores" => nothing,
+                "retrieval_relevance_scores" => nothing,
+                "retrieval_relevance_weights" => nothing,
+            )
+        elseif endpoint == "/configure"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => "bridge-test-model-v1",
+                "ctx_tokens" => [[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
+                "config_diagnostics" => Dict("num_ctx_tokens" => 2, "embed_dim" => 4),
+            )
+        elseif endpoint == "/propose"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => "bridge-test-model-v1",
+                "candidate_paths" => [
+                    [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+                    [[0.2, 0.4, -0.3, 0.5, 0.1, 0.0, 0.2, 0.1], [0.1, 0.3, -0.2, 0.4, 0.1, 0.0, 0.1, 0.1]],
+                ],
+                "candidate_actions" => [
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.2, 0.4, -0.3, 0.5, 0.1, 0.0, 0.2, 0.1],
+                ],
+                "candidate_postures" => [[0.0, 0.0], [0.6, 0.2]],
+                "candidate_reasoning_states" => [[0.0, 0.0, 0.0, 0.0], [0.4, 0.3, 0.2, 0.1]],
+                "proposal_diagnostics" => Dict(
+                    "num_candidates" => 2,
+                    "path_length" => 2,
+                    "action_dim" => 8,
+                    "contains_explicit_baseline" => true,
+                ),
+            )
+        elseif endpoint == "/rollout"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => "bridge-test-model-v1",
+                "trajectory" => [
+                    [[0.1, 0.1, 0.1, 0.1], [0.1, 0.1, 0.1, 0.1]],
+                    [[0.2, 0.2, 0.2, 0.2], [0.3, 0.3, 0.3, 0.3]],
+                ],
+                "terminal_latents" => [[0.1, 0.1, 0.1, 0.1], [0.3, 0.3, 0.3, 0.3]],
+                "summary_tokens" => [[0.1, 0.1, 0.1, 0.1], [0.3, 0.3, 0.3, 0.3]],
+                "rollout_diagnostics" => Dict("horizon" => 2, "rollout_dim" => 4),
+            )
+        elseif endpoint == "/critic"
+            return Dict(
+                "bridge_version" => "v1",
+                "domain_name" => "insite_t1d",
+                "model_version" => "bridge-test-model-v1",
+                "candidate_ic" => [0.4, 0.2],
+                "candidate_tc" => [0.2, 0.1],
+                "candidate_total" => [0.6, 0.3],
+                "critic_diagnostics" => Dict("used_ctx_tokens" => true, "path_level_ic" => true),
+            )
+        end
+        error("unexpected endpoint: $endpoint")
+    end
+
+    Chamelia.set_python_bridge_request_fn!(system, mock_bridge_request)
+
+    obs = Observation(
+        timestamp = 1.0,
+        signals = Dict{Symbol, Any}(
+            :bg_avg => 112.0,
+            :tir_7d => 0.72,
+            :pct_low_7d => 0.01,
+        ),
+    )
+    warmup = Observation(
+        timestamp = 0.5,
+        signals = Dict{Symbol, Any}(
+            :bg_avg => 110.0,
+            :tir_7d => 0.70,
+        ),
+    )
+
+    Chamelia.observe!(system, warmup)
+    system.config.φ_cost.thresholds = EpistemicThresholds(
+        κ_min = 0.0,
+        ρ_min = 0.0,
+        η_min = 0.0,
+    )
+    @test_nowarn Chamelia.step!(system, obs)
+    @test !isempty(calls)
+    @test all(get(payload, "mode", nothing) == "v3" for (_, payload) in calls)
+
+    status = Chamelia.graduation_status(system)
+    @test status.python_bridge_enabled
+    @test status.last_bridge_diagnostics isa Dict
+    @test status.last_bridge_diagnostics["bridge_ok"] == true
+    @test status.last_bridge_diagnostics["model_version"] == "bridge-test-model-v1"
+    @test status.last_bridge_diagnostics["num_candidates"] == 2
+    @test status.last_bridge_diagnostics["path_length"] == 2
+    @test status.last_bridge_diagnostics["python_selected_candidate_idx"] == 1
+    @test status.last_decision_reason != :epistemic_failed
+    final_reason = string(status.last_decision_reason)
+    @test status.last_bridge_diagnostics["candidate_source_used"] == "python_bridge"
+    @test status.last_bridge_diagnostics["decoded_candidate_count"] == 1
+    @test status.last_bridge_diagnostics["selected_bridge_candidate_idx"] === nothing
+    @test status.last_bridge_diagnostics["python_advisory_available"] == true
+    @test status.last_bridge_diagnostics["python_advisory_considered"] == true
+    @test status.last_bridge_diagnostics["selected_matches_python_top_candidate"] === nothing
+    @test status.last_bridge_diagnostics["selected_python_candidate_total"] === nothing
+    @test status.last_bridge_diagnostics["decision_reason"] == final_reason
+    @test status.last_bridge_diagnostics["accepted_action"] == false
+
+    rec = system.mem.records[end]
+    @test rec.action isa NullAction
+    @test rec.bridge_trace isa Dict
+    @test rec.bridge_diagnostics isa Dict
+    @test rec.bridge_outcome === nothing
+    @test rec.bridge_trace["model_version"] == "bridge-test-model-v1"
+    @test rec.bridge_trace["proposal_bundle"]["candidate_paths"][2][1][1] == 0.2
+    @test rec.bridge_trace["decoded_candidates"] isa Vector
+    @test length(rec.bridge_trace["decoded_candidates"]) == 1
+    @test rec.bridge_trace["decoded_candidates"][1]["bridge_candidate_idx"] == 1
+    @test rec.bridge_trace["decoded_candidates"][1]["decode_metadata"]["decoder"] == "insite_scalar_delta"
+    @test rec.bridge_trace["decoded_candidates"][1]["candidate_posture"] == [0.6, 0.2]
+    @test rec.bridge_trace["decoded_candidates"][1]["python_candidate_total"] == 0.3
+    @test rec.bridge_trace["julia_selection"]["selected_bridge_candidate_idx"] === nothing
+    @test rec.bridge_trace["julia_selection"]["bridge_candidates_rejected"] == true
+    @test rec.bridge_trace["julia_selection"]["python_selected_candidate_idx"] == 1
+    @test rec.bridge_trace["julia_selection"]["python_advisory_available"] == true
+    @test rec.bridge_trace["julia_selection"]["python_advisory_considered"] == true
+    @test rec.bridge_trace["julia_selection"]["selected_matches_python_top_candidate"] === nothing
+    @test rec.bridge_trace["julia_selection"]["selected_python_candidate_total"] === nothing
+    @test rec.bridge_trace["julia_selection"]["decision_reason"] == final_reason
+    @test rec.bridge_diagnostics["model_version"] == "bridge-test-model-v1"
+    @test rec.bridge_diagnostics["bridge_ok"] == true
+    @test rec.bridge_diagnostics["candidate_source_used"] == "python_bridge"
+    @test rec.bridge_diagnostics["decoded_candidate_count"] == 1
+    @test rec.bridge_diagnostics["selected_bridge_candidate_idx"] === nothing
+    @test rec.bridge_diagnostics["python_advisory_available"] == true
+    @test rec.bridge_diagnostics["python_advisory_considered"] == true
+    @test rec.bridge_diagnostics["selected_matches_python_top_candidate"] === nothing
+    @test rec.bridge_diagnostics["selected_python_candidate_total"] === nothing
+    @test rec.bridge_diagnostics["accepted_action"] == false
+
+    Chamelia.record_outcome!(
+        system,
+        rec.id,
+        Accept,
+        Dict{Symbol, Any}(
+            :bg_avg => 108.0,
+            :tir_7d => 0.76,
+            :pct_low_7d => 0.0,
+        ),
+        0.24,
+    )
+    @test rec.bridge_outcome isa Dict
+    @test rec.bridge_outcome["realized_cost"] == 0.24
+    @test rec.bridge_outcome["user_response"] == Int(Accept)
+    @test rec.bridge_outcome["realized_signals"][:tir_7d] == 0.76
+    @test rec.bridge_outcome["julia_selection"]["selected_bridge_candidate_idx"] === nothing
+    @test rec.bridge_outcome["julia_selection"]["bridge_candidates_rejected"] == true
+    @test rec.bridge_outcome["julia_selection"]["python_selected_candidate_idx"] == 1
+    @test rec.bridge_outcome["julia_selection"]["python_advisory_available"] == true
+    @test rec.bridge_outcome["julia_selection"]["python_advisory_considered"] == true
+
+    @test [call[1] for call in calls] == [
+        "/encode",
+        "/retrieve",
+        "/configure",
+        "/propose",
+        "/rollout",
+        "/critic",
+    ]
+    @test calls[1][2]["input_kind"] == "plugin_observation"
+    @test calls[1][2]["session_id"] == "bridge-test-session"
+    @test calls[1][2]["model_version"] == "bridge-test-model-v1"
+    @test calls[1][2]["observation"]["signals"]["bg_avg"] == 112.0
+    @test calls[end][2]["domain_state"]["signals"]["tir_7d"] == 0.72
+
+    failing = Chamelia.initialize_patient(
+        prefs,
+        Main.InSiteSimulator();
+        adapter=Main.InSiteDomainAdapter(),
+        bridge_url="http://bridge.test",
+        bridge_session_id="bridge-test-session-failing",
+        bridge_model_version="bridge-test-model-v1",
+    )
+    Chamelia.set_python_bridge_request_fn!(failing, (endpoint, payload) -> error("bridge boom"))
+    Chamelia.observe!(failing, warmup)
+    @test_nowarn Chamelia.step!(failing, obs)
+    failing_status = Chamelia.graduation_status(failing)
+    @test failing_status.python_bridge_enabled
+    @test failing_status.last_bridge_diagnostics isa Dict
+    @test failing_status.last_bridge_diagnostics["bridge_ok"] == false
+    @test failing_status.last_bridge_diagnostics["model_version"] == "bridge-test-model-v1"
+    @test occursin("bridge boom", failing_status.last_bridge_diagnostics["error_message"])
+end
+
+@testset "Python Bridge Mode Configuration" begin
+    prefs = UserPreferences()
+    system = Chamelia.initialize_patient(
+        prefs,
+        Main.InSiteSimulator();
+        adapter=Main.InSiteDomainAdapter(),
+    )
+
+    @test_throws ArgumentError Chamelia.configure_python_bridge!(
+        system;
+        base_url="http://bridge.test",
+        mode="invalid",
+        session_id="bridge-mode-test",
+        model_version="bridge-test-model-v1",
+    )
+
+    @test Main.ChameliaServer._resolved_bridge_mode_for_payload(Dict{String, Any}("bridge_mode" => "v1.5")) == "v1.5"
+end
+
+@testset "Legacy JEPA Compatibility Mode" begin
+    mktempdir() do dir
+        encoder = Perception.HierarchicalJEPAEncoder(2, 12, 3)
+        predictor = WorldModule.JEPAPredictor()
+        Perception.save_jepa_weights(encoder, predictor, dir)
+
+        system = Chamelia.initialize_patient(
+            UserPreferences(),
+            Main.InSiteSimulator();
+            adapter=Main.InSiteDomainAdapter(),
+            weights_dir=dir,
+        )
+        status = Chamelia.graduation_status(system)
+        @test status.jepa_weights_loaded == true
+        @test status.jepa_active == false
+        @test status.legacy_jepa_mode == "compatibility_only"
+        @test status.legacy_jepa_compat_enabled == false
+
+        system.graduated = true
+        obs = Observation(
+            timestamp = 1.0,
+            signals = Dict{Symbol, Any}(
+                :bg_avg => 112.0,
+                :tir_7d => 0.72,
+            ),
+        )
+        Chamelia.observe!(system, obs)
+        @test !(system.belief isa JEPABeliefState)
+
+        Chamelia.set_legacy_jepa_compat!(system; enabled=true)
+        compat_status = Chamelia.graduation_status(system)
+        @test compat_status.legacy_jepa_mode == "compatibility_enabled"
+        @test compat_status.legacy_jepa_compat_enabled == true
+
+        Chamelia.observe!(system, obs)
+        @test system.belief isa JEPABeliefState
+        @test Chamelia.graduation_status(system).jepa_active == true
+    end
+
+    system = Chamelia.initialize_patient(
+        UserPreferences(),
+        Main.InSiteSimulator();
+        adapter=Main.InSiteDomainAdapter(),
+    )
+    @test_throws ArgumentError Chamelia.set_legacy_jepa_compat!(system; enabled=true)
+    @test_throws ArgumentError Chamelia.initialize_patient(
+        UserPreferences(),
+        Main.InSiteSimulator();
+        adapter=Main.InSiteDomainAdapter(),
+        legacy_jepa_compat=true,
+    )
+end
+
+@testset "Bridge Adapter-Native Decode" begin
+    adapter = Main.InSiteDomainAdapter()
+    capabilities = Main.ConnectedAppCapabilities(
+        app_id = "insite",
+        supports_scalar_schedule = true,
+        supports_piecewise_schedule = true,
+        level_1_enabled = true,
+        level_2_enabled = false,
+        level_3_enabled = false,
+    )
+    app_state = Main.ConnectedAppState(
+        schedule_version = "bridge-schedule-v1",
+        current_segments = [
+            Main.SegmentSurface(segment_id="overnight", start_min=0, end_min=720, parameter_values=Dict(:isf => 42.0, :cr => 10.0, :basal => 0.8)),
+            Main.SegmentSurface(segment_id="day", start_min=720, end_min=1440, parameter_values=Dict(:isf => 48.0, :cr => 12.0, :basal => 0.7)),
+        ],
+        allow_structural_recommendations = false,
+        allow_continuous_schedule = false,
+    )
+
+    proposal_bundle = Dict{String, Any}(
+        "candidate_paths" => Any[
+            Any[[0.0, 0.0, 0.0, 0.0]],
+            Any[
+                Any[0.10, 0.25, 0.40, -0.20, 0.0, 0.0, 0.0, 0.0],
+                Any[0.05, -0.15, 0.35, 0.10, 0.0, 0.0, 0.0, 0.0],
+            ],
+        ],
+    )
+
+    decoded = Main.bridge_decode_candidate_proposals(adapter, proposal_bundle, capabilities, app_state)
+    @test length(decoded) == 1
+    @test decoded[1].action isa Main.ScheduledAction
+    @test decoded[1].decode_metadata["decoder"] == "insite_schedule_surface"
+    @test decoded[1].decode_metadata["used_schedule_surface"] == true
+    @test decoded[1].decode_metadata["targeted_segment_ids"] == ["overnight", "day"]
+
+    scheduled = decoded[1].action
+    @test scheduled.family == Main.parameter_adjustment
+    @test [segment.segment_id for segment in scheduled.segments] == ["overnight", "day"]
+    @test [segment.start_min for segment in scheduled.segments] == [0, 720]
+    @test [segment.end_min for segment in scheduled.segments] == [720, 1440]
+    @test length(scheduled.segment_deltas) == 2
+    @test scheduled.segment_deltas[1].segment_id == "overnight"
+    @test scheduled.segment_deltas[2].segment_id == "day"
+    @test haskey(scheduled.segment_deltas[1].parameter_deltas, :isf)
+    @test haskey(scheduled.segment_deltas[1].parameter_deltas, :cr)
+    @test haskey(scheduled.segment_deltas[1].parameter_deltas, :basal)
+
+    scalar_app_state = Main.ConnectedAppState(schedule_version = "", current_segments = Main.SegmentSurface[])
+    scalar_decoded = Main.bridge_decode_candidate_proposals(adapter, proposal_bundle, capabilities, scalar_app_state)
+    @test length(scalar_decoded) == 1
+    @test scalar_decoded[1].action isa Main.Actor.CandidateAction
+    @test scalar_decoded[1].decode_metadata["decoder"] == "insite_scalar_delta"
+    @test scalar_decoded[1].decode_metadata["used_schedule_surface"] == false
+
+    structural_capabilities = Main.ConnectedAppCapabilities(
+        app_id = "insite",
+        supports_scalar_schedule = true,
+        supports_piecewise_schedule = true,
+        level_1_enabled = true,
+        level_2_enabled = true,
+        max_segments = 4,
+        min_segment_duration_min = 120,
+        max_segments_addable = 2,
+    )
+    structural_state = Main.ConnectedAppState(
+        schedule_version = "bridge-structure-v1",
+        current_segments = app_state.current_segments,
+        allow_structural_recommendations = true,
+        allow_continuous_schedule = false,
+    )
+
+    split_path = Any[
+        Any[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.9, -0.2, -1.0, 0.0, -1.0],
+        Any[0.0, 0.2, 0.3, -0.1, 0.0, 0.0, 0.0, 0.0],
+    ]
+    split_decoded = Main.bridge_decode_action_path_result(adapter, split_path, structural_capabilities, structural_state)
+    @test split_decoded !== nothing
+    @test split_decoded.action isa Main.ScheduledAction
+    @test split_decoded.metadata["decoder"] == "insite_structure_edit"
+    @test split_decoded.metadata["structure_edit_type"] == "split"
+    @test split_decoded.metadata["target_segment_id"] == "overnight"
+    @test split_decoded.metadata["targeted_segment_ids"] == ["overnight_a"]
+    split_action = split_decoded.action
+    @test split_action.family == Main.structure_edit
+    @test split_action.level == 2
+    @test length(split_action.structural_edits) == 1
+    @test split_action.structural_edits[1].edit_type == :split
+    @test split_action.structural_edits[1].target_segment_id == "overnight"
+    @test length(split_action.segment_deltas) == 1
+    @test split_action.segment_deltas[1].segment_id == "overnight_a"
+
+    merge_path = Any[
+        Any[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, -0.4, 0.95, -1.0, 1.0, 0.0],
+        Any[0.0, -0.2, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0],
+    ]
+    merge_decoded = Main.bridge_decode_action_path_result(adapter, merge_path, structural_capabilities, structural_state)
+    @test merge_decoded !== nothing
+    @test merge_decoded.action isa Main.ScheduledAction
+    @test merge_decoded.metadata["decoder"] == "insite_structure_edit"
+    @test merge_decoded.metadata["structure_edit_type"] == "merge"
+    @test merge_decoded.metadata["target_segment_id"] == "overnight"
+    @test merge_decoded.metadata["neighbor_segment_id"] == "day"
+    @test merge_decoded.metadata["targeted_segment_ids"] == ["overnight__day"]
+    merge_action = merge_decoded.action
+    @test merge_action.family == Main.structure_edit
+    @test merge_action.level == 2
+    @test length(merge_action.structural_edits) == 1
+    @test merge_action.structural_edits[1].edit_type == :merge
+    @test merge_action.structural_edits[1].target_segment_id == "overnight"
+    @test merge_action.structural_edits[1].neighbor_segment_id == "day"
+    @test length(merge_action.segment_deltas) == 1
+    @test merge_action.segment_deltas[1].segment_id == "overnight__day"
+end
+
+@testset "Bridge Proposal Actions Feed Julia Selection" begin
+    config = make_test_config()
+    config.φ_act.δ_min_effect = -1.0
+    config.φ_cost.ε_burn = 10.0
+
+    belief = Main.GaussianBeliefState(
+        x̂_phys = Dict(:bg => 100.0),
+        Σ_phys = Dict(:bg => 4.0),
+        x̂_trust = 0.7,
+        σ_trust = 0.1,
+        x̂_burnout = 0.1,
+        σ_burnout = 0.05,
+        x̂_engagement = 0.7,
+        σ_engagement = 0.1,
+        x̂_burden = 0.2,
+        σ_burden = 0.05,
+        entropy = 0.1,
+        obs_log_lik = 0.0,
+    )
+    twin = make_test_twin()
+    epistemic = EpistemicState(
+        κ_familiarity = 0.9,
+        ρ_concordance = 0.9,
+        η_calibration = 0.9,
+        feasible = true,
+    )
+
+    bridge_action = Main.Actor.CandidateAction(Dict(:dim1 => 0.037, :dim2 => 0.0))
+    advisory_candidates = AbstractAction[
+        Main.Actor.CandidateAction(Dict(:dim1 => 0.037, :dim2 => 0.0)),
+        Main.Actor.CandidateAction(Dict(:dim1 => 0.037, :dim2 => 0.0)),
+    ]
+    advisory_scores = [
+        Main.BridgeProposalAdvisory(
+            bridge_candidate_idx = 1,
+            bridge_candidate_slot = 2,
+            python_total = 0.6,
+            python_rank = 2,
+        ),
+        Main.BridgeProposalAdvisory(
+            bridge_candidate_idx = 2,
+            bridge_candidate_slot = 3,
+            python_total = 0.1,
+            python_rank = 1,
+        ),
+    ]
+    advisory_evaluated = Main.Actor._evaluate_provided_actions(
+        advisory_candidates,
+        belief,
+        twin,
+        WorldModule.MockSimulator(),
+        initialize_noise(),
+        Cost.ZeroCritic(),
+        config;
+        advisories = advisory_scores,
+    )
+    @test length(advisory_evaluated) == 2
+    @test sort([result.advisory_total for result in advisory_evaluated]) == [0.1, 0.6]
+    @test sort([result.advisory_rank for result in advisory_evaluated]) == [1, 2]
+
+    advisory_probe = Any[
+        (cvar = 1.0, advisory_total = 0.6, advisory_rank = 2),
+        (cvar = 1.0, advisory_total = 0.1, advisory_rank = 1),
+    ]
+    sort!(advisory_probe, by = Main.Actor._candidate_order_key)
+    @test advisory_probe[1].advisory_total == 0.1
+    @test advisory_probe[1].advisory_rank == 1
+    @test advisory_probe[2].advisory_total == 0.6
+    @test advisory_probe[2].advisory_rank == 2
+
+    evaluated = Main.Actor._evaluate_provided_actions(
+        AbstractAction[bridge_action],
+        belief,
+        twin,
+        WorldModule.MockSimulator(),
+        initialize_noise(),
+        Cost.ZeroCritic(),
+        config,
+    )
+    @test length(evaluated) == 1
+    @test evaluated[1].action isa Main.Actor.CandidateAction
+    @test evaluated[1].action.deltas[:dim1] ≈ 0.037 atol=1e-8
+
+    pkg, reason, _ = Actor.decide(
+        belief,
+        twin,
+        WorldModule.MockSimulator(),
+        initialize_noise(),
+        Cost.ZeroCritic(),
+        epistemic,
+        config,
+        [:dim1, :dim2],
+        Dict(:burnout => 10.0, :physical_risk => 10.0);
+        proposal_actions = AbstractAction[bridge_action],
+        proposal_advisories = [
+            Main.BridgeProposalAdvisory(
+                bridge_candidate_idx = 1,
+                bridge_candidate_slot = 2,
+                python_total = 0.3,
+                python_rank = 1,
+            ),
+        ],
+    )
+
+    @test reason in (:recommended, :shadow_explore, :postgrad_probe, :effect_size_insufficient)
+    if pkg !== nothing
+        @test pkg.action isa Main.Actor.CandidateAction
+        @test pkg.action.deltas[:dim1] ≈ 0.037 atol=1e-8
+    end
+end
+
+@testset "Bridge Replay Export" begin
+    prefs = UserPreferences()
+    system = Chamelia.initialize_patient(
+        prefs,
+        Main.InSiteSimulator();
+        adapter=Main.InSiteDomainAdapter(),
+    )
+
+    bridge_trace = Dict{String, Any}(
+        "bridge_version" => "v1",
+        "domain_name" => "insite_t1d",
+        "model_version" => "bridge-test-model-v1",
+        "encoded_state" => Dict{String, Any}(
+            "z_t" => Any[0.1, 0.2],
+        ),
+        "retrieved_memory" => Dict{String, Any}(
+            "retrieved_keys" => Any[Any[0.1, 0.2]],
+            "retrieved_episode_summaries" => Any[Any[0.3, 0.4]],
+            "retrieval_base_quality_scores" => Any[0.5],
+            "retrieved_postures" => Any[Any[0.2, 0.8]],
+            "retrieval_base_scores" => Any[0.4],
+            "retrieval_relevance_scores" => Any[0.6],
+            "retrieval_relevance_weights" => Any[1.0],
+        ),
+        "configurator_output" => Dict{String, Any}(
+            "ctx_tokens" => Any[Any[0.1, 0.2], Any[0.3, 0.4]],
+        ),
+        "proposal_bundle" => Dict{String, Any}(
+            "candidate_actions" => Any[Any[0.0, 0.0], Any[0.2, -0.1]],
+            "candidate_paths" => Any[Any[Any[0.0, 0.0]], Any[Any[0.2, -0.1], Any[0.1, 0.0]]],
+            "candidate_postures" => Any[Any[0.0, 0.0], Any[0.6, 0.2]],
+            "candidate_reasoning_states" => Any[Any[0.0, 0.0], Any[0.7, 0.1]],
+        ),
+        "critic_scores" => Dict{String, Any}(
+            "candidate_ic" => Any[0.0, 0.3],
+            "candidate_tc" => Any[0.0, 0.1],
+            "candidate_total" => Any[0.0, 0.4],
+        ),
+        "julia_selection" => Dict{String, Any}(
+            "candidate_source_used" => "python_bridge",
+            "selected_bridge_candidate_slot" => 2,
+            "selected_bridge_candidate_idx" => 1,
+            "selected_candidate" => Dict{String, Any}(
+                "decode_metadata" => Dict{String, Any}("decoder" => "insite_scalar_delta"),
+            ),
+        ),
+    )
+
+    rec_id = Main.Memory.store_record!(
+        system.mem,
+        1,
+        system.belief,
+        NullAction(),
+        Main.EpistemicState(κ_familiarity=0.9, ρ_concordance=0.9, η_calibration=0.9, feasible=true),
+        system.config,
+        Chamelia.psy_from_belief(system.belief);
+        bridge_trace=bridge_trace,
+        bridge_diagnostics=Dict{String, Any}("bridge_ok" => true),
+    )
+    Main.Memory.store_outcome!(
+        system.mem,
+        rec_id,
+        Accept,
+        Dict{Symbol, Any}(:tir_7d => 0.75),
+        0.18;
+        latent_μ_at_outcome=Float32[0.4, 0.6],
+    )
+
+    exported = Chamelia.export_bridge_replay_examples(system)
+    @test length(exported) == 1
+    @test exported[1]["record_id"] == rec_id
+    @test exported[1]["selected_candidate_slot"] == 2
+    @test exported[1]["selected_action_vec"] == Any[0.2, -0.1]
+    @test exported[1]["outcome_z_tH"] == Float32[0.4, 0.6]
+    @test length(exported[1]["retrieval_trace"]) == 1
+    @test exported[1]["retrieval_trace"][1]["memory_keys"][1] == Any[0.1, 0.2]
+
+    Main.ChameliaServer.reset_patient_cache!()
+    Main.ChameliaServer.PATIENTS["bridge-export"] = system
+    response = server_request(
+        "POST",
+        "/chamelia_export_bridge_replay",
+        Dict("patient_id" => "bridge-export"),
+    )
+    payload = server_json(response)
+    @test response.status == 200
+    @test payload["count"] == 1
+    @test payload["examples"][1]["record_id"] == rec_id
+    @test payload["examples"][1]["selected_candidate_slot"] == 2
+end
+
+@testset "Bridge Replay Sync" begin
+    prefs = UserPreferences()
+    system = Chamelia.initialize_patient(
+        prefs,
+        Main.InSiteSimulator();
+        adapter=Main.InSiteDomainAdapter(),
+        bridge_url="http://bridge.test",
+        bridge_session_id="bridge-sync-session",
+        bridge_model_version="bridge-test-model-v1",
+    )
+
+    ingest_calls = Vector{Dict{String, Any}}()
+    Chamelia.set_python_bridge_request_fn!(system, (endpoint, payload) -> begin
+        endpoint == "/replay_ingest" || error("unexpected endpoint: $endpoint")
+        push!(ingest_calls, deepcopy(payload))
+        return Dict(
+            "bridge_version" => "v1",
+            "domain_name" => payload["domain_name"],
+            "model_version" => payload["model_version"],
+            "ingested" => length(payload["examples"]),
+            "duplicates" => 0,
+            "skipped" => 0,
+            "memory_size" => length(payload["examples"]),
+        )
+    end)
+
+    bridge_trace = Dict{String, Any}(
+        "bridge_version" => "v1",
+        "domain_name" => "insite_t1d",
+        "model_version" => "bridge-test-model-v1",
+        "encoded_state" => Dict{String, Any}("z_t" => Any[0.1, 0.2]),
+        "retrieved_memory" => Dict{String, Any}(
+            "retrieved_keys" => Any[Any[0.1, 0.2]],
+            "retrieved_episode_summaries" => Any[Any[0.3, 0.4]],
+            "retrieval_base_quality_scores" => Any[0.5],
+        ),
+        "configurator_output" => Dict{String, Any}(
+            "ctx_tokens" => Any[Any[0.1, 0.2], Any[0.3, 0.4]],
+        ),
+        "proposal_bundle" => Dict{String, Any}(
+            "candidate_actions" => Any[Any[0.0, 0.0], Any[0.2, -0.1]],
+            "candidate_paths" => Any[Any[Any[0.0, 0.0]], Any[Any[0.2, -0.1], Any[0.1, 0.0]]],
+            "candidate_postures" => Any[Any[0.0, 0.0], Any[0.6, 0.2]],
+            "candidate_reasoning_states" => Any[Any[0.0, 0.0], Any[0.7, 0.1]],
+        ),
+        "critic_scores" => Dict{String, Any}(
+            "candidate_ic" => Any[0.0, 0.3],
+            "candidate_tc" => Any[0.0, 0.1],
+            "candidate_total" => Any[0.0, 0.4],
+        ),
+        "julia_selection" => Dict{String, Any}(
+            "candidate_source_used" => "python_bridge",
+            "selected_bridge_candidate_slot" => 2,
+            "selected_bridge_candidate_idx" => 1,
+        ),
+    )
+
+    for (day, record_id_hint, latent) in ((1, 1, Float32[0.4, 0.6]), (2, 2, Float32[0.5, 0.7]))
+        rec_id = Main.Memory.store_record!(
+            system.mem,
+            day,
+            system.belief,
+            NullAction(),
+            Main.EpistemicState(κ_familiarity=0.9, ρ_concordance=0.9, η_calibration=0.9, feasible=true),
+            system.config,
+            Chamelia.psy_from_belief(system.belief);
+            bridge_trace=deepcopy(bridge_trace),
+            bridge_diagnostics=Dict{String, Any}("bridge_ok" => true),
+        )
+        @test rec_id == record_id_hint
+        Main.Memory.store_outcome!(
+            system.mem,
+            rec_id,
+            Accept,
+            Dict{Symbol, Any}(:tir_7d => 0.75),
+            0.18 + 0.01 * day;
+            latent_μ_at_outcome=latent,
+        )
+    end
+
+    full_sync = Chamelia.sync_python_bridge_replay!(system; full_resync=true)
+    @test full_sync !== nothing
+    @test full_sync["exported_examples"] == 2
+    @test full_sync["ingested"] == 2
+    @test full_sync["last_synced_record_id"] == 2
+    @test length(ingest_calls) == 1
+    @test length(ingest_calls[1]["examples"]) == 2
+    @test ingest_calls[1]["examples"][1]["record_id"] == 1
+    @test ingest_calls[1]["examples"][2]["record_id"] == 2
+
+    rec_id = Main.Memory.store_record!(
+        system.mem,
+        3,
+        system.belief,
+        NullAction(),
+        Main.EpistemicState(κ_familiarity=0.9, ρ_concordance=0.9, η_calibration=0.9, feasible=true),
+        system.config,
+        Chamelia.psy_from_belief(system.belief);
+        bridge_trace=deepcopy(bridge_trace),
+        bridge_diagnostics=Dict{String, Any}("bridge_ok" => true),
+    )
+    Main.Memory.store_outcome!(
+        system.mem,
+        rec_id,
+        Accept,
+        Dict{Symbol, Any}(:tir_7d => 0.8),
+        0.15;
+        latent_μ_at_outcome=Float32[0.8, 0.9],
+    )
+
+    incremental_sync = Chamelia.sync_python_bridge_replay!(system; full_resync=false)
+    @test incremental_sync !== nothing
+    @test incremental_sync["since_record_id"] == 2
+    @test incremental_sync["exported_examples"] == 1
+    @test incremental_sync["ingested"] == 1
+    @test incremental_sync["last_synced_record_id"] == 3
+    @test length(ingest_calls) == 2
+    @test length(ingest_calls[2]["examples"]) == 1
+    @test ingest_calls[2]["examples"][1]["record_id"] == 3
 end
 
 @testset "Questionnaire Physical Priors" begin

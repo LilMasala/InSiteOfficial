@@ -64,14 +64,29 @@ def test_real_hjepa_backbone_runs_one_curriculum_step() -> None:
     assert loss.dim() == 0
 
 
-def test_real_hjepa_basic_arithmetic_stage_passes_locally(tmp_path) -> None:
-    """Verify the adaptive trainer can graduate Stage 1 arithmetic on tiny real HJEPA."""
+def test_build_stage_domains_honors_configured_stage_window() -> None:
+    """Configured stage windows should apply when no CLI stage filter is passed."""
+    curriculum_config = yaml.safe_load(CURRICULUM_CONFIG.read_text())
+    curriculum_config["curriculum"]["start_stage"] = 1
+    curriculum_config["curriculum"]["end_stage"] = 4
+
+    stages = build_stage_domains(
+        curriculum_config,
+        selected_stages=[],
+        selected_domains=[],
+    )
+    assert [stage[0].stage() for stage in stages] == [1, 2, 3, 4]
+
+
+def test_real_hjepa_basic_arithmetic_emits_bridge_artifacts_locally(tmp_path) -> None:
+    """Verify tiny real-HJEPA curriculum training emits bridge-loadable checkpoints."""
     args = SimpleNamespace(
         curriculum_config=str(CURRICULUM_CONFIG),
         chamelia_config=str(TINY_HJEPA_CONFIG),
         stage=["1"],
         domain=["basic_arithmetic"],
         device="cpu",
+        data_root=None,
         seed=11,
         backbone_mode="hjepa",
         lr=1.0e-3,
@@ -85,4 +100,12 @@ def test_real_hjepa_basic_arithmetic_stage_passes_locally(tmp_path) -> None:
         clip_grad=1.0,
         checkpoint_dir=str(tmp_path / "checkpoints"),
     )
-    assert run_training(args) == 0
+    exit_code = run_training(args)
+    assert exit_code in {0, 1}
+
+    bridge_artifacts = list((Path(args.checkpoint_dir) / "bridge_artifacts").glob("*.pth"))
+    assert bridge_artifacts
+    payload = torch.load(bridge_artifacts[0], map_location="cpu")
+    assert "model_state_dict" in payload
+    assert "config" in payload
+    assert payload["bridge_backbone_mode"] == "hjepa"

@@ -17,13 +17,23 @@ from typing import Any
 
 import numpy as np
 import torch
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 from prometheus_client import Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 from torchvision import transforms
 
+from .bridge_runtime import (
+    BridgeRuntime,
+    configure_session,
+    critic_session,
+    encode_session,
+    ingest_replay_examples,
+    propose_session,
+    retrieve_session,
+    rollout_session,
+)
 from ..models.hjepa import HJEPA, create_hjepa
 
 # Configure logging
@@ -81,6 +91,16 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     device: str
     version: str
+
+
+class BridgeHealthResponse(BaseModel):
+    """Response model for bridge health."""
+
+    status: str
+    bridge_runtime_ready: bool
+    active_sessions: int
+    backbone_mode: str
+    model_version: str
 
 
 class ModelServer:
@@ -252,6 +272,7 @@ class ModelServer:
 
 # Global model server instance
 model_server: ModelServer | None = None
+bridge_runtime: BridgeRuntime | None = None
 
 
 def get_model_server() -> ModelServer:
@@ -270,6 +291,22 @@ def get_model_server() -> ModelServer:
         )
 
     return model_server
+
+
+def get_bridge_runtime() -> BridgeRuntime:
+    """Get or create the Chamelia bridge runtime."""
+    global bridge_runtime
+
+    if bridge_runtime is None:
+        bridge_runtime = BridgeRuntime(
+            config_path=os.getenv("CHAMELIA_BRIDGE_CONFIG"),
+            device=os.getenv("CHAMELIA_BRIDGE_DEVICE"),
+            backbone_mode=os.getenv("CHAMELIA_BRIDGE_BACKBONE_MODE"),
+            checkpoint_path=os.getenv("CHAMELIA_BRIDGE_CHECKPOINT"),
+            model_version=os.getenv("CHAMELIA_BRIDGE_MODEL_VERSION"),
+        )
+
+    return bridge_runtime
 
 
 @app.on_event("startup")  # type: ignore[misc, untyped-decorator]
@@ -320,6 +357,19 @@ async def health_check() -> HealthResponse:
         REQUEST_COUNT.labels(endpoint="health", status="error").inc()
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.get("/bridge_health", response_model=BridgeHealthResponse)  # type: ignore[misc, untyped-decorator]
+async def bridge_health_check() -> BridgeHealthResponse:
+    """Bridge health endpoint."""
+    runtime = get_bridge_runtime()
+    return BridgeHealthResponse(
+        status="healthy",
+        bridge_runtime_ready=True,
+        active_sessions=len(runtime.sessions),
+        backbone_mode=runtime.backbone_mode,
+        model_version=runtime.model_version,
+    )
 
 
 @app.post("/extract", response_model=FeatureResponse)  # type: ignore[misc, untyped-decorator]
@@ -466,6 +516,160 @@ async def model_info() -> dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to get model info: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _require_bridge_session_id(payload: dict[str, Any]) -> str:
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise HTTPException(status_code=400, detail="bridge payload requires non-empty session_id")
+    return session_id.strip()
+
+
+def _require_domain_name(payload: dict[str, Any]) -> str:
+    domain_name = payload.get("domain_name")
+    if not isinstance(domain_name, str) or not domain_name.strip():
+        raise HTTPException(status_code=400, detail="bridge payload requires non-empty domain_name")
+    return domain_name.strip()
+
+
+def _bridge_response(endpoint: str, fn) -> dict[str, Any]:
+    start_time = time.time()
+    try:
+        response = fn()
+        REQUEST_COUNT.labels(endpoint=endpoint, status="success").inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint).observe(time.time() - start_time)
+        return response
+    except HTTPException:
+        REQUEST_COUNT.labels(endpoint=endpoint, status="error").inc()
+        raise
+    except Exception as exc:
+        REQUEST_COUNT.labels(endpoint=endpoint, status="error").inc()
+        logger.error("Bridge endpoint %s failed: %s", endpoint, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/encode")  # type: ignore[misc, untyped-decorator]
+async def bridge_encode(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Encode one bridge observation into a latent state."""
+    return _bridge_response(
+        "encode",
+        lambda: encode_session(
+            get_bridge_runtime().get_session(
+                _require_bridge_session_id(payload),
+                _require_domain_name(payload),
+            ),
+            input_kind=str(payload.get("input_kind", "plugin_observation")),
+            tokens=payload.get("tokens"),
+            mask=payload.get("mask"),
+            observation=payload.get("observation"),
+        ),
+    )
+
+
+@app.post("/retrieve")  # type: ignore[misc, untyped-decorator]
+async def bridge_retrieve(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Retrieve and rerank bridge memory for one encoded state."""
+    return _bridge_response(
+        "retrieve",
+        lambda: retrieve_session(
+            get_bridge_runtime().get_session(
+                _require_bridge_session_id(payload),
+                _require_domain_name(payload),
+            ),
+            z_t=payload.get("z_t"),
+            query_posture=payload.get("query_posture"),
+        ),
+    )
+
+
+@app.post("/configure")  # type: ignore[misc, untyped-decorator]
+async def bridge_configure(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Build context tokens from encoded state and retrieved memory."""
+    return _bridge_response(
+        "configure",
+        lambda: configure_session(
+            get_bridge_runtime().get_session(
+                _require_bridge_session_id(payload),
+                _require_domain_name(payload),
+            ),
+            encoded_state=payload["encoded_state"],
+            retrieved_memory=payload["retrieved_memory"],
+        ),
+    )
+
+
+@app.post("/propose")  # type: ignore[misc, untyped-decorator]
+async def bridge_propose(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Generate candidate paths, postures, and reasoning states."""
+    return _bridge_response(
+        "propose",
+        lambda: propose_session(
+            get_bridge_runtime().get_session(
+                _require_bridge_session_id(payload),
+                _require_domain_name(payload),
+            ),
+            mode=str(payload.get("mode", "v3")),
+            encoded_state=payload["encoded_state"],
+            configurator_output=payload["configurator_output"],
+            retrieved_memory=payload.get("retrieved_memory"),
+        ),
+    )
+
+
+@app.post("/rollout")  # type: ignore[misc, untyped-decorator]
+async def bridge_rollout(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Roll out imagined futures for the proposed candidate paths."""
+    return _bridge_response(
+        "rollout",
+        lambda: rollout_session(
+            get_bridge_runtime().get_session(
+                _require_bridge_session_id(payload),
+                _require_domain_name(payload),
+            ),
+            encoded_state=payload["encoded_state"],
+            configurator_output=payload["configurator_output"],
+            proposal_bundle=payload["proposal_bundle"],
+            rollout_horizon=int(payload.get("rollout_horizon", 2)),
+        ),
+    )
+
+
+@app.post("/critic")  # type: ignore[misc, untyped-decorator]
+async def bridge_critic(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Score candidate paths with intrinsic cost plus critic tail value."""
+    return _bridge_response(
+        "critic",
+        lambda: critic_session(
+            get_bridge_runtime().get_session(
+                _require_bridge_session_id(payload),
+                _require_domain_name(payload),
+            ),
+            encoded_state=payload["encoded_state"],
+            configurator_output=payload["configurator_output"],
+            proposal_bundle=payload["proposal_bundle"],
+            rollout_bundle=payload["rollout_bundle"],
+            domain_state=payload.get("domain_state", {}),
+        ),
+    )
+
+
+@app.post("/replay_ingest")  # type: ignore[misc, untyped-decorator]
+async def bridge_replay_ingest(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Ingest Julia-exported replay examples into session memory."""
+    raw_examples = payload.get("examples")
+    if not isinstance(raw_examples, list):
+        raise HTTPException(status_code=400, detail="bridge replay ingest requires examples list")
+    examples = [example for example in raw_examples if isinstance(example, dict)]
+    return _bridge_response(
+        "replay_ingest",
+        lambda: ingest_replay_examples(
+            get_bridge_runtime().get_session(
+                _require_bridge_session_id(payload),
+                _require_domain_name(payload),
+            ),
+            examples=examples,
+        ),
+    )
 
 
 if __name__ == "__main__":

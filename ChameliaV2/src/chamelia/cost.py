@@ -3,10 +3,32 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _repeat_domain_state(domain_state: dict[str, Any], repeats: int) -> dict[str, Any]:
+    """Repeat batch-shaped domain-state tensors to match flattened candidates."""
+    repeated: dict[str, Any] = {}
+    for key, value in domain_state.items():
+        if torch.is_tensor(value) and value.dim() > 0:
+            repeated[key] = value.repeat_interleave(repeats, dim=0)
+        else:
+            repeated[key] = value
+    return repeated
+
+
+def _flatten_path_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
+    """Flatten a [B, K, P, ...] tensor into [B*K*P, ...] with shape metadata."""
+    batch_size, num_candidates, path_length = tensor.shape[:3]
+    return tensor.reshape(batch_size * num_candidates * path_length, *tensor.shape[3:]), (
+        batch_size,
+        num_candidates,
+        path_length,
+    )
 
 
 class TransformerBlock(nn.Module):
@@ -231,6 +253,7 @@ class CostModule(nn.Module):
         action: torch.Tensor,
         ctx_tokens: torch.Tensor,
         domain_state: dict,
+        future_z: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute intrinsic, trainable, and total cost terms.
 
@@ -246,7 +269,89 @@ class CostModule(nn.Module):
                 - "tc": [B]
                 - "total": [B]
         """
+        critic_latent = z if future_z is None else future_z
         ic = self.intrinsic_cost(z, action, domain_state)
-        tc = self.trainable_critic(z, ctx_tokens)
+        tc = self.trainable_critic(critic_latent, ctx_tokens)
         return {"ic": ic, "tc": tc, "total": ic + tc}
 
+    def score_candidates(
+        self,
+        z: torch.Tensor,
+        actions: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        domain_state: dict[str, Any],
+        future_z: torch.Tensor | None = None,
+        future_trajectory: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Score a batch of candidate actions.
+
+        Args:
+            z: Current latent state [B, D].
+            actions: Candidate actions [B, K, A] or [B, A].
+            ctx_tokens: Context tokens [B, C, D].
+            domain_state: Opaque domain state.
+            future_z: Optional candidate terminal latents [B, K, D].
+            future_trajectory: Optional imagined path latents [B, K, P, D].
+
+        Returns:
+            Dict with ``ic``, ``tc``, and ``total`` as [B, K].
+        """
+        if actions.dim() == 2:
+            return {
+                key: value.unsqueeze(1)
+                for key, value in self.forward(
+                    z=z,
+                    action=actions,
+                    ctx_tokens=ctx_tokens,
+                    domain_state=domain_state,
+                    future_z=future_z,
+                ).items()
+            }
+
+        if actions.dim() == 4:
+            flat_actions, (batch_size, num_candidates, path_length) = _flatten_path_tensor(actions)
+            if future_trajectory is None:
+                raise ValueError("future_trajectory is required when scoring action paths.")
+            flat_future, _ = _flatten_path_tensor(future_trajectory)
+            repeated_domain_state = _repeat_domain_state(domain_state, num_candidates * path_length)
+            path_ic = self.intrinsic_cost(flat_future, flat_actions, repeated_domain_state)
+            ic = path_ic.view(batch_size, num_candidates, path_length).mean(dim=-1)
+
+            if future_z is None:
+                future_z = future_trajectory[:, :, -1, :]
+            flat_ctx = (
+                ctx_tokens.unsqueeze(1)
+                .expand(-1, num_candidates, -1, -1)
+                .reshape(
+                    batch_size * num_candidates,
+                    ctx_tokens.shape[1],
+                    ctx_tokens.shape[2],
+                )
+            )
+            tc = self.trainable_critic(
+                future_z.reshape(batch_size * num_candidates, -1),
+                flat_ctx,
+            ).view(batch_size, num_candidates)
+            return {"ic": ic, "tc": tc, "total": ic + tc}
+
+        batch_size, num_candidates, _ = actions.shape
+        flat_actions = actions.reshape(batch_size * num_candidates, -1)
+        flat_z = (
+            z.unsqueeze(1)
+            .expand(-1, num_candidates, -1)
+            .reshape(batch_size * num_candidates, -1)
+        )
+        flat_ctx = (
+            ctx_tokens.unsqueeze(1)
+            .expand(-1, num_candidates, -1, -1)
+            .reshape(
+                batch_size * num_candidates,
+                ctx_tokens.shape[1],
+                ctx_tokens.shape[2],
+            )
+        )
+        flat_future = flat_z if future_z is None else future_z.reshape(batch_size * num_candidates, -1)
+        repeated_domain_state = _repeat_domain_state(domain_state, num_candidates)
+        ic = self.intrinsic_cost(flat_z, flat_actions, repeated_domain_state).view(batch_size, num_candidates)
+        tc = self.trainable_critic(flat_future, flat_ctx).view(batch_size, num_candidates)
+        return {"ic": ic, "tc": tc, "total": ic + tc}

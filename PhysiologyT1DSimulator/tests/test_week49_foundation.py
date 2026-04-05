@@ -107,6 +107,11 @@ def test_build_run_report_exposes_realized_metrics_and_trends():
                 "graduated": day >= 2,
                 "belief_mode": "kalman",
                 "jepa_weights_loaded": False,
+                "python_bridge_enabled": True,
+                "python_bridge_mode": "v3",
+                "python_bridge_model_version": "bridge-test-model-v1",
+                "legacy_jepa_mode": "compatibility_only",
+                "legacy_jepa_compat_enabled": False,
                 "belief_entropy": 0.21,
                 "familiarity": 0.74,
                 "concordance": 0.69,
@@ -150,6 +155,11 @@ def test_build_run_report_exposes_realized_metrics_and_trends():
             "configurator_mode": "rules",
             "jepa_active": False,
             "decision_block_reason": None,
+            "requested_bridge_mode": "v3",
+            "requested_bridge_model_version": "bridge-test-model-v1",
+            "requested_python_bridge_url_present": True,
+            "requested_legacy_jepa_compat": False,
+            "experiment_label": "v3",
         }
         for day, tir, high, recommendation in [
             (1, 0.40, 0.40, None),
@@ -183,6 +193,15 @@ def test_build_run_report_exposes_realized_metrics_and_trends():
     assert report["trend_series"]["mood_valence_daily"][0] == 0.1
     assert report["recommendation_timeline"][0]["predicted_outcomes"]["delta_tir"] == 0.05
     assert report["realized_outcome_timeline"][0]["pct_high_delta"] < 0.0
+    assert report["python_bridge_enabled"] is True
+    assert report["python_bridge_mode"] == "v3"
+    assert report["python_bridge_model_version"] == "bridge-test-model-v1"
+    assert report["legacy_jepa_mode"] == "compatibility_only"
+    assert report["legacy_jepa_compat_enabled"] is False
+    assert report["requested_runtime"]["bridge_mode"] == "v3"
+    assert report["requested_runtime"]["bridge_model_version"] == "bridge-test-model-v1"
+    assert report["requested_runtime"]["python_bridge_url_present"] is True
+    assert report["experiment_label"] == "v3"
     assert report["competence_snapshot"]["familiarity"] == 0.74
     assert report["calibration_summary"]["paired_count"] == 1
     assert report["calibration_summary"]["tir_direction_match_rate"] == 1.0

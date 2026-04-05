@@ -7,7 +7,13 @@ from pathlib import Path
 
 
 FIELDS = [
+    "experiment_label",
     "persona",
+    "python_bridge_enabled",
+    "python_bridge_mode",
+    "python_bridge_model_version",
+    "legacy_jepa_compat_enabled",
+    "legacy_jepa_mode",
     "jepa_status",
     "jepa_weights_loaded",
     "graduated_day",

@@ -17,6 +17,9 @@ The Configurator decides which strategy to use based on:
 using Statistics
 using LinearAlgebra
 
+import Main: bridge_action_summary
+using Main: BridgeProposalAdvisory
+
 # ─────────────────────────────────────────────────────────────────
 # CandidateAction
 # Concrete action type for grid/beam/gradient search.
@@ -34,6 +37,33 @@ end
 function magnitude(a::CandidateAction) :: Float64
     isempty(a.deltas) && return 0.0
     return sum(abs(v) for v in values(a.deltas)) / length(a.deltas)
+end
+
+function bridge_action_summary(action::CandidateAction) :: Dict{String, Any}
+    return Dict(
+        "kind" => "candidate",
+        "deltas" => Dict(String(key) => value for (key, value) in action.deltas),
+    )
+end
+
+function _advisory_total(result) :: Float64
+    if hasproperty(result, :advisory_total)
+        value = getproperty(result, :advisory_total)
+        value isa Number && return Float64(value)
+    end
+    return Inf
+end
+
+function _advisory_rank(result) :: Int
+    if hasproperty(result, :advisory_rank)
+        value = getproperty(result, :advisory_rank)
+        value isa Integer && return Int(value)
+    end
+    return typemax(Int)
+end
+
+function _candidate_order_key(result)
+    return (result.cvar, _advisory_total(result), _advisory_rank(result))
 end
 
 # ─────────────────────────────────────────────────────────────────
@@ -347,6 +377,79 @@ function _evaluate_scheduled_candidates(
     end
 
     sort!(results, by = r -> r.cvar)
+    return results
+end
+
+function _evaluate_provided_actions(
+    candidates :: Vector{<:AbstractAction},
+    belief     :: AbstractBeliefState,
+    twin       :: DigitalTwin,
+    sim        :: AbstractSimulator,
+    noise      :: RolloutNoise,
+    critic     :: AbstractCriticModel,
+    config     :: ConfiguratorState,
+    ;
+    advisories :: Union{Nothing, Vector{BridgeProposalAdvisory}} = nothing,
+)
+    isempty(candidates) && return []
+
+    results = Vector{Any}(undef, length(candidates))
+    Threads.@threads for i in 1:length(candidates)
+        rollouts = run_rollouts(belief, candidates[i], twin, sim, noise, config)
+        energies = compute_energies(rollouts, critic, config)
+        cvar = compute_cvar(energies, config.φ_act.α_cvar)
+        advisory = isnothing(advisories) || i > length(advisories) ? nothing : advisories[i]
+        results[i] = (
+            action=candidates[i],
+            rollouts=rollouts,
+            energies=energies,
+            cvar=cvar,
+            advisory_ic=isnothing(advisory) ? nothing : advisory.python_ic,
+            advisory_tc=isnothing(advisory) ? nothing : advisory.python_tc,
+            advisory_total=isnothing(advisory) ? nothing : advisory.python_total,
+            advisory_rank=isnothing(advisory) ? nothing : advisory.python_rank,
+        )
+    end
+
+    sort!(results, by = _candidate_order_key)
+    return results
+end
+
+function _evaluate_provided_actions(
+    candidates :: Vector{<:AbstractAction},
+    belief     :: JEPABeliefState,
+    twin       :: DigitalTwin,
+    sim        :: AbstractSimulator,
+    noise      :: RolloutNoise,
+    critic     :: AbstractCriticModel,
+    config     :: ConfiguratorState,
+    ;
+    advisories :: Union{Nothing, Vector{BridgeProposalAdvisory}} = nothing,
+)
+    _ = twin
+    _ = sim
+    _ = noise
+    isempty(candidates) && return []
+
+    results = Vector{Any}(undef, length(candidates))
+    Threads.@threads for i in 1:length(candidates)
+        rollouts = run_latent_rollouts(belief, candidates[i], JEPA_PREDICTOR, config)
+        energies = compute_energies(rollouts, critic, config)
+        cvar = compute_cvar(energies, config.φ_act.α_cvar)
+        advisory = isnothing(advisories) || i > length(advisories) ? nothing : advisories[i]
+        results[i] = (
+            action=candidates[i],
+            rollouts=rollouts,
+            energies=energies,
+            cvar=cvar,
+            advisory_ic=isnothing(advisory) ? nothing : advisory.python_ic,
+            advisory_tc=isnothing(advisory) ? nothing : advisory.python_tc,
+            advisory_total=isnothing(advisory) ? nothing : advisory.python_total,
+            advisory_rank=isnothing(advisory) ? nothing : advisory.python_rank,
+        )
+    end
+
+    sort!(results, by = _candidate_order_key)
     return results
 end
 

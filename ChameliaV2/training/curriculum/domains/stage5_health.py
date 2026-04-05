@@ -6,7 +6,68 @@ from typing import Any
 
 import torch
 
-from training.curriculum.domains.base import BaseCurriculumDomain, DomainSpec, MaskingStrategy, make_level
+from training.curriculum.domains.base import (
+    BaseCurriculumDomain,
+    DomainSpec,
+    MaskingStrategy,
+    SequenceRuntimeDomain,
+    make_level,
+)
+from training.curriculum.generators.health_sim import PatientState, SyntheticPatientEnv
+
+
+HEALTH_FIELDS = ("bg", "mood", "engagement", "trust", "burnout", "burden")
+HEALTH_ACTION_LABELS = ("hold", "stabilize", "support", "aggressive_optimize")
+
+
+def _clip01(value: float) -> float:
+    """Clamp a float into [0, 1]."""
+    return max(0.0, min(1.0, value))
+
+
+def _state_to_tensor(state: dict[str, float]) -> torch.Tensor:
+    """Convert a patient-state dict to a compact tensor."""
+    return torch.tensor([float(state[field]) for field in HEALTH_FIELDS], dtype=torch.float32)
+
+
+def _tensor_to_state_dict(state_tensor: torch.Tensor) -> dict[str, float]:
+    """Convert a compact patient-state tensor back to a dict."""
+    values = state_tensor.detach().cpu().tolist()
+    return {field: float(value) for field, value in zip(HEALTH_FIELDS, values, strict=True)}
+
+
+def _normalize_state_value(field: str, value: float) -> float:
+    """Normalize a patient-state value into [0, 1] for tokenization."""
+    if field == "bg":
+        return _clip01((value - 40.0) / 260.0)
+    if field == "mood":
+        return _clip01((value + 1.0) / 2.0)
+    return _clip01(value)
+
+
+def _state_to_tokens(state: dict[str, float], seq_len: int, vocab_size: int) -> torch.Tensor:
+    """Encode a patient state into a fixed-length token sequence."""
+    base_tokens: list[int] = []
+    max_token = max(2, vocab_size - 1)
+    for field in HEALTH_FIELDS:
+        normalized = _normalize_state_value(field, float(state[field]))
+        token = 1 + int(round(normalized * (max_token - 1)))
+        complement = 1 + int(round((1.0 - normalized) * (max_token - 1)))
+        base_tokens.extend([token, complement])
+
+    base = torch.tensor(base_tokens, dtype=torch.long)
+    repeats = (seq_len + base.numel() - 1) // base.numel()
+    return base.repeat(repeats)[:seq_len]
+
+
+def _health_realized_cost(state: dict[str, float]) -> float:
+    """Compute realized health cost from an outcome state."""
+    bg_cost = abs(float(state["bg"]) - 110.0) / 100.0
+    burden_cost = max(0.0, float(state["burden"]))
+    trust_cost = max(0.0, 1.0 - float(state["trust"]))
+    burnout_cost = max(0.0, float(state["burnout"]))
+    crisis_penalty = 0.5 if float(state["bg"]) < 70.0 or float(state["bg"]) > 220.0 else 0.0
+    return float(bg_cost + burden_cost + trust_cost + 0.5 * burnout_cost + crisis_penalty)
 
 
 class HealthMaskingStrategy(MaskingStrategy):
@@ -36,12 +97,102 @@ def _health_samples(level: int, split: str, spec: DomainSpec) -> list[dict[str, 
     generator = torch.Generator().manual_seed(500 + level + (0 if split == "train" else 4000))
     samples: list[dict[str, torch.Tensor]] = []
     for _ in range(spec.dataset_size):
-        tokens = torch.randint(1, spec.vocab_size, (spec.seq_len,), generator=generator)
-        target = torch.roll(tokens, shifts=-2, dims=0)
-        crisis = torch.tensor(float(level >= 3))
-        samples.append({"tokens": tokens, "target": target, "crisis": crisis})
+        env = SyntheticPatientEnv()
+        current_state = env.reset()
+        event_draw = int(torch.randint(0, 3, (1,), generator=generator).item())
+        if event_draw == 1:
+            env.inject_event("illness", 0.3 + 0.7 * float(torch.rand(1, generator=generator).item()))
+        elif event_draw == 2:
+            env.inject_event("acute_stress", 0.3 + 0.7 * float(torch.rand(1, generator=generator).item()))
+        current_state = env._to_dict()
+        heuristic_action = "support" if current_state["trust"] < 0.6 or current_state["burden"] > 0.35 else "stabilize"
+        next_state, _, _, _ = env.step(heuristic_action, {})
+        tokens = _state_to_tokens(current_state, spec.seq_len, spec.vocab_size)
+        target = _state_to_tokens(next_state, spec.seq_len, spec.vocab_size)
+        crisis = torch.tensor(
+            float(
+                level >= 3
+                or current_state["bg"] > 180.0
+                or current_state["trust"] < 0.55
+                or current_state["burden"] > 0.45
+            ),
+            dtype=torch.float32,
+        )
+        samples.append(
+            {
+                "tokens": tokens,
+                "target": target,
+                "crisis": crisis,
+                "patient_state": _state_to_tensor(current_state),
+            }
+        )
     return samples
 
+
+class HealthRuntimeDomain(SequenceRuntimeDomain):
+    """Runtime health domain with simulated delayed outcomes."""
+
+    def decode_action(self, action_vec: torch.Tensor) -> Any:
+        """Decode continuous actions into named care interventions."""
+        if action_vec.dim() == 1:
+            action_vec = action_vec.unsqueeze(0)
+        logits = action_vec[:, : len(HEALTH_ACTION_LABELS)]
+        indices = logits.argmax(dim=-1).tolist()
+        labels = [HEALTH_ACTION_LABELS[idx] for idx in indices]
+        return labels[0] if len(labels) == 1 else labels
+
+    def simulate_delayed_outcome(
+        self,
+        action_vec: torch.Tensor,
+        domain_state: dict[str, Any],
+    ) -> dict[str, torch.Tensor] | None:
+        """Simulate the next patient state from the selected action."""
+        if action_vec.dim() == 2:
+            action_vec = action_vec.unsqueeze(1)
+        return self.simulate_path_outcome(action_vec, domain_state)
+
+    def simulate_path_outcome(
+        self,
+        action_path: torch.Tensor,
+        domain_state: dict[str, Any],
+    ) -> dict[str, torch.Tensor] | None:
+        """Simulate a delayed outcome for a whole candidate path."""
+        patient_state = domain_state.get("patient_state")
+        if not torch.is_tensor(patient_state):
+            return None
+        if patient_state.dim() == 1:
+            patient_state = patient_state.unsqueeze(0)
+        if action_path.dim() == 2:
+            action_path = action_path.unsqueeze(1)
+
+        outcome_tokens: list[torch.Tensor] = []
+        realized_costs: list[float] = []
+        patient_state_cpu = patient_state.detach().cpu()
+        for idx in range(action_path.shape[0]):
+            env = SyntheticPatientEnv()
+            state_dict = _tensor_to_state_dict(patient_state_cpu[idx])
+            env.state = PatientState(**state_dict)
+            labels = self.decode_action(action_path[idx])
+            if isinstance(labels, str):
+                labels = [labels]
+            next_state = state_dict
+            cumulative_cost = 0.0
+            for label in labels:
+                next_state, _, _, _ = env.step(label, {})
+                cumulative_cost += _health_realized_cost(next_state)
+            outcome_tokens.append(
+                _state_to_tokens(next_state, self.owner.spec.seq_len, self.owner.vocab_size)
+            )
+            realized_costs.append(cumulative_cost / max(1, len(labels)))
+
+        return {
+            "outcome_observation": torch.stack(outcome_tokens, dim=0).to(action_path.device),
+            "realized_intrinsic_cost": torch.tensor(
+                realized_costs,
+                dtype=torch.float32,
+                device=action_path.device,
+            ),
+        }
 
 class HealthCurriculumDomain(BaseCurriculumDomain):
     """Stage 5 health and care scaffold."""
@@ -126,4 +277,4 @@ class HealthCurriculumDomain(BaseCurriculumDomain):
 
     def build_runtime_domain(self, embed_dim: int):
         """Build a simple sequence-based runtime plugin for health tokens."""
-        return self.build_sequence_runtime_domain(embed_dim)
+        return HealthRuntimeDomain(owner=self, embed_dim=embed_dim)

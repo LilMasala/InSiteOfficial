@@ -99,6 +99,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv311/
 env/
 venv/
 ENV/
@@ -138,6 +139,7 @@ ehthumbs.db
 Desktop.ini
 
 # Results and checkpoints
+checkpoints/
 results/checkpoints/*.pth
 results/checkpoints/*.pt
 results/logs/*

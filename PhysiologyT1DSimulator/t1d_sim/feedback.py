@@ -338,7 +338,7 @@ class EventSchedule:
 # Event catalog: (probability_per_180d, duration_range, taper_frac, is_major)
 _EVENT_CATALOG = {
     EventType.INSOMNIA_BOUT:         (0.25, (3, 10),  0.30, False),
-    EventType.ILLNESS:               (0.40, (3, 7),   0.40, True),
+    EventType.ILLNESS:               (0.30, (3, 7),   0.35, True),
     EventType.ACUTE_STRESS:          (0.15, (14, 45),  0.50, True),
     EventType.POSITIVE_LIFE_EVENT:   (0.28, (4, 12),  0.25, False),
     EventType.TRAVEL:                (0.30, (5, 14),  0.30, False),
@@ -348,6 +348,23 @@ _EVENT_CATALOG = {
     EventType.VACATION:              (0.35, (5, 10),  0.20, False),
     EventType.MEDICATION_CHANGE:     (0.10, (999, 999), 0.00, True),  # permanent
 }
+
+_EVENT_SEVERITY_RANGES: dict[EventType, tuple[float, float]] = {
+    EventType.INSOMNIA_BOUT: (0.30, 0.65),
+    EventType.ILLNESS: (0.35, 0.70),
+    EventType.ACUTE_STRESS: (0.30, 0.70),
+    EventType.POSITIVE_LIFE_EVENT: (0.40, 0.85),
+    EventType.TRAVEL: (0.30, 0.65),
+    EventType.MENSTRUAL_IRREGULARITY: (0.35, 0.75),
+    EventType.INJURY: (0.35, 0.75),
+    EventType.DEVICE_HIATUS: (0.35, 0.80),
+    EventType.VACATION: (0.35, 0.75),
+    EventType.MEDICATION_CHANGE: (0.40, 0.80),
+}
+
+_ILLNESS_DURATION_DAYS = np.arange(3, 11, dtype=int)
+_ILLNESS_DURATION_WEIGHTS = np.asarray([1.0, 0.72, 0.52, 0.37, 0.27, 0.19, 0.14, 0.10], dtype=float)
+_ILLNESS_DURATION_WEIGHTS /= _ILLNESS_DURATION_WEIGHTS.sum()
 
 
 def sample_life_events(
@@ -375,11 +392,17 @@ def sample_life_events(
         # Duration
         if etype == EventType.MEDICATION_CHANGE:
             duration = n_days  # permanent from onset
+        elif etype == EventType.ILLNESS:
+            duration = int(rng.choice(_ILLNESS_DURATION_DAYS, p=_ILLNESS_DURATION_WEIGHTS))
         else:
             duration = int(rng.integers(dur_range[0], dur_range[1] + 1))
 
-        taper = max(0, int(duration * taper_frac))
-        severity = float(rng.uniform(0.4, 1.0))
+        if etype == EventType.ILLNESS:
+            taper = 0 if duration <= 4 else 1
+        else:
+            taper = max(0, int(duration * taper_frac))
+        severity_lo, severity_hi = _EVENT_SEVERITY_RANGES.get(etype, (0.4, 1.0))
+        severity = float(rng.uniform(severity_lo, severity_hi))
 
         # Place at a random day (leave room for the event)
         latest_start = max(1, n_days - duration)
@@ -439,8 +462,11 @@ def _sample_event_params(
         }
     elif etype == EventType.ILLNESS:
         return {
-            "egp_mult": float(rng.uniform(1.30, 1.50)),
-            "isf_factor": float(rng.uniform(0.70, 0.80)),
+            "egp_mult": float(rng.uniform(1.10, 1.20)),
+            "isf_factor": float(rng.uniform(0.86, 0.94)),
+            "exercise_prob_mult": float(rng.uniform(0.15, 0.45)),
+            "stress_bump": float(rng.uniform(0.04, 0.10)),
+            "appetite_swing": float(rng.uniform(0.04, 0.10)),
             "appetite_direction": float(rng.choice([-1, 1])),  # smaller or larger meals
         }
     elif etype == EventType.ACUTE_STRESS:
@@ -715,13 +741,16 @@ def apply_event_modifiers(
 
         elif ev.event_type == EventType.ILLNESS:
             mods["is_ill_override"] = True
-            mods["egp_mult"] *= p.get("egp_mult", 1.40) ** intensity
+            egp_target = p.get("egp_mult", 1.16)
+            mods["egp_mult"] *= 1.0 + (egp_target - 1.0) * intensity
             isf_penalty = 1.0 - (1.0 - p.get("isf_factor", 0.75)) * intensity
             mods["isf_mult_factor"] *= isf_penalty
-            mods["exercise_prob_mult"] *= 0.0  # no exercise when sick
-            mods["stress_add"] += 0.15 * intensity
+            reduced_activity = 1.0 - (1.0 - p.get("exercise_prob_mult", 0.25)) * intensity
+            mods["exercise_prob_mult"] *= max(0.05, reduced_activity)
+            mods["stress_add"] += p.get("stress_bump", 0.08) * intensity
             direction = p.get("appetite_direction", -1)
-            mods["meal_size_mult"] *= 1.0 + direction * 0.15 * intensity
+            appetite_swing = p.get("appetite_swing", 0.08)
+            mods["meal_size_mult"] *= 1.0 + direction * appetite_swing * intensity
 
         elif ev.event_type == EventType.ACUTE_STRESS:
             mods["stress_add"] += p.get("stress_jump", 0.20) * intensity
@@ -794,9 +823,9 @@ def apply_event_modifiers(
     mods["sleep_minutes_mult"] = max(0.2, mods["sleep_minutes_mult"])
     mods["exercise_prob_mult"] = float(np.clip(mods["exercise_prob_mult"], 0.0, 2.0))
     mods["meal_size_mult"] = float(np.clip(mods["meal_size_mult"], 0.5, 2.0))
-    mods["isf_mult_factor"] = float(np.clip(mods["isf_mult_factor"], 0.5, 1.5))
-    mods["egp_mult"] = float(np.clip(mods["egp_mult"], 0.8, 2.0))
-    mods["stress_add"] = float(np.clip(mods["stress_add"], -0.20, 0.50))
+    mods["isf_mult_factor"] = float(np.clip(mods["isf_mult_factor"], 0.75, 1.35))
+    mods["egp_mult"] = float(np.clip(mods["egp_mult"], 0.85, 1.35))
+    mods["stress_add"] = float(np.clip(mods["stress_add"], -0.20, 0.35))
     mods["mood_offset"] = float(np.clip(mods["mood_offset"], -0.60, 0.20))
 
     return mods

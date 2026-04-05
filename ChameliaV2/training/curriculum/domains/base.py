@@ -349,6 +349,12 @@ class SequenceRuntimeDomain(AbstractDomain):
         tokens = observation if torch.is_tensor(observation) else torch.tensor(observation)
         return {"tokens": tokens}
 
+    def prepare_bridge_observation(self, observation: Any) -> Any:
+        """Normalize bridge payloads into tokenizer-ready sequence tokens."""
+        if isinstance(observation, dict) and "tokens" in observation:
+            observation = observation["tokens"]
+        return observation if torch.is_tensor(observation) else torch.tensor(observation, dtype=torch.long)
+
     def compute_regime_embedding(self, domain_state: dict) -> torch.Tensor | None:
         """Return no explicit regime embedding by default."""
         _ = domain_state
@@ -398,6 +404,12 @@ class BoardRuntimeDomain(AbstractDomain):
         """Construct an opaque board-state payload."""
         tokens = observation if torch.is_tensor(observation) else torch.tensor(observation)
         return {"tokens": tokens}
+
+    def prepare_bridge_observation(self, observation: Any) -> Any:
+        """Normalize bridge payloads into tokenizer-ready board tokens."""
+        if isinstance(observation, dict) and "tokens" in observation:
+            observation = observation["tokens"]
+        return observation if torch.is_tensor(observation) else torch.tensor(observation, dtype=torch.long)
 
     def compute_regime_embedding(self, domain_state: dict) -> torch.Tensor | None:
         """Board domains do not expose a regime embedding by default."""

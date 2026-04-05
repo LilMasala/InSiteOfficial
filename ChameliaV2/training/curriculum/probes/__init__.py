@@ -1,4 +1,4 @@
-"""Probe scaffolds for curriculum evaluation."""
+"""Probe utilities for curriculum evaluation."""
 
 from training.curriculum.probes.game_probe import GameProbe
 from training.curriculum.probes.health_probe import HealthProbe

@@ -40,7 +40,8 @@ using Main: AbstractSimulator, AbstractAction, AbstractBeliefState,
             ActionFamily, parameter_adjustment, structure_edit, continuous_schedule,
             ConnectedAppCapabilities, ConnectedAppState,
             SegmentSurface, SegmentDelta, StructureEdit, ScheduledAction,
-            AbstractDomainAdapter, RegimeDetectionResult, UserPreferences
+            AbstractDomainAdapter, RegimeDetectionResult, UserPreferences,
+            BridgeProposalAdvisory
 
 import Main: is_null, magnitude, detect_regime, minimum_action_delta_threshold
 
@@ -78,6 +79,9 @@ function decide(
     prefs       :: UserPreferences = UserPreferences(),
     signals     :: Dict{Symbol, Any} = Dict{Symbol, Any}(),
     memory      :: MemoryBuffer = MemoryBuffer(),
+    ;
+    proposal_actions::Union{Nothing, Vector{AbstractAction}} = nothing,
+    proposal_advisories::Union{Nothing, Vector{BridgeProposalAdvisory}} = nothing,
 ) :: Tuple{Union{RecommendationPackage, Nothing}, Symbol, Any}
 
     # ── 1. Epistemic gate ─────────────────────────────────────────
@@ -88,9 +92,13 @@ function decide(
     # ── 2. Generate and evaluate candidates ───────────────────────
     strategy = _select_strategy(belief, config)
     use_schedule_surface = capabilities.level_1_enabled && !isempty(app_state.current_segments)
-    candidates = use_schedule_surface ?
-        search_scheduled_actions(strategy, belief, twin, sim, noise, critic, config, capabilities, app_state; current_day=current_day) :
-        search_actions(strategy, belief, twin, sim, noise, critic, config, dimensions)
+    candidates = if !isnothing(proposal_actions) && !isempty(proposal_actions)
+        _evaluate_provided_actions(proposal_actions, belief, twin, sim, noise, critic, config; advisories=proposal_advisories)
+    else
+        use_schedule_surface ?
+            search_scheduled_actions(strategy, belief, twin, sim, noise, critic, config, capabilities, app_state; current_day=current_day) :
+            search_actions(strategy, belief, twin, sim, noise, critic, config, dimensions)
+    end
 
     isempty(candidates) && return nothing, :no_candidates, nothing
 
@@ -174,7 +182,7 @@ function decide(
     end
 
     # ── 5. Pick best by CVaR ──────────────────────────────────────
-    sort!(survivors, by = r -> r.cvar)
+    sort!(survivors, by = _candidate_order_key)
 
     # ── 6. Burnout attribution ────────────────────────────────────
     burnout_horizon = selection_reason == :postgrad_probe ? min(14, config.φ_cost.H_burn) : nothing
@@ -266,6 +274,9 @@ function decide(
     prefs       :: UserPreferences = UserPreferences(),
     signals     :: Dict{Symbol, Any} = Dict{Symbol, Any}(),
     memory      :: MemoryBuffer = MemoryBuffer(),
+    ;
+    proposal_actions::Union{Nothing, Vector{AbstractAction}} = nothing,
+    proposal_advisories::Union{Nothing, Vector{BridgeProposalAdvisory}} = nothing,
 ) :: Tuple{Union{RecommendationPackage, Nothing}, Symbol, Any}
 
     if !passes_epistemic_gate(epistemic)
@@ -274,9 +285,13 @@ function decide(
 
     strategy = _select_strategy(belief, config)
     use_schedule_surface = capabilities.level_1_enabled && !isempty(app_state.current_segments)
-    candidates = use_schedule_surface ?
-        search_scheduled_actions(strategy, belief, twin, sim, noise, critic, config, capabilities, app_state; current_day=current_day) :
-        search_actions(strategy, belief, twin, sim, noise, critic, config, dimensions)
+    candidates = if !isnothing(proposal_actions) && !isempty(proposal_actions)
+        _evaluate_provided_actions(proposal_actions, belief, twin, sim, noise, critic, config; advisories=proposal_advisories)
+    else
+        use_schedule_surface ?
+            search_scheduled_actions(strategy, belief, twin, sim, noise, critic, config, capabilities, app_state; current_day=current_day) :
+            search_actions(strategy, belief, twin, sim, noise, critic, config, dimensions)
+    end
     isempty(candidates) && return nothing, :no_candidates, nothing
 
     null_action = use_schedule_surface ?
@@ -345,7 +360,7 @@ function decide(
         isempty(survivors) && return nothing, :effect_size_insufficient, nothing
         return nothing, :no_survivors, nothing
     end
-    sort!(survivors, by = r -> r.cvar)
+    sort!(survivors, by = _candidate_order_key)
     burnout_horizon = selection_reason == :postgrad_probe ? min(14, config.φ_cost.H_burn) : nothing
     attribution = isnothing(burnout_horizon) ?
         attribute_burnout(belief, best.action, twin, sim, noise, config) :
@@ -476,6 +491,36 @@ function _rollout_signal_means(rollouts :: Vector{RolloutResult})
     )
 end
 
+function _signal_float(
+    signals::Dict{Symbol, Any},
+    primary::Symbol,
+    fallback::Symbol,
+    default::Float64,
+) :: Float64
+    value = get(signals, primary, get(signals, fallback, default))
+    value === nothing && (value = get(signals, fallback, default))
+    value === nothing && return default
+    return try
+        Float64(value)
+    catch
+        default
+    end
+end
+
+function _signal_float(
+    signals::Dict{Symbol, Any},
+    key::Symbol,
+    default::Float64,
+) :: Float64
+    value = get(signals, key, default)
+    value === nothing && return default
+    return try
+        Float64(value)
+    catch
+        default
+    end
+end
+
 function _rollout_signal_samples(rollouts :: Vector{RolloutResult})
     tir = Float64[]
     pct_low = Float64[]
@@ -485,10 +530,10 @@ function _rollout_signal_samples(rollouts :: Vector{RolloutResult})
     for rollout in rollouts
         isempty(rollout.phys_signals) && continue
         signals = rollout.phys_signals[end]
-        push!(tir, Float64(get(signals, :tir_7d, get(signals, :tir, 0.0))))
-        push!(pct_low, Float64(get(signals, :pct_low_7d, get(signals, :pct_low, 0.0))))
-        push!(pct_high, Float64(get(signals, :pct_high_7d, get(signals, :pct_high, 0.0))))
-        push!(bg_avg, Float64(get(signals, :bg_avg, 0.0)))
+        push!(tir, _signal_float(signals, :tir_7d, :tir, 0.0))
+        push!(pct_low, _signal_float(signals, :pct_low_7d, :pct_low, 0.0))
+        push!(pct_high, _signal_float(signals, :pct_high_7d, :pct_high, 0.0))
+        push!(bg_avg, _signal_float(signals, :bg_avg, 0.0))
     end
 
     isempty(tir) && return nothing
