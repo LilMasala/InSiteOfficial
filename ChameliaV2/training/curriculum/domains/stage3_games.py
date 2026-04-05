@@ -63,34 +63,70 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
         def move_supervision(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
             _ = z
             answers = domain_state["answer_token"].long().clamp(min=0, max=action.shape[1] - 1)
-            return F.cross_entropy(action, answers, reduction="none")
+            fallback_loss = F.cross_entropy(action, answers, reduction="none")
+            candidate_tokens = domain_state.get("candidate_move_tokens")
+            candidate_mask = domain_state.get("candidate_move_mask")
+            if candidate_tokens is not None and candidate_mask is not None and candidate_mask.any():
+                log_probs = F.log_softmax(action, dim=-1)
+                clipped_tokens = candidate_tokens.long().clamp(min=0, max=action.shape[1] - 1)
+                candidate_log_probs = torch.gather(log_probs, 1, clipped_tokens)
+                mask = candidate_mask.float()
+                weights = domain_state.get("candidate_move_weights")
+                if weights is None:
+                    weights = mask / mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                else:
+                    weights = weights.float() * mask
+                    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                guided_loss = -(weights * candidate_log_probs * mask).sum(dim=-1)
+                return torch.where(candidate_mask.any(dim=-1), guided_loss, fallback_loss)
+            return fallback_loss
 
-        def position_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
+        def engine_blunder_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
+            fallback_cost = (z.mean(dim=-1) - domain_state["target"].float().mean(dim=-1)).abs()
+            blunder_losses = domain_state.get("candidate_move_blunder_cp")
+            candidate_tokens = domain_state.get("candidate_move_tokens")
+            candidate_mask = domain_state.get("candidate_move_mask")
+            if (
+                blunder_losses is not None
+                and candidate_tokens is not None
+                and candidate_mask is not None
+                and candidate_mask.any()
+            ):
+                probs = torch.softmax(action, dim=-1)
+                clipped_tokens = candidate_tokens.long().clamp(min=0, max=action.shape[1] - 1)
+                candidate_probs = torch.gather(probs, 1, clipped_tokens) * candidate_mask.float()
+                candidate_mass = candidate_probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-6)
+                normalized_candidate_probs = candidate_probs / candidate_mass
+                scaled_losses = (blunder_losses.float() / 100.0) * candidate_mask.float()
+                off_candidate_penalty = (1.0 - candidate_probs.sum(dim=-1)).clamp_min(0.0)
+                max_loss = scaled_losses.max(dim=-1).values.clamp_min(1.0)
+                guided_cost = (normalized_candidate_probs * scaled_losses).sum(dim=-1) + off_candidate_penalty * max_loss
+                return torch.where(candidate_mask.any(dim=-1), guided_cost, fallback_cost)
             _ = action
-            return (z.mean(dim=-1) - domain_state["target"].float().mean(dim=-1)).abs()
+            return fallback_cost
 
         schedule = [
-            make_level(0, "next-move prediction", [(move_supervision, 0.8), (position_cost, 0.2)], {"game_score": 0.75}, 64),
-            make_level(1, "material balance", [(move_supervision, 0.75), (position_cost, 0.25)], {"game_score": 0.80}, 64),
-            make_level(2, "positional evaluation", [(move_supervision, 0.7), (position_cost, 0.3)], {"game_score": 0.85}, 64),
+            make_level(0, "next-move prediction", [(move_supervision, 0.8), (engine_blunder_cost, 0.2)], {"game_score": 0.75}, 64),
+            make_level(1, "material balance", [(move_supervision, 0.75), (engine_blunder_cost, 0.25)], {"game_score": 0.80}, 64),
+            make_level(2, "positional evaluation", [(move_supervision, 0.7), (engine_blunder_cost, 0.3)], {"game_score": 0.85}, 64),
             make_level(
                 3,
                 "tactical depth",
-                [(move_supervision, 0.65), (position_cost, 0.35)],
+                [(move_supervision, 0.65), (engine_blunder_cost, 0.35)],
                 {"game_score": 0.90, "blunder_rate": 0.90},
                 64,
             ),
             make_level(
                 4,
                 "strategic mastery",
-                [(move_supervision, 0.6), (position_cost, 0.4)],
+                [(move_supervision, 0.6), (engine_blunder_cost, 0.4)],
                 {"game_score": 0.94, "plan_accuracy": 0.85},
                 64,
             ),
             make_level(
                 5,
                 "superhuman play",
-                [(move_supervision, 0.55), (position_cost, 0.45)],
+                [(move_supervision, 0.55), (engine_blunder_cost, 0.45)],
                 {"game_score": 0.97, "plan_accuracy": 0.90},
                 64,
             ),
@@ -151,6 +187,17 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
         batch.domain_state["answer"] = answers
         batch.domain_state["answer_token"] = answers
         batch.domain_state["target"] = raw_batch["target"]
+        for key in (
+            "candidate_move_tokens",
+            "candidate_move_weights",
+            "candidate_move_mask",
+            "candidate_move_blunder_cp",
+            "principal_variation_tokens",
+            "centipawn_eval",
+        ):
+            if key in raw_batch:
+                batch.targets[key] = raw_batch[key]
+                batch.domain_state[key] = raw_batch[key]
         return batch
 
     def run_advancement_probe(self, model: Any, level: int) -> dict[str, float]:
