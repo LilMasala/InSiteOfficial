@@ -185,6 +185,7 @@ class TrainableCritic(nn.Module):
         )
         self.norm_ctx = nn.LayerNorm(embed_dim)
         self.norm_out = nn.LayerNorm(embed_dim)
+        self.output_activation = nn.Softplus()
         self.value_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.GELU(),
@@ -207,7 +208,9 @@ class TrainableCritic(nn.Module):
         ctx = self.norm_ctx(ctx_tokens)
         x = x + self.cross_attn_to_ctx(query=x, key=ctx, value=ctx)[0]
         x = self.norm_out(x).squeeze(1)
-        return self.value_head(x).squeeze(-1)
+        raw_value = self.value_head(x).squeeze(-1)
+        # TC is defined as predicted future intrinsic cost, so keep it in cost space.
+        return self.output_activation(raw_value)
 
     def compute_critic_loss(
         self,
@@ -223,7 +226,8 @@ class TrainableCritic(nn.Module):
         Returns:
             Scalar tensor [] containing smooth L1 loss.
         """
-        return F.smooth_l1_loss(predicted_value, realized_ic.detach())
+        target = realized_ic.detach().clamp_min(0.0)
+        return F.smooth_l1_loss(predicted_value, target)
 
 
 class CostModule(nn.Module):

@@ -341,6 +341,28 @@ def test_chamelia_pipeline_shapes() -> None:
     assert critic_loss.dim() == 0
 
 
+def test_trainable_critic_outputs_nonnegative_future_costs() -> None:
+    """TC should stay in cost space because it predicts future intrinsic cost."""
+    torch.manual_seed(0)
+
+    critic = TrainableCritic(
+        embed_dim=32,
+        num_heads=4,
+        num_layers=1,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        num_ctx_tokens=4,
+        horizon=5,
+    )
+    z = torch.randn(6, 32)
+    ctx = torch.randn(6, 4, 32)
+
+    predicted = critic(z, ctx)
+
+    assert predicted.shape == (6,)
+    assert torch.all(predicted >= 0)
+
+
 def test_latent_memory_summarizes_retrieved_selected_postures() -> None:
     """Retrieved episodes should expose selected postures with better-outcome scores."""
     memory = LatentMemory(embed_dim=8, max_episodes=8, retrieval_k=4, device="cpu")
