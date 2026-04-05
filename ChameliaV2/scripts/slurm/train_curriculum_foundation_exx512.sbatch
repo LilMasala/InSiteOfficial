@@ -10,7 +10,11 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  ROOT_DIR="${SLURM_SUBMIT_DIR}"
+else
+  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
 cd "$ROOT_DIR"
 
 LOG_DIR="${ROOT_DIR}/logs/slurm"
