@@ -8,7 +8,7 @@ curriculum:
     stage0_language:
       domains: ["language"]
       batch_size: 32
-      learning_rate: 5.0e-5
+      learning_rate: 5.0e-4
       encoder_init: "roberta-base"
       eval_languages: ["en", "fr", "de", "es", "zh"]
 

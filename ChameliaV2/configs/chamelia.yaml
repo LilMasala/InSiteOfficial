@@ -109,9 +109,9 @@ training:
   critic_loss_weight: 1.0
   mode1_distill_weight: 0.05
   representation_loss_weight: 1.0
-  stage0_tc_weight: 1.0
-  stage0_disable_memory_replay_losses: false
-  stage0_disable_mode1_distill: false
+  stage0_tc_weight: 0.0
+  stage0_disable_memory_replay_losses: true
+  stage0_disable_mode1_distill: true
 
 loss:
   type: "combined"

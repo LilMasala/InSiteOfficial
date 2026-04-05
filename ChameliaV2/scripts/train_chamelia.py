@@ -492,6 +492,36 @@ def build_optimizer(model: Chamelia, training_cfg: dict[str, Any], lr: float) ->
     return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 
+def _stage_learning_rate(
+    curriculum_config: dict[str, Any],
+    stage_label: int,
+    fallback_lr: float,
+) -> float:
+    """Resolve the base learning rate for one curriculum stage.
+
+    Args:
+        curriculum_config: Parsed curriculum configuration.
+        stage_label: User-facing stage integer.
+        fallback_lr: Global fallback learning rate.
+
+    Returns:
+        Stage-specific learning rate when configured, else ``fallback_lr``.
+    """
+    stage_key_by_label = {
+        0: "stage0_language",
+        1: "stage1_reasoning",
+        2: "stage2_patterns",
+        3: "stage3_games",
+        4: "stage4_collaborative",
+        5: "stage5_health",
+    }
+    stage_key = stage_key_by_label.get(int(stage_label))
+    if stage_key is None:
+        return fallback_lr
+    stage_cfg = curriculum_config.get("curriculum", {}).get("stages", {}).get(stage_key, {})
+    return float(stage_cfg.get("learning_rate", fallback_lr))
+
+
 def initialize_from_checkpoint(
     model: Chamelia,
     checkpoint_path: str | Path,
@@ -1005,8 +1035,10 @@ def run_training(args: argparse.Namespace) -> int:
         _log(f"initialized model from checkpoint={args.init_checkpoint}")
 
     training_cfg = _resolve_training_config(chamelia_config, args.backbone_mode)
-    base_lr = float(args.lr if args.lr is not None else training_cfg.get("learning_rate", 1.5e-4))
-    optimizer = build_optimizer(model, training_cfg, base_lr)
+    global_fallback_lr = float(args.lr if args.lr is not None else training_cfg.get("learning_rate", 1.5e-4))
+    initial_stage_label = stages[0][0].stage() if stages and stages[0] else 0
+    initial_stage_lr = _stage_learning_rate(curriculum_config, int(initial_stage_label), global_fallback_lr)
+    optimizer = build_optimizer(model, training_cfg, initial_stage_lr)
     representation_loss_fn = build_representation_loss(chamelia_config, effective_model_cfg)
 
     curriculum_config["checkpoint_dir"] = args.checkpoint_dir
@@ -1047,6 +1079,8 @@ def run_training(args: argparse.Namespace) -> int:
         f"backbone_mode={args.backbone_mode} "
         f"selected_stages={selected_stages or 'config_default'} "
         f"selected_domains={selected_domains or 'all'} "
+        f"global_fallback_lr={global_fallback_lr:.6g} "
+        f"initial_stage_lr={initial_stage_lr:.6g} "
         f"checkpoint_dir={args.checkpoint_dir} "
         f"stage0_tc_weight={float(training_cfg.get('stage0_tc_weight', 0.0)):.3f} "
         f"stage0_disable_memory_replay_losses={bool(training_cfg.get('stage0_disable_memory_replay_losses', True))} "
@@ -1055,7 +1089,13 @@ def run_training(args: argparse.Namespace) -> int:
 
     for stage_idx, stage_domains in enumerate(stages):
         stage_label = stage_domains[0].stage() if stage_domains else stage_idx
-        _log(f"=== stage {stage_label} :: {', '.join(domain.domain_name() for domain in stage_domains)} ===")
+        stage_base_lr = _stage_learning_rate(curriculum_config, int(stage_label), global_fallback_lr)
+        runner.optimizer = build_optimizer(model, training_cfg, stage_base_lr)
+        runner._ensure_optimizer_tracks_model()
+        _log(
+            f"=== stage {stage_label} :: {', '.join(domain.domain_name() for domain in stage_domains)} "
+            f"(base_lr={stage_base_lr:.6g}) ==="
+        )
         passed, _history = train_stage(
             model,
             runner,
@@ -1069,7 +1109,7 @@ def run_training(args: argparse.Namespace) -> int:
             max_extensions=args.max_extensions,
             max_retunes=args.max_retunes,
             retune_lr_factors=retune_lrs,
-            base_lr=base_lr,
+            base_lr=stage_base_lr,
             training_cfg=training_cfg,
             clip_grad=args.clip_grad,
             stage_label=stage_label,

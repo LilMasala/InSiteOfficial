@@ -69,7 +69,7 @@ MAX_RETUNES="${MAX_RETUNES:-2}"
 EXTENSION_FACTOR="${EXTENSION_FACTOR:-1.5}"
 RETUNE_LR_FACTORS="${RETUNE_LR_FACTORS:-0.5,1.5}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
-LR="${LR:-2.0e-4}"
+LR="${LR:-}"
 
 echo "Starting foundation curriculum run"
 echo "  root:            ${ROOT_DIR}"
@@ -96,7 +96,6 @@ TRAIN_CMD=(
   --data-root "${DATA_ROOT}"
   --seed "${SEED}"
   --backbone-mode hjepa
-  --lr "${LR}"
   --initial-stage-steps "${INITIAL_STAGE_STEPS}"
   --eval-every "${EVAL_EVERY}"
   --max-total-stage-steps "${MAX_TOTAL_STAGE_STEPS}"
@@ -108,6 +107,10 @@ TRAIN_CMD=(
   --checkpoint-dir "${CHECKPOINT_DIR}"
   --model-version "${MODEL_VERSION}"
 )
+
+if [[ -n "${LR}" ]]; then
+  TRAIN_CMD+=(--lr "${LR}")
+fi
 
 if [[ -n "${STAGES}" ]]; then
   IFS=',' read -r -a STAGE_LIST <<< "${STAGES}"
