@@ -200,6 +200,18 @@ def test_curriculum_domains_and_cost_progression() -> None:
         assert isinstance(advanced, bool)
 
 
+def test_stage0_language_curriculum_emits_learnable_nonpad_supervision() -> None:
+    """Stage-0 loaders should emit real answer tokens from a sizeable curriculum."""
+    domain = LanguageCurriculumDomain(batch_size=8, seq_len=16)
+    loader = domain.get_data_loader(level=0, split="train")
+    assert len(loader.dataset) >= 4096
+
+    batch = next(iter(loader))
+    answers = batch.domain_state["answer_token"].long()
+    assert torch.all(answers > 0)
+    assert answers.unique().numel() > 1
+
+
 def test_curriculum_runner_and_config(tmp_path: Path) -> None:
     """Load curriculum config and validate runner/graduation scaffolding."""
     config_path = Path("/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/configs/curriculum.yaml")
