@@ -1,5 +1,5 @@
 curriculum:
-  start_stage: 1
+  start_stage: 0
   end_stage: 4
   eval_interval: 200
   checkpoint_interval: 2000

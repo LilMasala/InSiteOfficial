@@ -4,7 +4,7 @@ This is the current cluster runbook for the repaired `ChameliaV2 -> V3` training
 
 The intended sequence is:
 
-1. foundation pretraining over stages `1-4`
+1. foundation pretraining over stages `0-4`
 2. stage-5 health/T1D specialization
 3. export bridge-loadable artifacts from each run
 4. point the Julia/Python bridge at the resulting `.pth` artifact
@@ -64,7 +64,7 @@ sbatch scripts/slurm/train_curriculum_foundation_exx512.sbatch
 
 This phase should teach the planner the general reasoning/search substrate before health specialization.
 
-- stages: `1,2,3,4`
+- stages: `0,1,2,3,4`
 - config: [curriculum_hjepa_foundation_single_gpu.yaml](/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/configs/curriculum_hjepa_foundation_single_gpu.yaml)
 - launcher: [train_curriculum_foundation_exx512.sbatch](/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/scripts/slurm/train_curriculum_foundation_exx512.sbatch)
 
@@ -78,10 +78,6 @@ export MODEL_VERSION=foundation-20260405
 export DATA_ROOT=$PWD/data/curriculum
 sbatch scripts/slurm/train_curriculum_foundation_exx512.sbatch
 ```
-
-Useful overrides:
-
-- `STAGES=0,1,2,3,4` if you explicitly want Stage 0 included
 - `CHECKPOINT_DIR=/path/to/checkpoints/foundation-20260405`
 - `CUDA_MODULE=<cluster-cuda-module>`
 

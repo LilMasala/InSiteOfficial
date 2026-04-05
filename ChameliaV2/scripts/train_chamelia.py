@@ -6,10 +6,11 @@ from __future__ import annotations
 import argparse
 import copy
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 import random
 import sys
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 import yaml
@@ -28,14 +29,16 @@ from src.losses.hjepa_loss import HJEPALoss
 from src.models.hjepa import HJEPA
 from training.curriculum.control import AdaptiveTrainingController, EvalPoint
 from training.curriculum.domains.base import CurriculumDomain
-from training.curriculum.domains.stage0_language import LanguageCurriculumDomain
-from training.curriculum.domains.stage1_reasoning import ReasoningCurriculumDomain
-from training.curriculum.domains.stage2_patterns import PatternCurriculumDomain
-from training.curriculum.domains.stage3_games import GamesCurriculumDomain
-from training.curriculum.domains.stage4_collaborative import CollaborativeCurriculumDomain
-from training.curriculum.domains.stage5_health import HealthCurriculumDomain
 from training.curriculum.graduation import GraduationManager
 from training.curriculum.stage_runner import CurriculumStageRunner
+
+if TYPE_CHECKING:
+    from training.curriculum.domains.stage0_language import LanguageCurriculumDomain
+    from training.curriculum.domains.stage1_reasoning import ReasoningCurriculumDomain
+    from training.curriculum.domains.stage2_patterns import PatternCurriculumDomain
+    from training.curriculum.domains.stage3_games import GamesCurriculumDomain
+    from training.curriculum.domains.stage4_collaborative import CollaborativeCurriculumDomain
+    from training.curriculum.domains.stage5_health import HealthCurriculumDomain
 
 
 class StubSequenceHJEPA(torch.nn.Module):
@@ -258,6 +261,31 @@ def build_stage_domains(
     configured_start_stage = int(curriculum_root.get("start_stage", 0))
     configured_end_stage = int(curriculum_root.get("end_stage", len(cfg) - 1))
     stage_specs: list[tuple[int, str, list[CurriculumDomain]]] = []
+
+    LanguageCurriculumDomain = getattr(
+        import_module("training.curriculum.domains.stage0_language"),
+        "LanguageCurriculumDomain",
+    )
+    ReasoningCurriculumDomain = getattr(
+        import_module("training.curriculum.domains.stage1_reasoning"),
+        "ReasoningCurriculumDomain",
+    )
+    PatternCurriculumDomain = getattr(
+        import_module("training.curriculum.domains.stage2_patterns"),
+        "PatternCurriculumDomain",
+    )
+    GamesCurriculumDomain = getattr(
+        import_module("training.curriculum.domains.stage3_games"),
+        "GamesCurriculumDomain",
+    )
+    CollaborativeCurriculumDomain = getattr(
+        import_module("training.curriculum.domains.stage4_collaborative"),
+        "CollaborativeCurriculumDomain",
+    )
+    HealthCurriculumDomain = getattr(
+        import_module("training.curriculum.domains.stage5_health"),
+        "HealthCurriculumDomain",
+    )
 
     stage0_cfg = cfg["stage0_language"]
     stage0_domains = [
