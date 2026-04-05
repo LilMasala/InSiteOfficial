@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import copy
 from typing import Any
 
 import torch
@@ -17,7 +18,7 @@ def _repeat_domain_state(domain_state: dict[str, Any], repeats: int) -> dict[str
         if torch.is_tensor(value) and value.dim() > 0:
             repeated[key] = value.repeat_interleave(repeats, dim=0)
         else:
-            repeated[key] = value
+            repeated[key] = copy(value)
     return repeated
 
 
@@ -237,12 +238,14 @@ class CostModule(nn.Module):
         self,
         intrinsic_cost: IntrinsicCost,
         trainable_critic: TrainableCritic,
+        gamma: float = 0.99,
     ) -> None:
         """Initialize the combined cost module.
 
         Args:
             intrinsic_cost: Immutable intrinsic cost module.
             trainable_critic: Context-conditioned learned critic.
+            gamma: Discount factor applied to path cost and tail critic value.
 
         Returns:
             None.
@@ -250,6 +253,7 @@ class CostModule(nn.Module):
         super().__init__()
         self.intrinsic_cost = intrinsic_cost
         self.trainable_critic = trainable_critic
+        self.gamma = float(gamma)
 
     def forward(
         self,
@@ -258,6 +262,7 @@ class CostModule(nn.Module):
         ctx_tokens: torch.Tensor,
         domain_state: dict,
         future_z: torch.Tensor | None = None,
+        horizon: int = 1,
     ) -> dict[str, torch.Tensor]:
         """Compute intrinsic, trainable, and total cost terms.
 
@@ -276,7 +281,8 @@ class CostModule(nn.Module):
         critic_latent = z if future_z is None else future_z
         ic = self.intrinsic_cost(z, action, domain_state)
         tc = self.trainable_critic(critic_latent, ctx_tokens)
-        return {"ic": ic, "tc": tc, "total": ic + tc}
+        total = ic + ((self.gamma**max(1, int(horizon))) * tc)
+        return {"ic": ic, "tc": tc, "total": total}
 
     def score_candidates(
         self,
@@ -309,6 +315,7 @@ class CostModule(nn.Module):
                     ctx_tokens=ctx_tokens,
                     domain_state=domain_state,
                     future_z=future_z,
+                    horizon=1,
                 ).items()
             }
 
@@ -319,7 +326,19 @@ class CostModule(nn.Module):
             flat_future, _ = _flatten_path_tensor(future_trajectory)
             repeated_domain_state = _repeat_domain_state(domain_state, num_candidates * path_length)
             path_ic = self.intrinsic_cost(flat_future, flat_actions, repeated_domain_state)
-            ic = path_ic.view(batch_size, num_candidates, path_length).mean(dim=-1)
+            discounts = torch.pow(
+                torch.full(
+                    (path_length,),
+                    self.gamma,
+                    device=path_ic.device,
+                    dtype=path_ic.dtype,
+                ),
+                torch.arange(path_length, device=path_ic.device, dtype=path_ic.dtype),
+            )
+            ic = (
+                path_ic.view(batch_size, num_candidates, path_length)
+                * discounts.view(1, 1, path_length)
+            ).sum(dim=-1)
 
             if future_z is None:
                 future_z = future_trajectory[:, :, -1, :]
@@ -336,7 +355,8 @@ class CostModule(nn.Module):
                 future_z.reshape(batch_size * num_candidates, -1),
                 flat_ctx,
             ).view(batch_size, num_candidates)
-            return {"ic": ic, "tc": tc, "total": ic + tc}
+            tail_discount = self.gamma**path_length
+            return {"ic": ic, "tc": tc, "total": ic + (tail_discount * tc)}
 
         batch_size, num_candidates, _ = actions.shape
         flat_actions = actions.reshape(batch_size * num_candidates, -1)
@@ -354,8 +374,10 @@ class CostModule(nn.Module):
                 ctx_tokens.shape[2],
             )
         )
-        flat_future = flat_z if future_z is None else future_z.reshape(batch_size * num_candidates, -1)
+        if future_z is None:
+            raise ValueError("future_z is required when scoring candidate actions [B, K, A].")
+        flat_future = future_z.reshape(batch_size * num_candidates, -1)
         repeated_domain_state = _repeat_domain_state(domain_state, num_candidates)
         ic = self.intrinsic_cost(flat_z, flat_actions, repeated_domain_state).view(batch_size, num_candidates)
         tc = self.trainable_critic(flat_future, flat_ctx).view(batch_size, num_candidates)
-        return {"ic": ic, "tc": tc, "total": ic + tc}
+        return {"ic": ic, "tc": tc, "total": ic + (self.gamma * tc)}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -361,6 +362,81 @@ def test_trainable_critic_outputs_nonnegative_future_costs() -> None:
 
     assert predicted.shape == (6,)
     assert torch.all(predicted >= 0)
+
+
+def test_cost_module_requires_future_latents_for_candidate_scoring() -> None:
+    """Candidate scoring over [B, K, A] must use future latents, not current z fallback."""
+    cost_module = CostModule(
+        intrinsic_cost=IntrinsicCost(
+            cost_fns=[lambda z, action, domain_state: action.pow(2).mean(dim=-1)],
+            weights=[1.0],
+        ),
+        trainable_critic=TrainableCritic(
+            embed_dim=8,
+            num_heads=2,
+            num_layers=1,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            num_ctx_tokens=2,
+        ),
+    )
+    z = torch.randn(2, 8)
+    actions = torch.randn(2, 3, 4)
+    ctx = torch.randn(2, 2, 8)
+
+    with pytest.raises(ValueError, match="future_z is required"):
+        cost_module.score_candidates(
+            z=z,
+            actions=actions,
+            ctx_tokens=ctx,
+            domain_state={},
+        )
+
+
+def test_cost_module_path_scoring_uses_discounted_sum_and_tail_discount() -> None:
+    """Path scoring should use discounted IC accumulation plus discounted terminal TC."""
+
+    class ConstantCritic(TrainableCritic):
+        def forward(self, z: torch.Tensor, ctx_tokens: torch.Tensor) -> torch.Tensor:
+            _ = ctx_tokens
+            return torch.full((z.shape[0],), 2.0, device=z.device, dtype=z.dtype)
+
+    gamma = 0.5
+    cost_module = CostModule(
+        intrinsic_cost=IntrinsicCost(
+            cost_fns=[lambda z, action, domain_state: torch.ones(z.shape[0], device=z.device, dtype=z.dtype)],
+            weights=[1.0],
+        ),
+        trainable_critic=ConstantCritic(
+            embed_dim=8,
+            num_heads=2,
+            num_layers=1,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            num_ctx_tokens=2,
+        ),
+        gamma=gamma,
+    )
+    z = torch.randn(1, 8)
+    actions = torch.randn(1, 2, 3, 4)
+    ctx = torch.randn(1, 2, 8)
+    future_trajectory = torch.randn(1, 2, 3, 8)
+    future_z = future_trajectory[:, :, -1, :]
+
+    scored = cost_module.score_candidates(
+        z=z,
+        actions=actions,
+        ctx_tokens=ctx,
+        domain_state={},
+        future_z=future_z,
+        future_trajectory=future_trajectory,
+    )
+
+    expected_ic = 1.0 + gamma + (gamma**2)
+    expected_total = expected_ic + ((gamma**3) * 2.0)
+    assert torch.allclose(scored["ic"], torch.full((1, 2), expected_ic))
+    assert torch.allclose(scored["tc"], torch.full((1, 2), 2.0))
+    assert torch.allclose(scored["total"], torch.full((1, 2), expected_total))
 
 
 def test_latent_memory_summarizes_retrieved_selected_postures() -> None:

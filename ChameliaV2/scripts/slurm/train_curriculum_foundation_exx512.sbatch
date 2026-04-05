@@ -69,7 +69,7 @@ MAX_RETUNES="${MAX_RETUNES:-2}"
 EXTENSION_FACTOR="${EXTENSION_FACTOR:-1.5}"
 RETUNE_LR_FACTORS="${RETUNE_LR_FACTORS:-0.5,1.5}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
-LR="${LR:-1.5e-4}"
+LR="${LR:-2.0e-4}"
 
 echo "Starting foundation curriculum run"
 echo "  root:            ${ROOT_DIR}"
