@@ -13,7 +13,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-mkdir -p logs/slurm
+LOG_DIR="${ROOT_DIR}/logs/slurm"
+mkdir -p "${LOG_DIR}"
 
 if [[ -n "${CUDA_MODULE:-}" ]] && command -v module >/dev/null 2>&1; then
   module load "$CUDA_MODULE"
@@ -73,6 +74,7 @@ echo "  chamelia config: ${CHAMELIA_CONFIG}"
 echo "  stage-5 domains: ${STAGE5_DOMAINS}"
 echo "  data root:       ${DATA_ROOT}"
 echo "  checkpoint dir:  ${CHECKPOINT_DIR}"
+echo "  log dir:         ${LOG_DIR}"
 echo "  model version:   ${MODEL_VERSION}"
 echo "  init checkpoint: ${INIT_CHECKPOINT:-<none>}"
 echo "  node:            $(hostname)"
