@@ -104,6 +104,47 @@ def _log(message: str) -> None:
     print(f"[train_chamelia {timestamp}] {message}", flush=True)
 
 
+def _average_breakdowns(breakdowns: list[dict[str, float]]) -> dict[str, float]:
+    """Average matching scalar loss components across recent steps."""
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for breakdown in breakdowns:
+        for key, value in breakdown.items():
+            totals[key] = totals.get(key, 0.0) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+    return {
+        key: totals[key] / max(1, counts[key])
+        for key in sorted(totals.keys())
+    }
+
+
+def _format_breakdown(breakdown: dict[str, float]) -> str:
+    """Render a compact ordered loss-breakdown string."""
+    ordered_keys = [
+        "ic",
+        "tc",
+        "tc_contrib",
+        "rep",
+        "path",
+        "posture_div",
+        "posture_spec",
+        "retrieval_direct",
+        "critic_replay",
+        "world_model_replay",
+        "retrieval_replay",
+        "mode1_distill",
+        "total",
+    ]
+    parts = [
+        f"{key}={breakdown[key]:.4f}"
+        for key in ordered_keys
+        if key in breakdown
+    ]
+    extras = sorted(key for key in breakdown if key not in ordered_keys)
+    parts.extend(f"{key}={breakdown[key]:.4f}" for key in extras)
+    return ", ".join(parts)
+
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
@@ -741,6 +782,7 @@ def train_stage(
     extensions_used = 0
     retunes_used = 0
     recent_losses: list[float] = []
+    recent_breakdowns: list[dict[str, float]] = []
     best_snapshot = snapshot_stage(model, stage_domains, score=0.0)
 
     while True:
@@ -771,11 +813,13 @@ def train_stage(
                 stage_steps += 1
                 inner_steps += 1
                 recent_losses.append(float(loss.item()))
+                recent_breakdowns.append(runner.latest_loss_breakdown())
                 if stage_steps % heartbeat_steps == 0 or inner_steps == 1:
                     avg_recent_loss = sum(recent_losses[-heartbeat_steps:]) / max(
                         1,
                         min(len(recent_losses), heartbeat_steps),
                     )
+                    avg_recent_breakdown = _average_breakdowns(recent_breakdowns[-heartbeat_steps:])
                     level_summary = ", ".join(
                         f"{domain.domain_name()}:L{domain.cost.current_level}/"
                         f"{max(1, len(domain.get_cost_schedule()) - 1)}"
@@ -786,7 +830,8 @@ def train_stage(
                         f"heartbeat steps={stage_steps}/{budget_steps} "
                         f"global_step={runner.global_step} "
                         f"loss_avg={avg_recent_loss:.4f} "
-                        f"levels=[{level_summary}]"
+                        f"levels=[{level_summary}] "
+                        f"breakdown=[{_format_breakdown(avg_recent_breakdown)}]"
                     )
                 if inner_steps >= eval_every or stage_steps >= budget_steps:
                     break
@@ -808,7 +853,9 @@ def train_stage(
                 )
 
         mean_loss = sum(recent_losses) / max(1, len(recent_losses))
+        mean_breakdown = _average_breakdowns(recent_breakdowns)
         recent_losses.clear()
+        recent_breakdowns.clear()
         score = controller.stage_score(stage_domains, metrics)
         point = EvalPoint(step=stage_steps, mean_loss=mean_loss, stage_score=score, metrics=metrics)
         history.append(point)
@@ -835,7 +882,8 @@ def train_stage(
         )
         _log(
             f"stage={display_stage} steps={stage_steps} score={score:.3f} loss={mean_loss:.4f} "
-            f"decision={decision.action} reason={decision.reason} metrics=[{metric_summary}]"
+            f"decision={decision.action} reason={decision.reason} metrics=[{metric_summary}] "
+            f"breakdown=[{_format_breakdown(mean_breakdown)}]"
         )
 
         if decision.action == "graduate":
@@ -977,6 +1025,13 @@ def run_training(args: argparse.Namespace) -> int:
         critic_loss_weight=float(training_cfg.get("critic_loss_weight", 1.0)),
         mode1_distill_interval=int(training_cfg.get("mode1_distill_interval", 0)),
         mode1_distill_weight=float(training_cfg.get("mode1_distill_weight", 0.0)),
+        stage0_tc_weight=float(training_cfg.get("stage0_tc_weight", 0.0)),
+        stage0_disable_memory_replay_losses=bool(
+            training_cfg.get("stage0_disable_memory_replay_losses", True)
+        ),
+        stage0_disable_mode1_distill=bool(
+            training_cfg.get("stage0_disable_mode1_distill", True)
+        ),
         export_model_config=effective_model_cfg,
         export_backbone_mode=args.backbone_mode,
         export_model_version=getattr(args, "model_version", None),
@@ -992,7 +1047,10 @@ def run_training(args: argparse.Namespace) -> int:
         f"backbone_mode={args.backbone_mode} "
         f"selected_stages={selected_stages or 'config_default'} "
         f"selected_domains={selected_domains or 'all'} "
-        f"checkpoint_dir={args.checkpoint_dir}"
+        f"checkpoint_dir={args.checkpoint_dir} "
+        f"stage0_tc_weight={float(training_cfg.get('stage0_tc_weight', 0.0)):.3f} "
+        f"stage0_disable_memory_replay_losses={bool(training_cfg.get('stage0_disable_memory_replay_losses', True))} "
+        f"stage0_disable_mode1_distill={bool(training_cfg.get('stage0_disable_mode1_distill', True))}"
     )
 
     for stage_idx, stage_domains in enumerate(stages):

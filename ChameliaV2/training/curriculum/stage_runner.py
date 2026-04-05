@@ -61,6 +61,9 @@ class CurriculumStageRunner:
         retrieval_replay_loss_weight: float = 1.0,
         mode1_distill_interval: int = 0,
         mode1_distill_weight: float = 0.0,
+        stage0_tc_weight: float = 0.0,
+        stage0_disable_memory_replay_losses: bool = True,
+        stage0_disable_mode1_distill: bool = True,
         export_model_config: dict[str, Any] | None = None,
         export_backbone_mode: str | None = None,
         export_model_version: str | None = None,
@@ -103,6 +106,13 @@ class CurriculumStageRunner:
             retrieval_replay_loss_weight: Scalar weight for replayed retrieval-reranker loss.
             mode1_distill_interval: Interval in steps for distilling mode1 from mode2.
             mode1_distill_weight: Scalar weight for mode1 distillation loss.
+            stage0_tc_weight: Weight applied to the signed trainable-critic term during
+                Stage 0 optimization. Setting this to ``0.0`` keeps language training
+                anchored on the intrinsic task loss while still logging critic output.
+            stage0_disable_memory_replay_losses: Whether to suppress critic/world-model/
+                retrieval replay losses during Stage 0.
+            stage0_disable_mode1_distill: Whether to suppress mode1 distillation during
+                Stage 0.
             export_model_config: Optional bridge-loadable model config to bundle into
                 exported curriculum checkpoints.
             export_backbone_mode: Optional bridge backbone mode associated with exported
@@ -139,6 +149,9 @@ class CurriculumStageRunner:
         self.retrieval_replay_loss_weight = retrieval_replay_loss_weight
         self.mode1_distill_interval = mode1_distill_interval
         self.mode1_distill_weight = mode1_distill_weight
+        self.stage0_tc_weight = stage0_tc_weight
+        self.stage0_disable_memory_replay_losses = stage0_disable_memory_replay_losses
+        self.stage0_disable_mode1_distill = stage0_disable_mode1_distill
         self.export_model_config = deepcopy(export_model_config) if export_model_config is not None else None
         self.export_backbone_mode = export_backbone_mode
         self.export_model_version = export_model_version
@@ -149,6 +162,21 @@ class CurriculumStageRunner:
         self.bridge_artifact_dir = self.checkpoint_dir / "bridge_artifacts"
         self.bridge_artifact_dir.mkdir(parents=True, exist_ok=True)
         self._runtime_domains: dict[str, Any] = {}
+        self._last_loss_breakdown: dict[str, float] = {}
+
+    def latest_loss_breakdown(self) -> dict[str, float]:
+        """Return the most recent scalar loss breakdown."""
+        return dict(self._last_loss_breakdown)
+
+    def _set_last_loss_breakdown(self, breakdown: dict[str, torch.Tensor | float]) -> None:
+        """Store a detached scalar view of the latest loss breakdown."""
+        normalized: dict[str, float] = {}
+        for key, value in breakdown.items():
+            if torch.is_tensor(value):
+                normalized[key] = float(value.detach().item())
+            else:
+                normalized[key] = float(value)
+        self._last_loss_breakdown = normalized
 
     def _optimizer_param_ids(self) -> set[int]:
         """Return ids of parameters already tracked by the optimizer.
@@ -292,7 +320,17 @@ class CurriculumStageRunner:
             store_to_memory=self.store_to_memory,
             input_kind=input_kind,
         )
-        loss = outputs["cost"]["total"].mean()
+        is_stage0 = domain.stage() == 0
+        ic_mean = outputs["cost"]["ic"].mean()
+        tc_mean = outputs["cost"]["tc"].mean()
+        tc_weight = self.stage0_tc_weight if is_stage0 else 1.0
+        loss = ic_mean + (tc_weight * tc_mean)
+        breakdown: dict[str, torch.Tensor | float] = {
+            "ic": ic_mean,
+            "tc": tc_mean,
+            "tc_contrib": tc_weight * tc_mean,
+            "total": loss,
+        }
         if self.representation_loss_fn is not None:
             hjepa_out = outputs["hjepa_out"]
             masks = hjepa_out.get("masks_valid", hjepa_out.get("mask_valid"))
@@ -304,7 +342,10 @@ class CurriculumStageRunner:
                 masks=masks,
                 context_features=hjepa_out.get("context_features"),
             )
-            loss = loss + self.representation_loss_weight * rep_loss_dict["loss"]
+            rep_contrib = self.representation_loss_weight * rep_loss_dict["loss"]
+            loss = loss + rep_contrib
+            breakdown["rep"] = rep_contrib
+            breakdown["total"] = loss
 
         if self.path_baseline_loss_weight > 0.0:
             path_baseline_loss = self._compute_path_baseline_loss(
@@ -313,12 +354,18 @@ class CurriculumStageRunner:
                 runtime_domain=runtime_domain,
             )
             if path_baseline_loss is not None:
-                loss = loss + self.path_baseline_loss_weight * path_baseline_loss
+                path_contrib = self.path_baseline_loss_weight * path_baseline_loss
+                loss = loss + path_contrib
+                breakdown["path"] = path_contrib
+                breakdown["total"] = loss
 
         if self.posture_diversity_loss_weight > 0.0:
             posture_diversity_loss = self._compute_posture_diversity_loss(outputs=outputs)
             if posture_diversity_loss is not None:
-                loss = loss + self.posture_diversity_loss_weight * posture_diversity_loss
+                posture_div_contrib = self.posture_diversity_loss_weight * posture_diversity_loss
+                loss = loss + posture_div_contrib
+                breakdown["posture_div"] = posture_div_contrib
+                breakdown["total"] = loss
         if self.posture_specialization_loss_weight > 0.0:
             posture_specialization_loss = self._compute_posture_specialization_loss(
                 outputs=outputs,
@@ -326,7 +373,12 @@ class CurriculumStageRunner:
                 runtime_domain=runtime_domain,
             )
             if posture_specialization_loss is not None:
-                loss = loss + self.posture_specialization_loss_weight * posture_specialization_loss
+                posture_spec_contrib = (
+                    self.posture_specialization_loss_weight * posture_specialization_loss
+                )
+                loss = loss + posture_spec_contrib
+                breakdown["posture_spec"] = posture_spec_contrib
+                breakdown["total"] = loss
 
         outcome_observation, realized_ic = self._resolve_selected_outcome(
             outputs=outputs,
@@ -340,7 +392,12 @@ class CurriculumStageRunner:
                 realized_ic=realized_ic,
             )
             if retrieval_relevance_loss is not None:
-                loss = loss + self.retrieval_relevance_loss_weight * retrieval_relevance_loss
+                retrieval_direct_contrib = (
+                    self.retrieval_relevance_loss_weight * retrieval_relevance_loss
+                )
+                loss = loss + retrieval_direct_contrib
+                breakdown["retrieval_direct"] = retrieval_direct_contrib
+                breakdown["total"] = loss
 
         if self.store_to_memory:
             if outcome_observation is not None and realized_ic is not None:
@@ -350,30 +407,61 @@ class CurriculumStageRunner:
                 )
 
         next_step = self.global_step + 1
-        if self.critic_train_interval > 0 and next_step % self.critic_train_interval == 0:
+        memory_replay_enabled = not (is_stage0 and self.stage0_disable_memory_replay_losses)
+        if (
+            memory_replay_enabled
+            and self.critic_train_interval > 0
+            and next_step % self.critic_train_interval == 0
+        ):
             critic_loss = self.model.train_critic_from_memory()
             if critic_loss is not None:
-                loss = loss + self.critic_loss_weight * critic_loss
+                critic_contrib = self.critic_loss_weight * critic_loss
+                loss = loss + critic_contrib
+                breakdown["critic_replay"] = critic_contrib
+                breakdown["total"] = loss
 
-        if self.world_model_train_interval > 0 and next_step % self.world_model_train_interval == 0:
+        if (
+            memory_replay_enabled
+            and self.world_model_train_interval > 0
+            and next_step % self.world_model_train_interval == 0
+        ):
             world_model_loss = self.model.train_world_model_from_memory()
             if world_model_loss is not None:
-                loss = loss + self.world_model_loss_weight * world_model_loss
+                world_model_contrib = self.world_model_loss_weight * world_model_loss
+                loss = loss + world_model_contrib
+                breakdown["world_model_replay"] = world_model_contrib
+                breakdown["total"] = loss
 
-        if self.retrieval_train_interval > 0 and next_step % self.retrieval_train_interval == 0:
+        if (
+            memory_replay_enabled
+            and self.retrieval_train_interval > 0
+            and next_step % self.retrieval_train_interval == 0
+        ):
             retrieval_replay_loss = self.model.train_retrieval_from_memory(
                 temperature=self.retrieval_relevance_temperature
             )
             if retrieval_replay_loss is not None:
-                loss = loss + self.retrieval_replay_loss_weight * retrieval_replay_loss
+                retrieval_replay_contrib = self.retrieval_replay_loss_weight * retrieval_replay_loss
+                loss = loss + retrieval_replay_contrib
+                breakdown["retrieval_replay"] = retrieval_replay_contrib
+                breakdown["total"] = loss
 
-        if self.mode1_distill_interval > 0 and next_step % self.mode1_distill_interval == 0:
+        distill_enabled = not (is_stage0 and self.stage0_disable_mode1_distill)
+        if (
+            distill_enabled
+            and self.mode1_distill_interval > 0
+            and next_step % self.mode1_distill_interval == 0
+        ):
             distill_loss = self.model.actor.distill_from_mode2(
                 states=outputs["z"],
                 ctx_tokens=outputs["ctx_tokens"],
                 mode2_actions=outputs["action_vec"],
             )
-            loss = loss + self.mode1_distill_weight * distill_loss
+            distill_contrib = self.mode1_distill_weight * distill_loss
+            loss = loss + distill_contrib
+            breakdown["mode1_distill"] = distill_contrib
+            breakdown["total"] = loss
+        self._set_last_loss_breakdown(breakdown)
         return loss
 
     def _simulate_selected_outcome(
