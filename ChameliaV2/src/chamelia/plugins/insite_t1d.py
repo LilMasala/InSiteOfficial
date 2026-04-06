@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -11,9 +12,25 @@ from src.chamelia.tokenizers import TimeSeriesTokenizer
 
 from .base import AbstractDomain
 
+_log = logging.getLogger(__name__)
+
+# Known infusion site locations — must stay in sync with t1d_sim/constants.py SITE_LOCATIONS.
+# site_location is one-hot encoded (6 floats) rather than passed as a raw string.
+_SITE_LOCATIONS = (
+    "abdomen_left",
+    "abdomen_right",
+    "thigh_left",
+    "thigh_right",
+    "arm_left",
+    "arm_right",
+)
+
 # All signals emitted by FeatureFrameHourly.to_signal_dict(), in a fixed order.
-# Raw values are passed directly — the TimeSeriesTokenizer's learned nn.Linear +
+# Raw float values are passed directly — the TimeSeriesTokenizer's learned nn.Linear +
 # LayerNorm handles scale differences across features.
+# site_location (string) is expanded into one-hot columns at the end.
+# If you add a new signal to FeatureFrameHourly.to_signal_dict(), add it here too —
+# _signal_tensor() will warn at runtime if incoming keys are not in this list.
 _INSITE_SIGNAL_ORDER = (
     # Glucose
     "bg_avg",
@@ -49,7 +66,7 @@ _INSITE_SIGNAL_ORDER = (
     "cycle_phase_ovulation",
     "cycle_phase_luteal",
     "cycle_phase_menstrual",
-    # Infusion site
+    # Infusion site (numeric fields; site_location string handled separately below)
     "days_since_change",
     "site_repeat",
     # Mood / stress
@@ -63,7 +80,12 @@ _INSITE_SIGNAL_ORDER = (
     "stress_acute",
     # Calendar
     "day_of_week",
+    # site_location one-hot (6 floats, one per _SITE_LOCATIONS entry — appended last)
+    *[f"site_loc_{loc}" for loc in _SITE_LOCATIONS],
 )
+
+# Keys that are intentionally not numeric and handled separately (not dropped silently).
+_NONFLOAT_KEYS = frozenset({"site_location"})
 
 
 def _signal_tensor(observation: dict[str, Any]) -> torch.Tensor:
@@ -71,23 +93,46 @@ def _signal_tensor(observation: dict[str, Any]) -> torch.Tensor:
     signals = observation.get("signals", {})
     if not isinstance(signals, dict):
         signals = {}
+
+    # Warn about any incoming keys that aren't in our signal order or the known non-float set.
+    unknown = set(signals.keys()) - set(_INSITE_SIGNAL_ORDER) - _NONFLOAT_KEYS
+    if unknown:
+        _log.warning(
+            "InSiteBridgeDomain received signal keys not in _INSITE_SIGNAL_ORDER — "
+            "they will be ignored. Add them to the plugin to include them: %s",
+            sorted(unknown),
+        )
+
     values: list[float] = []
     for key in _INSITE_SIGNAL_ORDER:
+        if key.startswith("site_loc_"):
+            # one-hot column — handled by the site_location block below
+            continue
         raw = signals.get(key, 0.0)
         try:
             values.append(float(raw))
         except (TypeError, ValueError):
             values.append(0.0)
+
+    # One-hot encode site_location
+    site_loc = signals.get("site_location", "")
+    for loc in _SITE_LOCATIONS:
+        values.append(1.0 if site_loc == loc else 0.0)
+
     return torch.tensor(values, dtype=torch.float32).view(1, 1, -1)
 
 
 class InSiteBridgeDomain(AbstractDomain):
     """Plugin-owned bridge domain for InSite/T1D observations."""
 
+    # Number of float features fed to the tokenizer.
+    # = all entries in _INSITE_SIGNAL_ORDER (the site_loc_* entries are the one-hot columns).
+    NUM_FEATURES: int = len(_INSITE_SIGNAL_ORDER)
+
     def __init__(self, embed_dim: int = 64, action_dim: int = 8) -> None:
         self._action_dim = action_dim
         self._tokenizer = TimeSeriesTokenizer(
-            num_features=len(_INSITE_SIGNAL_ORDER),
+            num_features=self.NUM_FEATURES,
             embed_dim=embed_dim,
             max_seq_len=8,
             domain_name="insite_t1d",
