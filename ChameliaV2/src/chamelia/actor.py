@@ -196,11 +196,14 @@ class Actor(nn.Module):
         reasoning_states: torch.Tensor,
         state_token: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Keep candidate 0 as the simple/null baseline across reasoning rounds."""
+        """Keep candidate 0 as the simple/null baseline across reasoning rounds.
+
+        The baseline uses the raw state encoding (no candidate-specific elaboration)
+        but retains learned action logits so that gradients can flow when it is selected.
+        """
         baseline_paths = candidate_paths.clone()
         baseline_postures = candidate_postures.clone()
         baseline_reasoning = reasoning_states.clone()
-        baseline_paths[:, 0, :, :] = 0.0
         baseline_postures[:, 0, :] = 0.0
         baseline_reasoning[:, 0, :] = state_token.squeeze(1)
         return baseline_paths, baseline_postures, baseline_reasoning
