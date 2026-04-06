@@ -82,7 +82,9 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
             return fallback_loss
 
         def engine_blunder_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
-            fallback_cost = (z.mean(dim=-1) - domain_state["target"].float().mean(dim=-1)).abs()
+            _ = z
+            fallback_answers = domain_state["answer_token"].long().clamp(min=0, max=action.shape[1] - 1)
+            fallback_cost = F.cross_entropy(action, fallback_answers, reduction="none")
             blunder_losses = domain_state.get("candidate_move_blunder_cp")
             candidate_tokens = domain_state.get("candidate_move_tokens")
             candidate_mask = domain_state.get("candidate_move_mask")
@@ -102,7 +104,6 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
                 max_loss = scaled_losses.max(dim=-1).values.clamp_min(1.0)
                 guided_cost = (normalized_candidate_probs * scaled_losses).sum(dim=-1) + off_candidate_penalty * max_loss
                 return torch.where(candidate_mask.any(dim=-1), guided_cost, fallback_cost)
-            _ = action
             return fallback_cost
 
         schedule = [

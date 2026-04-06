@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from training.curriculum.data.public_patterns import (
     DEFAULT_CURRICULUM_ROOT,
@@ -78,41 +79,38 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
         """
         self.data_root = Path(data_root) if data_root is not None else DEFAULT_CURRICULUM_ROOT
 
-        def prediction_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
-            _ = action
-            return (z.mean(dim=-1) - domain_state["target"].float().mean(dim=-1)).abs()
-
-        def regime_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
-            _ = action
-            return (z.std(dim=-1) - domain_state["regime"].float()).abs()
+        def next_token_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
+            _ = z
+            answers = domain_state["answer_token"].long().clamp(min=0, max=action.shape[1] - 1)
+            return F.cross_entropy(action, answers, reduction="none")
 
         schedule = [
-            make_level(0, "prediction error", [(prediction_cost, 1.0)], {"error_score": 0.70}, 64),
+            make_level(0, "prediction error", [(next_token_cost, 1.0)], {"error_score": 0.70}, 64),
             make_level(
                 1,
                 "uncertainty calibration",
-                [(prediction_cost, 0.7), (regime_cost, 0.3)],
+                [(next_token_cost, 1.0)],
                 {"error_score": 0.78, "calibration": 0.72},
                 64,
             ),
             make_level(
                 2,
                 "rule identification",
-                [(prediction_cost, 0.6), (regime_cost, 0.4)],
+                [(next_token_cost, 1.0)],
                 {"error_score": 0.84, "rule_probe": 0.80},
                 64,
             ),
             make_level(
                 3,
                 "regime detection",
-                [(prediction_cost, 0.5), (regime_cost, 0.5)],
+                [(next_token_cost, 1.0)],
                 {"error_score": 0.88, "regime_detection": 0.90},
                 64,
             ),
             make_level(
                 4,
                 "counterfactual prediction",
-                [(prediction_cost, 0.4), (regime_cost, 0.6)],
+                [(next_token_cost, 1.0)],
                 {"error_score": 0.92, "counterfactual": 0.90},
                 64,
             ),
@@ -156,6 +154,14 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
             probe_fn=probe_fn,
             sample_builder=sample_builder,
         )
+
+    def build_curriculum_batch(self, raw_batch, split):
+        """Attach answer-token supervision to the standard curriculum batch."""
+        batch = super().build_curriculum_batch(raw_batch, split)
+        answer_token = raw_batch["target"][:, -1].long()
+        batch.targets["answer_token"] = answer_token
+        batch.domain_state["answer_token"] = answer_token
+        return batch
 
     def build_runtime_domain(self, embed_dim: int):
         """Build a sequence-based runtime plugin for pattern domains."""

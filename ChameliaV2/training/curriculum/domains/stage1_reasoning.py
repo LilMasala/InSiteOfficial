@@ -222,9 +222,10 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
             resolved_vocab_size = 128 if domain_variant == "basic_arithmetic" else 8192
         self.data_root = Path(data_root) if data_root is not None else DEFAULT_CURRICULUM_ROOT
 
-        def outcome_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
-            _ = action
-            return (z.mean(dim=-1) - domain_state["target"].float().mean(dim=-1)).abs()
+        def next_token_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
+            _ = z
+            answers = domain_state["answer_token"].long().clamp(min=0, max=action.shape[1] - 1)
+            return F.cross_entropy(action, answers, reduction="none")
 
         def process_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
             _ = action
@@ -232,32 +233,32 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
             return -rewarder.compute_step_reward(z, z * 0.95, premises, domain_state["level"])
 
         schedule = [
-            make_level(0, "outcome correctness only", [(outcome_cost, 1.0)], {"accuracy": 0.60}, 64),
+            make_level(0, "outcome correctness only", [(next_token_cost, 1.0)], {"accuracy": 0.60}, 64),
             make_level(
                 1,
                 "hypothesis space monotonicity",
-                [(outcome_cost, 0.6), (process_cost, 0.4)],
+                [(next_token_cost, 0.6), (process_cost, 0.4)],
                 {"accuracy": 0.75, "consistency": 0.70},
                 64,
             ),
             make_level(
                 2,
                 "premise consistency",
-                [(outcome_cost, 0.5), (process_cost, 0.5)],
+                [(next_token_cost, 0.5), (process_cost, 0.5)],
                 {"accuracy": 0.85, "consistency": 0.80},
                 64,
             ),
             make_level(
                 3,
                 "parsimony",
-                [(outcome_cost, 0.5), (process_cost, 0.5)],
+                [(next_token_cost, 0.5), (process_cost, 0.5)],
                 {"accuracy": 0.92, "generalization": 0.80},
                 64,
             ),
             make_level(
                 4,
                 "generation quality",
-                [(outcome_cost, 0.4), (process_cost, 0.6)],
+                [(next_token_cost, 0.4), (process_cost, 0.6)],
                 {"accuracy": 0.95, "generalization": 0.90},
                 64,
             ),
@@ -495,17 +496,10 @@ class ArithmeticRuntimeDomain(AbstractDomain):
             z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]
         ) -> torch.Tensor:
             _ = z
-            answers = domain_state["answer"].long()
+            answers = domain_state["answer"].long().clamp(min=0, max=action.shape[1] - 1)
             return F.cross_entropy(action, answers, reduction="none")
 
-        def representation_alignment(
-            z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]
-        ) -> torch.Tensor:
-            _ = action
-            targets = domain_state["target"].float().mean(dim=-1)
-            return (z.mean(dim=-1) - targets).abs()
-
-        return [(answer_cross_entropy, 0.8), (representation_alignment, 0.2)]
+        return [(answer_cross_entropy, 1.0)]
 
     def get_domain_state(self, observation: Any) -> dict:
         """Build arithmetic domain state from a token observation."""
@@ -605,14 +599,7 @@ class PublicReasoningRuntimeDomain(AbstractDomain):
             answers = domain_state["answer_token"].long().clamp(min=0, max=action.shape[1] - 1)
             return F.cross_entropy(action, answers, reduction="none")
 
-        def representation_alignment(
-            z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]
-        ) -> torch.Tensor:
-            _ = action
-            targets = domain_state["target"].float().mean(dim=-1)
-            return (z.mean(dim=-1) - targets).abs()
-
-        return [(answer_supervision, 0.85), (representation_alignment, 0.15)]
+        return [(answer_supervision, 1.0)]
 
     def get_domain_state(self, observation: Any) -> dict:
         """Build a generic reasoning domain state.
