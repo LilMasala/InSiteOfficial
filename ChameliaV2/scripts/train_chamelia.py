@@ -361,7 +361,7 @@ def build_stage_domains(
                 if domain_name == "basic_arithmetic"
                 else _domain_batch_size(stage1_cfg, 16)
             ),
-            seq_len=(8 if domain_name == "basic_arithmetic" else 256),
+            seq_len=(8 if domain_name == "basic_arithmetic" else 196),
             data_root=data_root,
         )
         for domain_name in stage1_cfg["domains"]
