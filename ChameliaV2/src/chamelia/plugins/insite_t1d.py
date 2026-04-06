@@ -11,15 +11,58 @@ from src.chamelia.tokenizers import TimeSeriesTokenizer
 
 from .base import AbstractDomain
 
+# All signals emitted by FeatureFrameHourly.to_signal_dict(), in a fixed order.
+# Raw values are passed directly — the TimeSeriesTokenizer's learned nn.Linear +
+# LayerNorm handles scale differences across features.
 _INSITE_SIGNAL_ORDER = (
+    # Glucose
     "bg_avg",
     "tir_7d",
     "pct_low_7d",
     "pct_high_7d",
-    "bg_var",
+    "uroc",
+    "bg_delta_7h",
+    "bg_z_7h",
+    # Heart rate
+    "heart_rate",
+    "hr_delta_7h",
+    "hr_z_7h",
+    "resting_hr",
+    # Energy / activity
+    "active_kcal",
+    "kcal_last3h",
+    "kcal_last6h",
+    "active_kcal_delta7h",
+    "active_kcal_z7h",
+    # Sleep
+    "sleep_total_min",
+    "sleep_debt_7d",
+    "mins_since_wake",
+    # Exercise
+    "move_mins",
     "exercise_mins",
-    "cycle_phase_menstrual",
+    "exercise_last3h",
+    "hours_since_exercise",
+    # Menstrual cycle
+    "cycle_day",
+    "cycle_phase_follicular",
+    "cycle_phase_ovulation",
     "cycle_phase_luteal",
+    "cycle_phase_menstrual",
+    # Infusion site
+    "days_since_change",
+    "site_repeat",
+    # Mood / stress
+    "valence",
+    "arousal",
+    "quad_pos_pos",
+    "quad_pos_neg",
+    "quad_neg_pos",
+    "quad_neg_neg",
+    "hours_since_mood",
+    "stress_acute",
+    # Calendar
+    "day_of_week",
 )
 
 
@@ -32,16 +75,9 @@ def _signal_tensor(observation: dict[str, Any]) -> torch.Tensor:
     for key in _INSITE_SIGNAL_ORDER:
         raw = signals.get(key, 0.0)
         try:
-            value = float(raw)
+            values.append(float(raw))
         except (TypeError, ValueError):
-            value = 0.0
-        if key == "bg_avg":
-            value = value / 250.0
-        elif key in {"exercise_mins"}:
-            value = min(max(value / 120.0, 0.0), 2.0)
-        else:
-            value = min(max(value, -2.0), 2.0)
-        values.append(value)
+            values.append(0.0)
     return torch.tensor(values, dtype=torch.float32).view(1, 1, -1)
 
 
@@ -131,10 +167,7 @@ class InSiteBridgeDomain(AbstractDomain):
             "tir_7d": scalar("tir_7d", 0.65),
             "pct_low_7d": scalar("pct_low_7d", 0.02),
             "pct_high_7d": scalar("pct_high_7d", 0.20),
-            "bg_var": scalar("bg_var", 0.12),
-            "exercise_mins": scalar("exercise_mins", 0.0),
-            "cycle_phase_menstrual": scalar("cycle_phase_menstrual", 0.0),
-            "cycle_phase_luteal": scalar("cycle_phase_luteal", 0.0),
+            "bg_var": scalar("uroc", 0.0),  # used by volatility_cost
             "signals": signals,
         }
 
@@ -158,7 +191,6 @@ class InSiteBridgeDomain(AbstractDomain):
                 domain_state["tir_7d"],
                 domain_state["pct_low_7d"],
                 domain_state["pct_high_7d"],
-                domain_state["exercise_mins"],
             ],
             dim=-1,
         )
