@@ -208,37 +208,33 @@ class LanguageCurriculumDomain(BaseCurriculumDomain):
             answers = domain_state["answer_token"].long().clamp(min=0, max=action.shape[1] - 1)
             return F.cross_entropy(action, answers, reduction="none")
 
-        def representation_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict[str, Any]) -> torch.Tensor:
-            _ = action
-            return (z.mean(dim=-1) - domain_state["target"].float().mean(dim=-1)).abs()
-
         schedule = [
-            make_level(0, "masked next-token prediction", [(next_token_cost, 0.8), (representation_cost, 0.2)], {"token_accuracy": 0.55}, 512),
+            make_level(0, "masked next-token prediction", [(next_token_cost, 1.0)], {"token_accuracy": 0.55}, 512),
             make_level(
                 1,
                 "sentence continuity",
-                [(next_token_cost, 0.75), (representation_cost, 0.25)],
+                [(next_token_cost, 1.0)],
                 {"token_accuracy": 0.65, "consistency": 0.7},
                 512,
             ),
             make_level(
                 2,
                 "document semantics",
-                [(next_token_cost, 0.7), (representation_cost, 0.3)],
+                [(next_token_cost, 1.0)],
                 {"token_accuracy": 0.75, "generalization": 0.72},
                 1024,
             ),
             make_level(
                 3,
                 "long-context abstraction",
-                [(next_token_cost, 0.65), (representation_cost, 0.35)],
+                [(next_token_cost, 1.0)],
                 {"token_accuracy": 0.82, "generalization": 0.78},
                 1024,
             ),
             make_level(
                 4,
                 "cross-domain transfer",
-                [(next_token_cost, 0.6), (representation_cost, 0.4)],
+                [(next_token_cost, 1.0)],
                 {"token_accuracy": 0.88, "generalization": 0.82},
                 1024,
             ),
