@@ -206,22 +206,25 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
         if model is None:
             return super().run_advancement_probe(model, level)
 
-        runtime_domain = getattr(model, "domain", None)
-        if runtime_domain is None or getattr(runtime_domain, "domain_name", "") != self.spec.name:
-            return super().run_advancement_probe(model, level)
-
         device = next(model.parameters()).device
         previous_domain = getattr(model, "domain", None)
-        train_acc = self._probe_split_accuracy(model, level, split="train", device=device)
-        val_acc = self._probe_split_accuracy(model, level, split="val", device=device)
-        if previous_domain is not None:
-            model.set_domain(previous_domain)
 
-        return {
-            "game_score": val_acc,
-            "blunder_rate": val_acc,
-            "plan_accuracy": max(0.0, 1.0 - abs(train_acc - val_acc)),
-        }
+        runtime_domain = self.build_runtime_domain(model.embed_dim)
+        if runtime_domain is None:
+            return super().run_advancement_probe(model, level)
+        model.set_domain(runtime_domain)
+
+        try:
+            train_acc = self._probe_split_accuracy(model, level, split="train", device=device)
+            val_acc = self._probe_split_accuracy(model, level, split="val", device=device)
+            return {
+                "game_score": val_acc,
+                "blunder_rate": val_acc,
+                "plan_accuracy": max(0.0, 1.0 - abs(train_acc - val_acc)),
+            }
+        finally:
+            if previous_domain is not None:
+                model.set_domain(previous_domain)
 
     def _probe_split_accuracy(
         self,

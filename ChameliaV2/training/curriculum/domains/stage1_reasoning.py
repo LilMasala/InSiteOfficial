@@ -373,33 +373,33 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
         if model is None:
             return super().run_advancement_probe(model, level)
 
-        runtime_domain = getattr(model, "domain", None)
-        if runtime_domain is None or getattr(runtime_domain, "domain_name", "") != self.spec.name:
-            return super().run_advancement_probe(model, level)
-
         device = next(model.parameters()).device
         previous_domain = getattr(model, "domain", None)
-        if self.spec.name == "basic_arithmetic":
-            accuracy = self._probe_split_accuracy(model, runtime_domain, level, split="train", device=device)
+
+        runtime_domain = self.build_runtime_domain(model.embed_dim)
+        if runtime_domain is None:
+            return super().run_advancement_probe(model, level)
+        model.set_domain(runtime_domain)
+
+        try:
+            if self.spec.name == "basic_arithmetic":
+                accuracy = self._probe_split_accuracy(model, runtime_domain, level, split="train", device=device)
+                return {
+                    "accuracy": accuracy,
+                    "consistency": min(0.99, accuracy + 0.03),
+                    "generalization": min(0.99, accuracy + 0.02),
+                }
+
+            train_acc = self._probe_split_accuracy(model, runtime_domain, level, split="train", device=device)
+            val_acc = self._probe_split_accuracy(model, runtime_domain, level, split="val", device=device)
+            return {
+                "accuracy": val_acc,
+                "consistency": max(0.0, 1.0 - abs(train_acc - val_acc)),
+                "generalization": val_acc,
+            }
+        finally:
             if previous_domain is not None:
                 model.set_domain(previous_domain)
-            return {
-                "accuracy": accuracy,
-                "consistency": min(0.99, accuracy + 0.03),
-                "generalization": min(0.99, accuracy + 0.02),
-            }
-
-        train_acc = self._probe_split_accuracy(model, runtime_domain, level, split="train", device=device)
-        val_acc = self._probe_split_accuracy(model, runtime_domain, level, split="val", device=device)
-        if previous_domain is not None:
-            model.set_domain(previous_domain)
-
-        accuracy = val_acc
-        return {
-            "accuracy": accuracy,
-            "consistency": max(0.0, 1.0 - abs(train_acc - val_acc)),
-            "generalization": val_acc,
-        }
 
     def _probe_split_accuracy(
         self,
