@@ -32,13 +32,18 @@ class LogicProblemGenerator:
         self.vocab_size = vocab_size
         self.seq_len = seq_len
 
-    def sample(self, level: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generate one synthetic premise/conclusion example."""
+    def sample(self, level: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate one synthetic premise/conclusion example.
+
+        Returns:
+            Tuple of (tokens, target, answer) where answer is the conclusion token.
+        """
         premise_len = min(self.seq_len - 4, 8 + level)
         premise = torch.randint(1, self.vocab_size // 8, (premise_len,))
-        conclusion = torch.tensor([premise.sum().item() % self.vocab_size], dtype=torch.long)
+        conclusion_val = int(premise.sum().item() % max(1, self.vocab_size - 1)) + 1
+        conclusion = torch.tensor([conclusion_val], dtype=torch.long)
         tokens = torch.zeros(self.seq_len, dtype=torch.long)
         tokens[:premise_len] = premise
         tokens[premise_len] = 99  # toy implication token
         tokens[premise_len + 1] = conclusion
-        return tokens, tokens.clone()
+        return tokens, tokens.clone(), conclusion.squeeze(0)

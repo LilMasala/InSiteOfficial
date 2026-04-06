@@ -107,7 +107,7 @@ training:
   memory_outcome_delay: 30
   store_to_memory: true
   critic_loss_weight: 1.0
-  mode1_distill_weight: 0.05
+  mode1_distill_weight: 0.001
   representation_loss_weight: 1.0
   stage0_tc_weight: 0.0
   stage0_disable_memory_replay_losses: true

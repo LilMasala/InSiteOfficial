@@ -29,10 +29,11 @@ if [[ -f "${HOME}/.bashrc" ]]; then
   source "${HOME}/.bashrc"
 fi
 
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-chameliav2}"
 if [[ -n "${MAMBA_ENV_NAME:-}" ]] && command -v micromamba >/dev/null 2>&1; then
   eval "$(micromamba shell hook --shell bash)"
   micromamba activate "${MAMBA_ENV_NAME}"
-elif [[ -n "${CONDA_ENV_NAME:-}" ]] && command -v conda >/dev/null 2>&1; then
+elif command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
   conda activate "${CONDA_ENV_NAME}"
 fi

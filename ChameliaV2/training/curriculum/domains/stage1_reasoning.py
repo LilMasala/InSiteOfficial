@@ -190,10 +190,9 @@ def _reasoning_samples(level: int, split: str, spec: DomainSpec) -> list[dict[st
         if "arithmetic" in spec.name or (index % 4 == 0 and split == "train"):
             tokens, target = arithmetic_generator.sample(level)
             answer = target[target != 0][-1].long()
-            samples.append({"tokens": tokens, "target": target, "answer": answer})
         else:
-            tokens, target = logic_generator.sample(level)
-            samples.append({"tokens": tokens, "target": target})
+            tokens, target, answer = logic_generator.sample(level)
+        samples.append({"tokens": tokens, "target": target, "answer": answer})
     return samples
 
 
