@@ -10,6 +10,7 @@ model:
   fpn_feature_dim: 512
   fpn_fusion_method: "add"
   use_rope: true
+  sequence_mode: true  # 1D RoPE for token sequences — no 196-token limit
   use_flash_attention: true
   use_layerscale: true
   layerscale_init: 1.0e-5

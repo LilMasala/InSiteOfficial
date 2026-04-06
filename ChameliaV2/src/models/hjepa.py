@@ -78,6 +78,7 @@ class HJEPA(nn.Module):
         use_layerscale: bool = False,
         layerscale_init: float = 1e-5,
         use_flash_attention: bool = True,
+        sequence_mode: bool = False,
     ) -> None:
         super().__init__()
 
@@ -108,6 +109,7 @@ class HJEPA(nn.Module):
             use_flash_attention=use_flash_attention,
             use_layerscale=use_layerscale,
             layerscale_init=layerscale_init,
+            sequence_mode=sequence_mode,
         )
 
         # Override EMA parameters for target encoder

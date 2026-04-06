@@ -303,6 +303,61 @@ class VisionRoPE2D(nn.Module):
         return freqs_y, freqs_x
 
 
+class SequenceRoPE1D(nn.Module):
+    """
+    1D Rotary Position Embeddings for arbitrary-length token sequences.
+
+    Unlike VisionRoPE2D (which encodes 2D spatial patches for a fixed 14x14 image
+    grid), this encodes flat token positions [0, 1, 2, ...] with no upper bound.
+    The rotation math is identical — only the position indexing changes.
+
+    Frequencies are precomputed up to max_seq_len and cached as buffers.
+    Any sequence length up to max_seq_len is supported without recomputation.
+
+    Args:
+        dim: Head dimension (must be even).
+        max_seq_len: Maximum sequence length to precompute (default: 4096).
+        theta: Base frequency (default: 10000.0, same as original RoPE paper).
+    """
+
+    def __init__(self, dim: int, max_seq_len: int = 4096, theta: float = 10000.0) -> None:
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"Head dim must be even for RoPE, got {dim}")
+        self.dim = dim
+        self.theta = theta
+        # freq_bands shape: [dim//2]  — theta^(-2i/d) for i in 0..dim//2
+        freq_bands = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # positions shape: [max_seq_len]
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        # angles shape: [max_seq_len, dim//2]
+        angles = torch.outer(positions, freq_bands)
+        self.register_buffer("cos_cached", angles.cos(), persistent=False)
+        self.register_buffer("sin_cached", angles.sin(), persistent=False)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply 1D RoPE to query and key tensors.
+
+        Args:
+            q: [batch, num_heads, seq_len, head_dim]
+            k: [batch, num_heads, seq_len, head_dim]
+
+        Returns:
+            Rotated (q, k) with the same shape.
+        """
+        N = q.shape[2]
+        cos = cast(torch.Tensor, self.cos_cached)[:N][None, None, :, :]  # [1,1,N,D//2]
+        sin = cast(torch.Tensor, self.sin_cached)[:N][None, None, :, :]
+        return self._apply(q, cos, sin), self._apply(k, cos, sin)
+
+    @staticmethod
+    def _apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        rotated = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        return rotated.flatten(-2)
+
+
 class RoPEAttentionWrapper(nn.Module):
     """
     Wrapper around timm's attention module to inject RoPE.
@@ -324,7 +379,7 @@ class RoPEAttentionWrapper(nn.Module):
     def __init__(
         self,
         attn_module: nn.Module,
-        rope_module: VisionRoPE2D,
+        rope_module: VisionRoPE2D | SequenceRoPE1D,
         use_flash_attention: bool = False,
         use_mps_optimization: bool = True,  # Enable MPS optimization by default on Apple Silicon
     ):
@@ -385,26 +440,27 @@ class RoPEAttentionWrapper(nn.Module):
         if self.k_norm is not None:
             k = self.k_norm(k)
 
-        # Calculate grid dimensions (excluding CLS token)
-        num_patches = N - 1 if N > 1 else N  # Account for CLS token
-        grid_size = int(math.sqrt(num_patches))
-
-        # Apply RoPE to Q and K (skip CLS token if present)
-        if N > 1:  # Has CLS token
+        # Apply RoPE to Q and K — skip CLS token (position 0) if present.
+        # SequenceRoPE1D: call directly, no grid args needed.
+        # VisionRoPE2D: infer square grid from patch count.
+        if N > 1:
             q_cls, q_patches = q[:, :, :1, :], q[:, :, 1:, :]
             k_cls, k_patches = k[:, :, :1, :], k[:, :, 1:, :]
-
-            # Apply RoPE only to patch tokens
-            q_patches_rope, k_patches_rope = self.rope(
-                q_patches, k_patches, num_patches_h=grid_size, num_patches_w=grid_size
-            )
-
-            # Concatenate CLS token back
+            if isinstance(self.rope, SequenceRoPE1D):
+                q_patches_rope, k_patches_rope = self.rope(q_patches, k_patches)
+            else:
+                grid_size = int(math.sqrt(N - 1))
+                q_patches_rope, k_patches_rope = self.rope(
+                    q_patches, k_patches, num_patches_h=grid_size, num_patches_w=grid_size
+                )
             q = torch.cat([q_cls, q_patches_rope], dim=2)
             k = torch.cat([k_cls, k_patches_rope], dim=2)
         else:
-            # No CLS token, apply RoPE to all tokens
-            q, k = self.rope(q, k, num_patches_h=grid_size, num_patches_w=grid_size)
+            if isinstance(self.rope, SequenceRoPE1D):
+                q, k = self.rope(q, k)
+            else:
+                grid_size = int(math.sqrt(N))
+                q, k = self.rope(q, k, num_patches_h=grid_size, num_patches_w=grid_size)
 
         # Compute attention using optimal backend
         if self.use_flash:
@@ -477,6 +533,7 @@ class ContextEncoder(nn.Module):
         use_mps_optimization: bool = True,  # Enable MPS optimization by default
         use_layerscale: bool = False,  # Add LayerScale support
         layerscale_init: float = 1e-5,  # Initial value for LayerScale
+        sequence_mode: bool = False,  # Use 1D RoPE for token sequences instead of 2D image patches
     ):
         super().__init__()
 
@@ -506,22 +563,34 @@ class ContextEncoder(nn.Module):
         # Flash Attention configuration
         self.use_flash_attention = use_flash_attention
 
-        # RoPE configuration
-        self.use_rope = use_rope
-        if use_rope:
-            # Get head dimension from first attention block
+        # sequence_mode: use 1D RoPE for token sequences (no fixed-length pos_embed limit)
+        self.sequence_mode = sequence_mode
+
+        # RoPE configuration — sequence_mode forces use_rope=True with SequenceRoPE1D
+        self.use_rope = use_rope or sequence_mode
+        if self.use_rope:
             num_heads: int = self.vit.blocks[0].attn.num_heads  # type: ignore[index, union-attr]
             head_dim = self.embed_dim // num_heads
 
-            # Create RoPE module
-            self.rope = VisionRoPE2D(
-                dim=head_dim,
-                patch_size=self.patch_size,
-                num_patches_per_side=self.grid_size,
-                theta=rope_theta,
-            )
+            if sequence_mode:
+                # 1D RoPE: no length limit, positions are flat token indices
+                self.rope: VisionRoPE2D | SequenceRoPE1D = SequenceRoPE1D(
+                    dim=head_dim,
+                    theta=rope_theta,
+                )
+                # Absolute pos_embed is meaningless for sequences — zero it out so it
+                # contributes nothing, and skip the addition in forward() to avoid the
+                # shape mismatch when seq_len > num_image_patches.
+                self.vit.pos_embed.data.zero_()
+            else:
+                self.rope = VisionRoPE2D(
+                    dim=head_dim,
+                    patch_size=self.patch_size,
+                    num_patches_per_side=self.grid_size,
+                    theta=rope_theta,
+                )
 
-            # Wrap all attention layers with RoPE
+            # Wrap all attention layers with the chosen RoPE module
             for block in self.vit.blocks:  # type: ignore[union-attr]
                 block.attn = RoPEAttentionWrapper(
                     block.attn,
@@ -529,10 +598,6 @@ class ContextEncoder(nn.Module):
                     use_flash_attention=use_flash_attention,
                     use_mps_optimization=use_mps_optimization,
                 )
-
-            # When using RoPE, we can optionally reduce or remove absolute position embeddings
-            # Here we keep them but they can be set to zero or removed
-            # self.vit.pos_embed.data.zero_()  # Uncomment to disable absolute pos embeddings
 
         # LayerScale configuration
         self.use_layerscale = use_layerscale
@@ -611,10 +676,11 @@ class ContextEncoder(nn.Module):
         cls_token = self.vit.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_token, x), dim=1)
 
-        # Add positional embeddings
-        # Note: When using RoPE, absolute embeddings are less critical
-        # but we keep them for backward compatibility and hybrid approaches
-        x = x + self.vit.pos_embed[:, : x.shape[1], :]
+        # Add positional embeddings.
+        # In sequence_mode the pos_embed is zeroed and skipped — 1D RoPE handles
+        # position via Q/K rotation, and seq_len may exceed the ViT's 197-slot table.
+        if not self.sequence_mode:
+            x = x + self.vit.pos_embed[:, : x.shape[1], :]
         x = self.vit.pos_drop(x)
 
         # Apply mask if provided (set masked patches to zero)
@@ -696,6 +762,7 @@ class TargetEncoder(nn.Module):
         use_mps_optimization: bool = True,  # Enable MPS optimization by default
         use_layerscale: bool = False,  # Add LayerScale support
         layerscale_init: float = 1e-5,  # Initial value for LayerScale
+        sequence_mode: bool = False,
     ):
         super().__init__()
 
@@ -727,22 +794,26 @@ class TargetEncoder(nn.Module):
         # Flash Attention configuration
         self.use_flash_attention = use_flash_attention
 
-        # RoPE configuration
-        self.use_rope = use_rope
-        if use_rope:
-            # Get head dimension from first attention block
+        self.sequence_mode = sequence_mode
+        self.use_rope = use_rope or sequence_mode
+        if self.use_rope:
             num_heads: int = self.vit.blocks[0].attn.num_heads  # type: ignore[index, union-attr]
             head_dim = self.embed_dim // num_heads
 
-            # Create RoPE module
-            self.rope = VisionRoPE2D(
-                dim=head_dim,
-                patch_size=self.patch_size,
-                num_patches_per_side=self.grid_size,
-                theta=rope_theta,
-            )
+            if sequence_mode:
+                self.rope: VisionRoPE2D | SequenceRoPE1D = SequenceRoPE1D(
+                    dim=head_dim,
+                    theta=rope_theta,
+                )
+                self.vit.pos_embed.data.zero_()
+            else:
+                self.rope = VisionRoPE2D(
+                    dim=head_dim,
+                    patch_size=self.patch_size,
+                    num_patches_per_side=self.grid_size,
+                    theta=rope_theta,
+                )
 
-            # Wrap all attention layers with RoPE
             for block in self.vit.blocks:  # type: ignore[union-attr]
                 block.attn = RoPEAttentionWrapper(
                     block.attn,
@@ -819,8 +890,9 @@ class TargetEncoder(nn.Module):
         cls_token = self.vit.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_token, x), dim=1)
 
-        # Add positional embeddings
-        x = x + self.vit.pos_embed
+        # Add positional embeddings (skipped in sequence_mode — 1D RoPE handles position)
+        if not self.sequence_mode:
+            x = x + self.vit.pos_embed[:, : x.shape[1], :]
         x = self.vit.pos_drop(x)
 
         # Pass through transformer blocks
@@ -885,6 +957,7 @@ def create_encoder(
     use_mps_optimization: bool = True,
     use_layerscale: bool = False,
     layerscale_init: float = 1e-5,
+    sequence_mode: bool = False,
 ) -> tuple[ContextEncoder, TargetEncoder]:
     """
     Factory function to create context and target encoders.
@@ -922,6 +995,7 @@ def create_encoder(
         use_mps_optimization=use_mps_optimization,
         use_layerscale=use_layerscale,
         layerscale_init=layerscale_init,
+        sequence_mode=sequence_mode,
     )
 
     target_encoder = TargetEncoder(
@@ -935,6 +1009,7 @@ def create_encoder(
         use_mps_optimization=use_mps_optimization,
         use_layerscale=use_layerscale,
         layerscale_init=layerscale_init,
+        sequence_mode=sequence_mode,
     )
 
     # Initialize target encoder with context encoder weights

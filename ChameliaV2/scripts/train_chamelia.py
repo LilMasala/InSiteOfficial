@@ -361,7 +361,7 @@ def build_stage_domains(
                 if domain_name == "basic_arithmetic"
                 else _domain_batch_size(stage1_cfg, 16)
             ),
-            seq_len=(8 if domain_name == "basic_arithmetic" else 196),
+            seq_len=(8 if domain_name == "basic_arithmetic" else 256),
             data_root=data_root,
         )
         for domain_name in stage1_cfg["domains"]
@@ -705,6 +705,7 @@ def build_model(
             use_layerscale=bool(model_cfg.get("use_layerscale", False)),
             layerscale_init=float(model_cfg.get("layerscale_init", 1.0e-5)),
             use_flash_attention=bool(model_cfg.get("use_flash_attention", True)),
+            sequence_mode=bool(model_cfg.get("sequence_mode", False)),
         )
     else:
         raise ValueError(f"Unsupported backbone mode '{backbone_mode}'.")

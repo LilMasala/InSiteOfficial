@@ -34,6 +34,7 @@ class EMAConfig(BaseModel):
 class RoPEConfig(BaseModel):
     use_rope: bool = False
     theta: float = 10000.0
+    sequence_mode: bool = False  # Use 1D RoPE for token sequences (no 196-token limit)
 
 
 class FPNConfig(BaseModel):
