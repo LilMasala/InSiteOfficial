@@ -52,7 +52,7 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
         self,
         domain_variant: str = "chess",
         batch_size: int = 8,
-        seq_len: int = 69,
+        seq_len: int = 128,
         data_root: str | Path | None = None,
     ) -> None:
         """Initialize a strategic game domain variant."""
@@ -143,7 +143,8 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
             }
 
         def sample_builder(level: int, split: str, spec: DomainSpec) -> list[dict[str, torch.Tensor]]:
-            key = (level, split, spec.seq_len, spec.dataset_size)
+            max_samples = spec.dataset_size if split == "train" else spec.dataset_size // 4
+            key = (level, split, spec.seq_len, max_samples)
             cached = self._sample_cache.get(key)
             if cached is not None:
                 return cached
@@ -152,7 +153,7 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
                 split=split,
                 vocab_size=spec.vocab_size,
                 seq_len=spec.seq_len,
-                max_samples=spec.dataset_size,
+                max_samples=max_samples,
                 data_root=self.data_root,
             )
             samples = public_samples or _game_samples(level, split, spec)
@@ -167,7 +168,7 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
                 vocab_size=vocab_size,
                 batch_size=batch_size,
                 seq_len=seq_len,
-                dataset_size=256,
+                dataset_size=4096,
             ),
             masking_strategy=GameMaskingStrategy(),
             cost_schedule=schedule,
@@ -195,10 +196,15 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
             "candidate_move_blunder_cp",
             "principal_variation_tokens",
             "centipawn_eval",
+            "best_move_token",
         ):
             if key in raw_batch:
                 batch.targets[key] = raw_batch[key]
                 batch.domain_state[key] = raw_batch[key]
+        # If best_move_token present, override answer_token for probe accuracy
+        if "best_move_token" in raw_batch:
+            batch.targets["answer_token"] = raw_batch["best_move_token"]
+            batch.domain_state["answer_token"] = raw_batch["best_move_token"]
         return batch
 
     def run_advancement_probe(self, model: Any, level: int) -> dict[str, float]:

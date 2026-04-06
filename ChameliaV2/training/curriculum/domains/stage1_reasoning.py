@@ -274,12 +274,14 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
 
         def sample_builder(level: int, split: str, spec: DomainSpec) -> list[dict[str, torch.Tensor]]:
             if domain_variant != "basic_arithmetic":
+                # Use full available data for val/probe; cap training to dataset_size
+                max_samples = spec.dataset_size if split == "train" else spec.dataset_size * 8
                 public_samples = load_public_reasoning_samples(
                     domain_variant=domain_variant,
                     split=split,
                     vocab_size=spec.vocab_size,
                     seq_len=spec.seq_len,
-                    max_samples=spec.dataset_size,
+                    max_samples=max_samples,
                     data_root=self.data_root,
                 )
                 if public_samples:
@@ -294,7 +296,7 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
                 vocab_size=resolved_vocab_size,
                 batch_size=batch_size,
                 seq_len=seq_len,
-                dataset_size=(64 if domain_variant == "basic_arithmetic" else 256),
+                dataset_size=(512 if domain_variant == "basic_arithmetic" else 8192),
             ),
             masking_strategy=ReasoningMaskingStrategy(domain_variant=domain_variant),
             cost_schedule=schedule,

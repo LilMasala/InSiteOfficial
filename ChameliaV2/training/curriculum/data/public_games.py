@@ -161,8 +161,28 @@ def _moves_from_sgf(text: str) -> list[list[str]]:
 
 
 def _record_to_sequence(record: dict, *, vocab_size: int, seq_len: int) -> dict | tuple[list[str], float] | None:
-    """Extract a structured move/action sequence from one record."""
-    for key in ("moves", "actions", "trajectory", "events"):
+    """Extract a structured move/action sequence from one record.
+
+    Chess records use ``moves`` (full game move list) as context and
+    ``best_move`` as the answer to predict. The annotation block carries
+    candidate move scores from the engine.
+    """
+    # Chess: moves is the game context, best_move is the supervised answer
+    best_move = record.get("best_move")
+    moves_list = record.get("moves")
+    if isinstance(moves_list, list) and moves_list and isinstance(best_move, str) and best_move.strip():
+        items = [str(m).strip() for m in moves_list if str(m).strip()]
+        if not items:
+            items = [best_move.strip()]
+        regime = float("win" in str(record.get("result", "")).lower())
+        annotation = _candidate_annotation_from_record(record, vocab_size=vocab_size, seq_len=seq_len)
+        # Override answer token to be best_move specifically
+        annotation["best_move_token"] = torch.tensor(
+            token_id_for_text(best_move.strip(), vocab_size), dtype=torch.long
+        )
+        return {"items": items, "regime": regime, "annotation": annotation}
+
+    for key in ("actions", "trajectory", "events"):
         value = record.get(key)
         if isinstance(value, list) and value:
             items: list[str] = []

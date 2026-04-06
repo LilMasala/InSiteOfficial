@@ -27,7 +27,7 @@ DEFAULT_CURRICULUM_ROOT = PROJECT_ROOT / "data" / "curriculum"
 SPLIT_ALIASES = {
     "train": ("train",),
     "val": ("validation", "valid", "val", "dev", "test"),
-    "test": ("test", "eval", "evaluation"),
+    "test": ("test", "eval", "evaluation", "dev"),
 }
 
 
@@ -119,16 +119,25 @@ def _candidate_files(dataset_dir: Path, split: str, keywords: tuple[str, ...]) -
     Args:
         dataset_dir: Dataset root.
         split: Requested split.
-        keywords: Optional path keywords.
+        keywords: Optional path keywords to filter by filename stem (not full path).
 
     Returns:
-        Sorted file paths.
+        Sorted file paths, excluding hidden cache directories.
     """
     if not dataset_dir.exists():
         return []
-    files = sorted(path for path in dataset_dir.rglob("*") if path.suffix.lower() in SUPPORTED_SUFFIXES)
+    files = sorted(
+        path for path in dataset_dir.rglob("*")
+        if path.suffix.lower() in SUPPORTED_SUFFIXES
+        and ".cache" not in path.parts
+    )
     if keywords:
-        files = [path for path in files if any(keyword in str(path).lower() for keyword in keywords)]
+        # Match keywords against the file stem only, not the full path, so
+        # agieval/test/lsat-ar.jsonl matches keyword "lsat-ar" but not "test".
+        files = [
+            path for path in files
+            if any(keyword in path.stem.lower() for keyword in keywords)
+        ]
     if not files:
         return []
     split_specific = [path for path in files if _split_matches(path, split)]
@@ -318,7 +327,7 @@ def _extract_answer_text(record: dict[str, Any]) -> str:
     Returns:
         Canonical answer text.
     """
-    answer = _extract_text(record, ("answer", "solution", "output", "completion", "response", "final_answer"))
+    answer = _extract_text(record, ("answer", "solution", "output", "completion", "response", "final_answer", "explanation"))
     if answer:
         match = re.findall(r"####\s*([^\n]+)", answer)
         if match:
@@ -382,6 +391,10 @@ def _normalize_label_record(
 ) -> dict[str, torch.Tensor] | None:
     """Normalize an entailment/label-style reasoning record.
 
+    Handles ProofWriter (theory+question, answer=True/False),
+    FOLIO (premises+conclusion+label), and generic entailment datasets.
+    True/False answers are converted to binary MCQ (A=True, B=False).
+
     Args:
         record: Source record.
         vocab_size: Vocabulary size V.
@@ -390,6 +403,8 @@ def _normalize_label_record(
     Returns:
         Normalized sample dictionary or ``None``.
     """
+    # ProofWriter: theory (facts+rules) + question
+    theory = _extract_text(record, ("theory",))
     question = _extract_text(record, ("question", "query", "prompt"))
     context = _extract_text(record, ("premise", "premises", "context", "facts"))
     hypothesis = _extract_text(record, ("hypothesis", "conclusion", "claim", "statement"))
@@ -402,8 +417,11 @@ def _normalize_label_record(
         label_text = ""
     if not label_text:
         return None
+
     prompt_parts = []
-    if context:
+    if theory:
+        prompt_parts.append(f"Facts: {theory}")
+    elif context:
         prompt_parts.append(f"Facts: {context}")
     if hypothesis:
         prompt_parts.append(f"Hypothesis: {hypothesis}")
@@ -411,6 +429,31 @@ def _normalize_label_record(
         prompt_parts.append(f"Question: {question}")
     if not prompt_parts:
         return None
+
+    # Convert True/False answers to binary MCQ (A=True, B=False)
+    normalized_label = label_text.lower()
+    if normalized_label in ("true", "false", "yes", "no", "0", "1", "entailment", "contradiction", "neutral"):
+        binary_choices = ["True", "False"]
+        if normalized_label in ("true", "yes", "1", "entailment"):
+            correct_idx = 0
+        else:
+            correct_idx = 1
+        choice_tokens, choice_mask = _choice_tensor(2, vocab_size)
+        answer_token = choice_tokens[correct_idx].clone()
+        prompt = (
+            " ".join(prompt_parts)
+            + " Choices: A. True B. False"
+        )
+        return {
+            "tokens": encode_reasoning_text(prompt, vocab_size=vocab_size, seq_len=seq_len),
+            "target": _default_target(f"Answer: {chr(ord('A') + correct_idx)}", vocab_size=vocab_size, seq_len=seq_len),
+            "answer": answer_token.long(),
+            "choice_tokens": choice_tokens.long(),
+            "choice_mask": choice_mask,
+            "correct_choice": torch.tensor(correct_idx, dtype=torch.long),
+        }
+
+    # Generic label — hash into vocab as-is
     target_text = f"Label: {label_text}"
     return {
         "tokens": encode_reasoning_text(" ".join(prompt_parts), vocab_size=vocab_size, seq_len=seq_len),
@@ -422,12 +465,89 @@ def _normalize_label_record(
     }
 
 
+def _extract_numeric_value(text: str) -> float | None:
+    """Try to parse a numeric value from an answer string.
+
+    Args:
+        text: Answer text.
+
+    Returns:
+        Float value or ``None`` if not numeric.
+    """
+    cleaned = text.strip().replace(",", "").replace("$", "").replace("%", "")
+    # Handle fractions like "3/4"
+    fraction_match = re.match(r"^(-?\d+)\s*/\s*(\d+)$", cleaned)
+    if fraction_match:
+        num, den = int(fraction_match.group(1)), int(fraction_match.group(2))
+        return num / den if den != 0 else None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _numeric_distractors(correct: float, n: int, seed: int) -> list[float]:
+    """Generate plausible numeric distractors for a math answer.
+
+    Args:
+        correct: Correct numerical answer.
+        n: Number of distractors to generate.
+        seed: Deterministic seed.
+
+    Returns:
+        List of ``n`` distinct distractor values.
+    """
+    import random as _random
+    rng = _random.Random(seed)
+    distractors: list[float] = []
+    abs_val = abs(correct) if correct != 0 else 1.0
+    perturbations = [
+        correct + abs_val * 0.5,
+        correct - abs_val * 0.5,
+        correct * 2.0,
+        correct + abs_val,
+        correct - abs_val,
+        correct * 0.5,
+        correct + 1,
+        correct - 1,
+        correct + 10,
+        correct * 3,
+    ]
+    for candidate in perturbations:
+        if candidate != correct and candidate not in distractors:
+            distractors.append(candidate)
+        if len(distractors) >= n:
+            break
+    while len(distractors) < n:
+        distractors.append(correct + rng.randint(1, 100) * (1 if rng.random() > 0.5 else -1))
+    return distractors[:n]
+
+
+def _format_numeric(value: float) -> str:
+    """Format a numeric value compactly.
+
+    Args:
+        value: Float value.
+
+    Returns:
+        String representation.
+    """
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.2f}"
+
+
 def _normalize_open_answer_record(
     record: dict[str, Any],
     vocab_size: int,
     seq_len: int,
 ) -> dict[str, torch.Tensor] | None:
     """Normalize an open-ended QA or instruction-following record.
+
+    Numeric answers (e.g. GSM8K) are converted to 4-choice MCQ by generating
+    3 plausible numerical distractors. This collapses the answer space from
+    vocab_size unique hashes to 4 stable choice tokens (hashes of A/B/C/D),
+    making the task learnable without a generative decoder.
 
     Args:
         record: Source record.
@@ -441,6 +561,36 @@ def _normalize_open_answer_record(
     answer_text = _extract_answer_text(record)
     if not question or not answer_text:
         return None
+
+    numeric_val = _extract_numeric_value(answer_text)
+    if numeric_val is not None:
+        # Build a deterministic 4-choice MCQ from the numeric answer
+        seed = int(hashlib.sha256(question.encode()).hexdigest()[:8], 16)
+        distractors = _numeric_distractors(numeric_val, n=3, seed=seed)
+        choices_vals = [numeric_val] + distractors[:3]
+        # Shuffle deterministically so correct answer isn't always choice A
+        shuffled_indices = list(range(4))
+        import random as _random
+        _random.Random(seed + 1).shuffle(shuffled_indices)
+        choices_vals = [choices_vals[i] for i in shuffled_indices]
+        correct_idx = shuffled_indices.index(0)  # index 0 was the correct answer
+        choices_text = [_format_numeric(v) for v in choices_vals]
+        choice_tokens, choice_mask = _choice_tensor(4, vocab_size)
+        answer_token = choice_tokens[correct_idx].clone()
+        prompt = (
+            f"Question: {question} Choices: "
+            + " ".join(f"{chr(ord('A') + i)}. {txt}" for i, txt in enumerate(choices_text))
+        )
+        return {
+            "tokens": encode_reasoning_text(prompt, vocab_size=vocab_size, seq_len=seq_len),
+            "target": _default_target(f"Answer: {chr(ord('A') + correct_idx)}", vocab_size=vocab_size, seq_len=seq_len),
+            "answer": answer_token.long(),
+            "choice_tokens": choice_tokens.long(),
+            "choice_mask": choice_mask,
+            "correct_choice": torch.tensor(correct_idx, dtype=torch.long),
+        }
+
+    # Non-numeric open answer — keep as-is (hash into vocab)
     return {
         "tokens": encode_reasoning_text(f"Question: {question}", vocab_size=vocab_size, seq_len=seq_len),
         "target": _default_target(answer_text, vocab_size=vocab_size, seq_len=seq_len),
@@ -503,6 +653,9 @@ def _records_for_dataset(
 def _dataset_plan_for_variant(domain_variant: str) -> list[tuple[str, tuple[str, ...]]]:
     """Return local source directories and optional keyword filters for a domain.
 
+    logiqa2 only ships a .py loader (no actual data files), so all variants
+    that would use it fall back to agieval/logiqa-en instead.
+
     Args:
         domain_variant: Stage-1 domain variant.
 
@@ -510,17 +663,22 @@ def _dataset_plan_for_variant(domain_variant: str) -> list[tuple[str, tuple[str,
         Dataset plan list.
     """
     if domain_variant == "lsat":
-        return [("agieval", ("lsat",)), ("logiqa2", tuple())]
+        # lsat-ar + lsat-lr + lsat-rc cover the three LSAT sections
+        return [("agieval", ("lsat-ar", "lsat-lr", "lsat-rc"))]
     if domain_variant == "gre":
-        return [("agieval", ("sat", "logiqa")), ("logiqa2", tuple())]
+        # SAT reasoning + LogiQA English is the closest proxy for GRE verbal
+        return [("agieval", ("sat-en", "logiqa-en")), ("folio", tuple())]
     if domain_variant == "formal_logic":
-        return [("proofwriter", tuple()), ("folio", tuple()), ("logiqa2", tuple())]
+        # ProofWriter (585k deductive chains) + FOLIO (FOL entailment) + LogiQA
+        return [("proofwriter", tuple()), ("folio", tuple()), ("agieval", ("logiqa-en",))]
     if domain_variant == "math_competition":
+        # GSM8K (grade-school) + all Hendrycks MATH subtypes
         return [("gsm8k", tuple()), ("hendrycks_math", tuple())]
     if domain_variant == "code_reasoning":
         return [("open_platypus", tuple())]
     if domain_variant == "mcat_cars":
-        return [("agieval", ("lsat-rc", "sat-en", "logiqa")), ("logiqa2", tuple())]
+        # LSAT reading comprehension + SAT English passages
+        return [("agieval", ("lsat-rc", "sat-en"))]
     return []
 
 

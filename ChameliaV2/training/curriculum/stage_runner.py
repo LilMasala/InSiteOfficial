@@ -67,6 +67,7 @@ class CurriculumStageRunner:
         export_model_config: dict[str, Any] | None = None,
         export_backbone_mode: str | None = None,
         export_model_version: str | None = None,
+        scratch_dir: str | Path | None = None,
     ) -> None:
         """Initialize the curriculum runner.
 
@@ -119,6 +120,10 @@ class CurriculumStageRunner:
                 model artifacts, such as ``stub`` or ``hjepa``.
             export_model_version: Optional explicit model version metadata for exported
                 bridge artifacts.
+            scratch_dir: Optional local scratch directory for large bridge artifacts.
+                When provided, all bridge .pth files are written here (fast local disk)
+                and only the best-scoring artifact is copied to the NFS checkpoint_dir.
+                Defaults to ``checkpoint_dir/bridge_artifacts`` when not set.
         """
         self.model = model
         self.stages = stages
@@ -159,8 +164,18 @@ class CurriculumStageRunner:
         self.global_step = 0
         self.checkpoint_dir = Path(config.get("checkpoint_dir", "checkpoints"))
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.bridge_artifact_dir = self.checkpoint_dir / "bridge_artifacts"
+        # Bridge artifacts go to local scratch when provided (avoids large NFS writes).
+        # Only the best-scoring artifact is persisted to NFS checkpoint_dir.
+        if scratch_dir is not None:
+            self.bridge_artifact_dir = Path(scratch_dir) / "bridge_artifacts"
+            self._nfs_best_artifact_dir: Path | None = self.checkpoint_dir / "bridge_artifacts"
+            self._nfs_best_artifact_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.bridge_artifact_dir = self.checkpoint_dir / "bridge_artifacts"
+            self._nfs_best_artifact_dir = None
         self.bridge_artifact_dir.mkdir(parents=True, exist_ok=True)
+        self._best_artifact_score: float = -1.0
+        self._best_artifact_path: Path | None = None
         self._runtime_domains: dict[str, Any] = {}
         self._last_loss_breakdown: dict[str, float] = {}
 
@@ -760,9 +775,16 @@ class CurriculumStageRunner:
         bridge_artifact_path = self._save_bridge_artifact(stage_idx, metrics, timestamp)
         if bridge_artifact_path is not None:
             payload["bridge_artifact_path"] = str(bridge_artifact_path)
-        torch.save(payload, status_path)
-        last_checkpoint_file = self.checkpoint_dir / "last_checkpoint.txt"
-        last_checkpoint_file.write_text(str(status_path))
+        try:
+            torch.save(payload, status_path)
+            last_checkpoint_file = self.checkpoint_dir / "last_checkpoint.txt"
+            last_checkpoint_file.write_text(str(status_path))
+        except (RuntimeError, OSError) as exc:
+            _runner_log(
+                f"WARNING: status checkpoint write failed (transient NFS error?), "
+                f"training continues — path={status_path} err={exc}"
+            )
+            return
         _runner_log(
             f"checkpoint_saved stage={stage_idx} "
             f"event={metrics.get('event', 'checkpoint')} "
@@ -806,7 +828,34 @@ class CurriculumStageRunner:
             "model_version": self.export_model_version,
         }
         artifact_path = self.bridge_artifact_dir / artifact_name
-        torch.save(artifact_payload, artifact_path)
+        try:
+            torch.save(artifact_payload, artifact_path)
+        except (RuntimeError, OSError) as exc:
+            _runner_log(
+                f"WARNING: bridge artifact write failed (transient NFS/disk error?), "
+                f"training continues — path={artifact_path} err={exc}"
+            )
+            return None
+
+        # Track best-scoring artifact and persist it to NFS if using scratch.
+        score = float(metrics.get("best_score", metrics.get("game_score", metrics.get("accuracy", 0.0))))
+        if self._nfs_best_artifact_dir is not None and score >= self._best_artifact_score:
+            self._best_artifact_score = score
+            self._best_artifact_path = artifact_path
+            nfs_dest = self._nfs_best_artifact_dir / "best_model.pth"
+            try:
+                import shutil
+                shutil.copy2(artifact_path, nfs_dest)
+                _runner_log(
+                    f"best_artifact_persisted score={score:.4f} "
+                    f"scratch={artifact_path} nfs={nfs_dest}"
+                )
+            except (RuntimeError, OSError) as exc:
+                _runner_log(
+                    f"WARNING: best artifact NFS copy failed — "
+                    f"scratch copy retained at {artifact_path} err={exc}"
+                )
+
         return artifact_path
 
     def resume_from_checkpoint(self, checkpoint_path: str) -> None:

@@ -361,7 +361,7 @@ def build_stage_domains(
                 if domain_name == "basic_arithmetic"
                 else _domain_batch_size(stage1_cfg, 16)
             ),
-            seq_len=(8 if domain_name == "basic_arithmetic" else 48),
+            seq_len=(8 if domain_name == "basic_arithmetic" else 256),
             data_root=data_root,
         )
         for domain_name in stage1_cfg["domains"]
@@ -382,10 +382,12 @@ def build_stage_domains(
     stage_specs.append((2, "stage2_patterns", stage2_domains))
 
     stage3_cfg = cfg["stage3_games"]
+    _stage3_seq_lens = {"chess": 128, "go": 128, "poker": 64, "gridworld": 64}
     stage3_domains = [
         GamesCurriculumDomain(
             domain_variant=domain_name,
             batch_size=_domain_batch_size(stage3_cfg, 8),
+            seq_len=_stage3_seq_lens.get(domain_name, 128),
             data_root=data_root,
         )
         for domain_name in stage3_cfg["domains"]
@@ -1000,9 +1002,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retune-lr-factors", default="0.5,1.5")
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--checkpoint-dir", default=str(PROJECT_ROOT / "checkpoints" / "chamelia_curriculum"))
+    parser.add_argument("--scratch-dir", default=None, help="Local scratch for large bridge artifacts. Only the best model is copied to --checkpoint-dir.")
     parser.add_argument("--model-version", default=None)
     parser.add_argument("--init-checkpoint", default=None)
     parser.add_argument("--start-stage", type=int, default=None, help="Skip all stages before this index.")
+    parser.add_argument("--eval-only", action="store_true", help="Run benchmark evaluation without training.")
     return parser
 
 
@@ -1074,6 +1078,7 @@ def run_training(args: argparse.Namespace) -> int:
         export_model_config=effective_model_cfg,
         export_backbone_mode=args.backbone_mode,
         export_model_version=getattr(args, "model_version", None),
+        scratch_dir=getattr(args, "scratch_dir", None),
     )
     if stages and stages[0]:
         runner._runtime_domains[stages[0][0].domain_name()] = model.domain
@@ -1133,6 +1138,76 @@ def run_training(args: argparse.Namespace) -> int:
     return 0
 
 
+_BENCHMARK_LABELS: dict[str, tuple[str, str]] = {
+    "basic_arithmetic": ("BasicArithmetic (synthetic)", "synthetic"),
+    "lsat": ("AGIEval-LSAT", "agieval/lsat"),
+    "gre": ("AGIEval-GRE/SAT + LogiQA2", "agieval/sat, logiqa2"),
+    "math_competition": ("GSM8K + Hendrycks-MATH", "gsm8k, hendrycks_math"),
+    "formal_logic": ("ProofWriter + FOLIO + LogiQA2", "proofwriter, folio, logiqa2"),
+    "code_reasoning": ("OpenPlatypus", "open_platypus"),
+    "mcat_cars": ("AGIEval-CARS/LSAT-RC", "agieval/lsat-rc, sat-en"),
+}
+
+
+def run_benchmark_eval(args: argparse.Namespace) -> int:
+    """Run standalone benchmark evaluation on all configured stage domains.
+
+    Args:
+        args: Parsed CLI args (requires --init-checkpoint).
+
+    Returns:
+        Process exit code.
+    """
+    if not getattr(args, "init_checkpoint", None):
+        print("--init-checkpoint is required for --eval-only", flush=True)
+        return 1
+
+    set_seed(args.seed)
+    curriculum_config = load_yaml(args.curriculum_config)
+    chamelia_config = load_yaml(args.chamelia_config)
+    selected_stages = [int(value) for value in parse_csv_arg(args.stage)]
+    selected_domains = parse_csv_arg(args.domain)
+    device = choose_device(args.device)
+
+    stages = build_stage_domains(
+        curriculum_config,
+        selected_stages=selected_stages,
+        selected_domains=selected_domains,
+        data_root=args.data_root,
+    )
+    model = build_model(chamelia_config, stages, device=device, backbone_mode=args.backbone_mode)
+    initialize_from_checkpoint(model, args.init_checkpoint, device=device)
+    model.eval()
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"\n{'=' * 70}", flush=True)
+    print(f"  Chamelia V2 Benchmark Evaluation  |  {timestamp}", flush=True)
+    print(f"  checkpoint: {args.init_checkpoint}", flush=True)
+    print(f"{'=' * 70}", flush=True)
+    print(f"  {'Domain':<28} {'Dataset':<36} {'split':<5}  {'accuracy':>8}  {'consistency':>11}  {'n':>5}", flush=True)
+    print(f"  {'-' * 28} {'-' * 36} {'-' * 5}  {'-' * 8}  {'-' * 11}  {'-' * 5}", flush=True)
+
+    for stage_domains in stages:
+        for domain in stage_domains:
+            name = domain.domain_name()
+            label, dataset_str = _BENCHMARK_LABELS.get(name, (name, "synthetic"))
+            level = domain.cost.current_level
+            domain_metrics = domain.run_advancement_probe(model, level)
+            accuracy = domain_metrics.get("accuracy", domain_metrics.get("token_accuracy", float("nan")))
+            consistency = domain_metrics.get("consistency", float("nan"))
+            loader = domain.get_data_loader(level, split="val")
+            n = sum(batch.tokens.shape[0] for batch in loader if batch.tokens is not None)
+            acc_str = f"{accuracy:.3f}" if accuracy == accuracy else "  n/a"
+            con_str = f"{consistency:.3f}" if consistency == consistency else "  n/a"
+            print(
+                f"  {label:<28} {dataset_str:<36} {'val':<5}  {acc_str:>8}  {con_str:>11}  {n:>5}",
+                flush=True,
+            )
+
+    print(f"{'=' * 70}\n", flush=True)
+    return 0
+
+
 def main() -> int:
     """CLI entrypoint.
 
@@ -1143,6 +1218,8 @@ def main() -> int:
         Process exit code.
     """
     args = build_parser().parse_args()
+    if getattr(args, "eval_only", False):
+        return run_benchmark_eval(args)
     return run_training(args)
 
 

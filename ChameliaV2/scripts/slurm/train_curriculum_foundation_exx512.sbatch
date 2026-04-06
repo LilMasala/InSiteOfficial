@@ -59,9 +59,14 @@ CURRICULUM_CONFIG="${CURRICULUM_CONFIG:-${ROOT_DIR}/configs/curriculum_hjepa_fou
 CHAMELIA_CONFIG="${CHAMELIA_CONFIG:-${ROOT_DIR}/configs/chamelia.yaml}"
 DATA_ROOT="${DATA_ROOT:-${ROOT_DIR}/data/curriculum}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${ROOT_DIR}/checkpoints/${RUN_TAG}}"
+# Local scratch for large bridge artifacts (~1.5 GB each); only the best model is
+# copied to CHECKPOINT_DIR (NFS/zfshomes).  Use node-local TMPDIR when available.
+SCRATCH_DIR="${SCRATCH_DIR:-${TMPDIR:-/tmp/chamelia_${SLURM_JOB_ID:-$$}}}"
+mkdir -p "${SCRATCH_DIR}"
 STAGES="${STAGES:-}"
 START_STAGE="${START_STAGE:-}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
+EVAL_ONLY="${EVAL_ONLY:-}"
 DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-42}"
 INITIAL_STAGE_STEPS="${INITIAL_STAGE_STEPS:-2000}"
@@ -83,10 +88,12 @@ echo "  stages:          ${STAGES:-<config default>}"
 echo "  device:          ${DEVICE}"
 echo "  data root:       ${DATA_ROOT}"
 echo "  checkpoint dir:  ${CHECKPOINT_DIR}"
+echo "  scratch dir:     ${SCRATCH_DIR}"
 echo "  log dir:         ${LOG_DIR}"
 echo "  model version:   ${MODEL_VERSION}"
 echo "  init checkpoint: ${INIT_CHECKPOINT:-<none>}"
 echo "  start stage:     ${START_STAGE:-<config default>}"
+echo "  eval only:       ${EVAL_ONLY:-false}"
 echo "  node:            $(hostname)"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -110,6 +117,7 @@ TRAIN_CMD=(
   --retune-lr-factors "${RETUNE_LR_FACTORS}"
   --clip-grad "${CLIP_GRAD}"
   --checkpoint-dir "${CHECKPOINT_DIR}"
+  --scratch-dir "${SCRATCH_DIR}"
   --model-version "${MODEL_VERSION}"
 )
 
@@ -125,6 +133,10 @@ if [[ -n "${START_STAGE}" ]]; then
   TRAIN_CMD+=(--start-stage "${START_STAGE}")
 fi
 
+if [[ -n "${EVAL_ONLY}" ]]; then
+  TRAIN_CMD+=(--eval-only)
+fi
+
 if [[ -n "${STAGES}" ]]; then
   IFS=',' read -r -a STAGE_LIST <<< "${STAGES}"
   for STAGE in "${STAGE_LIST[@]}"; do
@@ -137,3 +149,10 @@ printf '%q ' "${TRAIN_CMD[@]}"
 printf '\n'
 
 "${TRAIN_CMD[@]}"
+
+echo ""
+echo "Training complete."
+echo "  Best model (NFS):      ${CHECKPOINT_DIR}/bridge_artifacts/best_model.pth"
+echo "  All scratch artifacts:  ${SCRATCH_DIR}/bridge_artifacts/"
+echo "  To manually copy everything off scratch:"
+echo "    cp -r ${SCRATCH_DIR}/bridge_artifacts/ ${CHECKPOINT_DIR}/bridge_artifacts_all/"

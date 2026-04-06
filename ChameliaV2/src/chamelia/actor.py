@@ -142,7 +142,7 @@ class Actor(nn.Module):
         )
         self.cross_attn_to_posture_memory = nn.MultiheadAttention(
             embed_dim, num_heads, dropout=dropout, batch_first=True
-        )
+        ) 
         self.norm_ctx = nn.LayerNorm(embed_dim)
         self.norm_state = nn.LayerNorm(embed_dim)
         self.norm_posture = nn.LayerNorm(posture_dim)

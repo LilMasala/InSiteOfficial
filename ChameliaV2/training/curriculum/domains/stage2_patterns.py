@@ -128,11 +128,12 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
             }
 
         def sample_builder(level: int, split: str, spec: DomainSpec) -> list[dict[str, torch.Tensor]]:
+            max_samples = spec.dataset_size if split == "train" else spec.dataset_size * 4
             public_samples = load_public_pattern_samples(
                 domain_variant=domain_variant,
                 split=split,
                 seq_len=spec.seq_len,
-                max_samples=spec.dataset_size,
+                max_samples=max_samples,
                 data_root=self.data_root,
             )
             if public_samples:
@@ -147,7 +148,7 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
                 vocab_size=4096,
                 batch_size=batch_size,
                 seq_len=seq_len,
-                dataset_size=256,
+                dataset_size=2048,
             ),
             masking_strategy=PatternMaskingStrategy(),
             cost_schedule=schedule,
