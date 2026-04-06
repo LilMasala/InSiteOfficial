@@ -910,10 +910,14 @@ def train_stage(
             f"{domain_name}:{', '.join(f'{key}={value:.3f}' for key, value in domain_metrics.items())}"
             for domain_name, domain_metrics in metrics.items()
         )
+        level_summary = ", ".join(
+            f"{domain.domain_name()}:L{domain.cost.current_level}/{max(1, len(domain.get_cost_schedule()) - 1)}"
+            for domain in stage_domains
+        )
         _log(
             f"stage={display_stage} steps={stage_steps} score={score:.3f} loss={mean_loss:.4f} "
-            f"decision={decision.action} reason={decision.reason} metrics=[{metric_summary}] "
-            f"breakdown=[{_format_breakdown(mean_breakdown)}]"
+            f"decision={decision.action} reason={decision.reason} levels=[{level_summary}] "
+            f"metrics=[{metric_summary}] breakdown=[{_format_breakdown(mean_breakdown)}]"
         )
 
         if decision.action == "graduate":
@@ -998,6 +1002,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-dir", default=str(PROJECT_ROOT / "checkpoints" / "chamelia_curriculum"))
     parser.add_argument("--model-version", default=None)
     parser.add_argument("--init-checkpoint", default=None)
+    parser.add_argument("--start-stage", type=int, default=None, help="Skip all stages before this index.")
     return parser
 
 
@@ -1033,6 +1038,8 @@ def run_training(args: argparse.Namespace) -> int:
     if getattr(args, "init_checkpoint", None):
         initialize_from_checkpoint(model, args.init_checkpoint, device=device)
         _log(f"initialized model from checkpoint={args.init_checkpoint}")
+    else:
+        _log("no init_checkpoint specified — starting from scratch")
 
     training_cfg = _resolve_training_config(chamelia_config, args.backbone_mode)
     global_fallback_lr = float(args.lr if args.lr is not None else training_cfg.get("learning_rate", 1.5e-4))
@@ -1087,8 +1094,12 @@ def run_training(args: argparse.Namespace) -> int:
         f"stage0_disable_mode1_distill={bool(training_cfg.get('stage0_disable_mode1_distill', True))}"
     )
 
+    start_stage = getattr(args, "start_stage", None)
     for stage_idx, stage_domains in enumerate(stages):
         stage_label = stage_domains[0].stage() if stage_domains else stage_idx
+        if start_stage is not None and int(stage_label) < start_stage:
+            _log(f"skipping stage {stage_label} (start_stage={start_stage})")
+            continue
         stage_base_lr = _stage_learning_rate(curriculum_config, int(stage_label), global_fallback_lr)
         runner.optimizer = build_optimizer(model, training_cfg, stage_base_lr)
         runner._ensure_optimizer_tracks_model()

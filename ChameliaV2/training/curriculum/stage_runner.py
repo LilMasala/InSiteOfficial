@@ -761,6 +761,8 @@ class CurriculumStageRunner:
         if bridge_artifact_path is not None:
             payload["bridge_artifact_path"] = str(bridge_artifact_path)
         torch.save(payload, status_path)
+        last_checkpoint_file = self.checkpoint_dir / "last_checkpoint.txt"
+        last_checkpoint_file.write_text(str(status_path))
         _runner_log(
             f"checkpoint_saved stage={stage_idx} "
             f"event={metrics.get('event', 'checkpoint')} "

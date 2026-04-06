@@ -59,6 +59,8 @@ CHAMELIA_CONFIG="${CHAMELIA_CONFIG:-${ROOT_DIR}/configs/chamelia.yaml}"
 DATA_ROOT="${DATA_ROOT:-${ROOT_DIR}/data/curriculum}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${ROOT_DIR}/checkpoints/${RUN_TAG}}"
 STAGES="${STAGES:-}"
+START_STAGE="${START_STAGE:-}"
+INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-42}"
 INITIAL_STAGE_STEPS="${INITIAL_STAGE_STEPS:-2000}"
@@ -82,6 +84,8 @@ echo "  data root:       ${DATA_ROOT}"
 echo "  checkpoint dir:  ${CHECKPOINT_DIR}"
 echo "  log dir:         ${LOG_DIR}"
 echo "  model version:   ${MODEL_VERSION}"
+echo "  init checkpoint: ${INIT_CHECKPOINT:-<none>}"
+echo "  start stage:     ${START_STAGE:-<config default>}"
 echo "  node:            $(hostname)"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -110,6 +114,14 @@ TRAIN_CMD=(
 
 if [[ -n "${LR}" ]]; then
   TRAIN_CMD+=(--lr "${LR}")
+fi
+
+if [[ -n "${INIT_CHECKPOINT}" ]]; then
+  TRAIN_CMD+=(--init-checkpoint "${INIT_CHECKPOINT}")
+fi
+
+if [[ -n "${START_STAGE}" ]]; then
+  TRAIN_CMD+=(--start-stage "${START_STAGE}")
 fi
 
 if [[ -n "${STAGES}" ]]; then
