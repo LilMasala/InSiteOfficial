@@ -116,6 +116,11 @@ class Chamelia(nn.Module):
         tokenizer = domain.get_tokenizer()
         if isinstance(tokenizer, nn.Module):
             self.domain_tokenizer = tokenizer
+            try:
+                device = next(self.hjepa.parameters()).device
+                self.domain_tokenizer = self.domain_tokenizer.to(device)
+            except (StopIteration, AttributeError):
+                pass
 
     def get_domain_tokenizer(self) -> nn.Module | None:
         """Return the registered domain tokenizer module if present.
