@@ -434,20 +434,25 @@ def _normalize_label_record(
     if not prompt_parts:
         return None
 
-    # Convert True/False answers to binary MCQ (A=True, B=False)
+    # Convert True/False/Uncertain answers to MCQ
     normalized_label = label_text.lower()
-    if normalized_label in ("true", "false", "yes", "no", "0", "1", "entailment", "contradiction", "neutral"):
-        binary_choices = ["True", "False"]
-        if normalized_label in ("true", "yes", "1", "entailment"):
-            correct_idx = 0
-        else:
+    if normalized_label in ("true", "false", "yes", "no", "0", "1", "entailment", "contradiction", "neutral", "uncertain", "unknown", "maybe"):
+        if normalized_label in ("uncertain", "unknown", "maybe", "neutral"):
+            # 3-choice: A=True, B=Uncertain, C=False
+            choices_text = "A. True B. Uncertain C. False"
             correct_idx = 1
-        choice_tokens, choice_mask = _choice_tensor(2, vocab_size)
+            num_choices = 3
+        elif normalized_label in ("true", "yes", "1", "entailment"):
+            choices_text = "A. True B. Uncertain C. False"
+            correct_idx = 0
+            num_choices = 3
+        else:
+            choices_text = "A. True B. Uncertain C. False"
+            correct_idx = 2
+            num_choices = 3
+        choice_tokens, choice_mask = _choice_tensor(num_choices, vocab_size)
         answer_token = choice_tokens[correct_idx].clone()
-        prompt = (
-            " ".join(prompt_parts)
-            + " Choices: A. True B. False"
-        )
+        prompt = " ".join(prompt_parts) + f" Choices: {choices_text}"
         return {
             "tokens": encode_reasoning_text(prompt, vocab_size=vocab_size, seq_len=seq_len),
             "target": _default_target(f"Answer: {chr(ord('A') + correct_idx)}", vocab_size=vocab_size, seq_len=seq_len),
