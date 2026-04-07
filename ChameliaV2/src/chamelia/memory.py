@@ -9,6 +9,38 @@ import torch
 import torch.nn.functional as F
 
 
+def _detach_to_device(value: torch.Tensor | None, device: torch.device | str) -> torch.Tensor | None:
+    """Detach and move optional tensors to the target memory device."""
+    if value is None:
+        return None
+    return value.detach().to(device)
+
+
+def _detach_trace_to_device(
+    trace: tuple[RetrievalTraceStep, ...] | None,
+    device: torch.device | str,
+) -> tuple[RetrievalTraceStep, ...] | None:
+    """Detach and move an optional retrieval trace to the target device."""
+    if trace is None:
+        return None
+    stored_trace: list[RetrievalTraceStep] = []
+    for step in trace:
+        stored_trace.append(
+            RetrievalTraceStep(
+                query_key=step.query_key.detach().to(device),
+                memory_keys=step.memory_keys.detach().to(device),
+                memory_summaries=step.memory_summaries.detach().to(device),
+                base_quality_scores=step.base_quality_scores.detach().to(device),
+                query_posture=_detach_to_device(step.query_posture, device),
+                memory_postures=_detach_to_device(step.memory_postures, device),
+                base_scores=_detach_to_device(step.base_scores, device),
+                relevance_scores=_detach_to_device(step.relevance_scores, device),
+                relevance_weights=_detach_to_device(step.relevance_weights, device),
+            )
+        )
+    return tuple(stored_trace)
+
+
 @dataclass
 class EpisodeRecord:
     """Latent-indexed episode record.
@@ -75,55 +107,16 @@ class RetrievalReplayExample:
     memory_postures: torch.Tensor | None = None
 
 
-def _cpu_optional_tensor(value: torch.Tensor | None) -> torch.Tensor | None:
-    """Detach and move optional tensors to CPU."""
-    if value is None:
-        return None
-    return value.detach().cpu()
-
-
-def _cpu_optional_retrieval_trace(
-    trace: tuple[RetrievalTraceStep, ...] | None,
-) -> tuple[RetrievalTraceStep, ...] | None:
-    """Detach and move an optional retrieval trace to CPU."""
-    if trace is None:
-        return None
-    stored_trace: list[RetrievalTraceStep] = []
-    for step in trace:
-        stored_trace.append(
-            RetrievalTraceStep(
-                query_key=step.query_key.detach().cpu(),
-                memory_keys=step.memory_keys.detach().cpu(),
-                memory_summaries=step.memory_summaries.detach().cpu(),
-                base_quality_scores=step.base_quality_scores.detach().cpu(),
-                query_posture=_cpu_optional_tensor(step.query_posture),
-                memory_postures=_cpu_optional_tensor(step.memory_postures),
-                base_scores=_cpu_optional_tensor(step.base_scores),
-                relevance_scores=_cpu_optional_tensor(step.relevance_scores),
-                relevance_weights=_cpu_optional_tensor(step.relevance_weights),
-            )
-        )
-    return tuple(stored_trace)
-
-
-def _lift_to_embed(value: torch.Tensor | None, embed_dim: int) -> torch.Tensor | None:
+def _lift_to_embed(value: torch.Tensor | None, embed_dim: int, device: torch.device | str) -> torch.Tensor | None:
     """Flatten and pad/truncate a tensor to the shared embed width."""
     if value is None:
         return None
     flat = value.detach().float().reshape(-1)
     if flat.numel() >= embed_dim:
         return flat[:embed_dim]
-    lifted = torch.zeros(embed_dim, dtype=torch.float32)
+    lifted = torch.zeros(embed_dim, dtype=torch.float32, device=device)
     lifted[: flat.numel()] = flat
     return lifted
-
-
-def _normalize_vector(value: torch.Tensor) -> torch.Tensor:
-    """Normalize a 1D vector without producing NaNs for zero vectors."""
-    norm = value.norm(p=2)
-    if float(norm.item()) == 0.0:
-        return value
-    return value / norm
 
 
 def _record_quality_score(record: EpisodeRecord) -> float:
@@ -148,7 +141,7 @@ def _normalize_score_vector(values: torch.Tensor) -> torch.Tensor:
 
 
 class LatentMemory:
-    """CPU-backed latent key-value episodic memory."""
+    """Device-aware latent key-value episodic memory."""
 
     def __init__(
         self,
@@ -163,10 +156,7 @@ class LatentMemory:
             embed_dim: Key embedding dimension D.
             max_episodes: Maximum circular-buffer capacity.
             retrieval_k: Default retrieval count K.
-            device: Storage device for keys, typically "cpu".
-
-        Returns:
-            None.
+            device: Storage device for keys and values (e.g. "cuda" or "cpu").
         """
         self.embed_dim = embed_dim
         self.max_episodes = max_episodes
@@ -180,50 +170,40 @@ class LatentMemory:
         self._id_to_slot: dict[int, int] = {}
 
     def store(self, record: EpisodeRecord) -> int:
-        """Store an episode record in the circular buffer.
-
-        Args:
-            record: EpisodeRecord with key [D], action [A], and ctx_tokens [C, D].
-
-        Returns:
-            Stable integer record ID. This ID remains valid until the slot is
-            overwritten by a future store when the buffer is full. Callers must
-            use this ID (not a raw slot index) when calling fill_outcome.
-        """
+        """Store an episode record in the circular buffer."""
         idx = self.head
         record_id = self._next_record_id
         self._next_record_id += 1
 
-        # If overwriting an existing slot, evict its stable ID from the lookup.
         if len(self.records) >= self.max_episodes:
             evicted_id = self.records[idx].record_id
             self._id_to_slot.pop(evicted_id, None)
 
-        self.keys[idx] = record.key.detach().cpu()
+        self.keys[idx] = record.key.detach().to(self.device)
         stored_record = EpisodeRecord(
-            key=record.key.detach().cpu(),
-            action=record.action.detach().cpu(),
-            ctx_tokens=record.ctx_tokens.detach().cpu(),
+            key=record.key.detach().to(self.device),
+            action=record.action.detach().to(self.device),
+            ctx_tokens=record.ctx_tokens.detach().to(self.device),
             ic_at_decision=record.ic_at_decision,
             ic_realized=record.ic_realized,
             tc_predicted=record.tc_predicted,
-            outcome_key=_cpu_optional_tensor(record.outcome_key),
+            outcome_key=_detach_to_device(record.outcome_key, self.device),
             step=record.step,
             domain_name=record.domain_name,
             record_id=record_id,
             model_version=record.model_version,
-            candidate_postures=_cpu_optional_tensor(record.candidate_postures),
-            selected_posture=_cpu_optional_tensor(record.selected_posture),
-            candidate_reasoning_states=_cpu_optional_tensor(record.candidate_reasoning_states),
-            candidate_paths=_cpu_optional_tensor(record.candidate_paths),
-            selected_path=_cpu_optional_tensor(record.selected_path),
-            candidate_actions=_cpu_optional_tensor(record.candidate_actions),
-            candidate_ic=_cpu_optional_tensor(record.candidate_ic),
-            candidate_tc=_cpu_optional_tensor(record.candidate_tc),
-            candidate_total=_cpu_optional_tensor(record.candidate_total),
-            candidate_terminal_latents=_cpu_optional_tensor(record.candidate_terminal_latents),
+            candidate_postures=_detach_to_device(record.candidate_postures, self.device),
+            selected_posture=_detach_to_device(record.selected_posture, self.device),
+            candidate_reasoning_states=_detach_to_device(record.candidate_reasoning_states, self.device),
+            candidate_paths=_detach_to_device(record.candidate_paths, self.device),
+            selected_path=_detach_to_device(record.selected_path, self.device),
+            candidate_actions=_detach_to_device(record.candidate_actions, self.device),
+            candidate_ic=_detach_to_device(record.candidate_ic, self.device),
+            candidate_tc=_detach_to_device(record.candidate_tc, self.device),
+            candidate_total=_detach_to_device(record.candidate_total, self.device),
+            candidate_terminal_latents=_detach_to_device(record.candidate_terminal_latents, self.device),
             selected_candidate_idx=record.selected_candidate_idx,
-            retrieval_trace=_cpu_optional_retrieval_trace(record.retrieval_trace),
+            retrieval_trace=_detach_trace_to_device(record.retrieval_trace, self.device),
             metadata=dict(record.metadata) if record.metadata is not None else None,
         )
         if len(self.records) < self.max_episodes:
@@ -236,36 +216,16 @@ class LatentMemory:
         return record_id
 
     def fill_outcome(self, record_id: int, ic_realized: float, outcome_key: torch.Tensor) -> bool:
-        """Fill in delayed outcome information for a stored episode.
-
-        If the record has been evicted (buffer wrapped past it), this is a
-        silent no-op and returns False. Callers should not use raw slot indices
-        here — only the stable record_id returned by store().
-
-        Args:
-            record_id: Stable record ID returned by store().
-            ic_realized: Realized intrinsic cost scalar.
-            outcome_key: Outcome latent key tensor of shape [D].
-
-        Returns:
-            True if the record was found and updated, False if it was evicted.
-        """
+        """Fill in delayed outcome information for a stored episode."""
         slot = self._id_to_slot.get(record_id)
         if slot is None:
             return False
         self.records[slot].ic_realized = ic_realized
-        self.records[slot].outcome_key = outcome_key.detach().cpu()
+        self.records[slot].outcome_key = outcome_key.detach().to(self.device)
         return True
 
     def get_record_by_id(self, record_id: int) -> EpisodeRecord | None:
-        """Return the record for a given stable record_id, or None if evicted.
-
-        Args:
-            record_id: Stable record ID returned by store().
-
-        Returns:
-            EpisodeRecord or None.
-        """
+        """Return the record for a given stable record_id, or None if evicted."""
         slot = self._id_to_slot.get(record_id)
         if slot is None:
             return None
@@ -276,17 +236,7 @@ class LatentMemory:
         query_key: torch.Tensor,
         k: int | None = None,
     ) -> tuple[torch.Tensor | None, list[list[EpisodeRecord]]]:
-        """Retrieve the top-k nearest episodes by cosine similarity.
-
-        Args:
-            query_key: Query tensor of shape [D] or [B, D].
-            k: Optional retrieval override.
-
-        Returns:
-            Tuple of:
-                - retrieved_keys: [B, k, D] or None if memory empty
-                - episode_lists: Python lists of EpisodeRecord, one list per batch element
-        """
+        """Retrieve the top-k nearest episodes by cosine similarity."""
         retrieved_keys, episode_lists, _ = self.retrieve_scored(query_key, k=k)
         return retrieved_keys, episode_lists
 
@@ -307,7 +257,7 @@ class LatentMemory:
             query_key = query_key.unsqueeze(0)
         stored = self.keys[: self.size]
 
-        q_norm = F.normalize(query_key.detach().cpu(), dim=-1)
+        q_norm = F.normalize(query_key.detach().to(self.device), dim=-1)
         k_norm = F.normalize(stored, dim=-1)
         combined_scores = torch.mm(q_norm, k_norm.T)
 
@@ -315,6 +265,7 @@ class LatentMemory:
             quality_scores = torch.tensor(
                 [_record_quality_score(record) for record in self.records[: self.size]],
                 dtype=torch.float32,
+                device=self.device
             )
             combined_scores = combined_scores + quality_weight * _normalize_score_vector(
                 quality_scores
@@ -324,8 +275,8 @@ class LatentMemory:
             if query_posture.dim() == 1:
                 query_posture = query_posture.unsqueeze(0)
             posture_dim = query_posture.shape[-1]
-            posture_bank = torch.zeros(self.size, posture_dim, dtype=torch.float32)
-            valid_mask = torch.zeros(self.size, dtype=torch.bool)
+            posture_bank = torch.zeros(self.size, posture_dim, dtype=torch.float32, device=self.device)
+            valid_mask = torch.zeros(self.size, dtype=torch.bool, device=self.device)
             for idx, record in enumerate(self.records[: self.size]):
                 if (
                     record.selected_posture is not None
@@ -334,7 +285,7 @@ class LatentMemory:
                     posture_bank[idx] = record.selected_posture.float()
                     valid_mask[idx] = True
             if valid_mask.any():
-                posture_query = F.normalize(query_posture.detach().cpu(), dim=-1)
+                posture_query = F.normalize(query_posture.detach().to(self.device), dim=-1)
                 posture_bank = F.normalize(posture_bank, dim=-1)
                 posture_scores = posture_query @ posture_bank.T
                 posture_scores = posture_scores.masked_fill(~valid_mask.unsqueeze(0), 0.0)
@@ -376,11 +327,13 @@ class LatentMemory:
             max_count,
             posture_dim,
             dtype=torch.float32,
+            device=self.device
         )
         posture_scores = torch.full(
             (len(episode_lists), max_count),
             float("-inf"),
             dtype=torch.float32,
+            device=self.device
         )
         for batch_idx, episodes in enumerate(episode_lists):
             insert_idx = 0
@@ -418,9 +371,9 @@ class LatentMemory:
 
         # Pre-allocate tensors for up to 6 components: [Key, Ctx, Action, Posture, Outcome, Diff]
         # Shape: [Batch, K_Retrievals, 6_Components, Embed_Dim]
-        comp_vals = torch.zeros(B, max_count, 6, self.embed_dim, dtype=torch.float32)
-        comp_mask = torch.zeros(B, max_count, 6, 1, dtype=torch.float32)
-        summary_scores = torch.full((B, max_count), float("-inf"), dtype=torch.float32)
+        comp_vals = torch.zeros(B, max_count, 6, self.embed_dim, dtype=torch.float32, device=self.device)
+        comp_mask = torch.zeros(B, max_count, 6, 1, dtype=torch.float32, device=self.device)
+        summary_scores = torch.full((B, max_count), float("-inf"), dtype=torch.float32, device=self.device)
 
         for b, episodes in enumerate(episode_lists):
             for k, record in enumerate(episodes[:max_count]):
@@ -460,7 +413,7 @@ class LatentMemory:
                     summary_scores[b, k] = _record_quality_score(record)
 
         # ------------------------------------------------------------------
-        # Vectorized Math Operations (replaces inner-loop stacking/normalization)
+        # Vectorized Math Operations
         # ------------------------------------------------------------------
         
         # 1. Normalize individual components (safe against div-by-zero)
@@ -487,17 +440,7 @@ class LatentMemory:
         self,
         min_outcome_delay: int = 1,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Return future latents, stored context, and realized intrinsic costs for critic training.
-
-        Args:
-            min_outcome_delay: Unused placeholder for API compatibility.
-
-        Returns:
-            Tuple of:
-                - future_keys: [N, D] or None
-                - ctx_tokens: [N, C, D] or None
-                - realized_ics: [N] or None
-        """
+        """Return future latents, stored context, and realized intrinsic costs for critic training."""
         _ = min_outcome_delay
         valid = [
             r
@@ -508,7 +451,7 @@ class LatentMemory:
             return None, None, None
         keys = torch.stack([r.outcome_key for r in valid if r.outcome_key is not None])
         ctx = torch.stack([r.ctx_tokens for r in valid])
-        ics = torch.tensor([float(r.ic_realized) for r in valid], dtype=torch.float32)
+        ics = torch.tensor([float(r.ic_realized) for r in valid], dtype=torch.float32, device=self.device)
         return keys, ctx, ics
 
     def get_world_model_training_pairs(
@@ -536,17 +479,7 @@ class LatentMemory:
     def get_jepa_transition_pairs(
         self,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """Return JEPA transition triples.
-
-        Args:
-            None.
-
-        Returns:
-            Tuple of:
-                - z_t: [N, D] or None
-                - actions: [N, A] or None
-                - z_tH: [N, D] or None
-        """
+        """Return JEPA transition triples."""
         z_t, actions, _, z_tH, _ = self.get_world_model_training_pairs()
         if z_t is None or actions is None or z_tH is None:
             return None, None, None

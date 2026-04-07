@@ -607,37 +607,36 @@ class Chamelia(nn.Module):
     def fill_outcome(
         self,
         ic_realized: float | torch.Tensor | list[float],
-        outcome_observation: Any,
+        outcome_observation: Any | None = None,
+        outcome_z: torch.Tensor | None = None,
     ) -> None:
-        """Fill delayed outcome into memory.
-
-        Args:
-            ic_realized: Realized intrinsic cost scalar, list, or tensor [B].
-            outcome_observation: Raw observation to tokenize and encode. May be batched.
-
-        Returns:
-            None.
-        """
+        """Fill delayed outcome into memory. (Optimized to skip redundant encoding)"""
         if not self._pending_record_indices:
             return
 
-        tokenizer = self.domain.get_tokenizer()
-        with torch.no_grad():
-            outcome_tokenized = tokenizer(outcome_observation)
-            outcome_tokens = outcome_tokenized.tokens
-            outcome_mask = torch.zeros(
-                outcome_tokens.shape[0],
-                outcome_tokens.shape[1],
-                device=outcome_tokens.device,
-                dtype=torch.float32,
-            )
-            outcome_hjepa = forward_hjepa(
-                self.hjepa,
-                outcome_tokens,
-                mask=outcome_mask,
-                input_kind="embedded_tokens",
-            )
-            outcome_z = self._get_scene_summary(outcome_hjepa)
+        # If the latent vector (z) is already provided by the rollout/training loop,
+        # we skip the expensive tokenizer and HJEPA forward pass entirely.
+        if outcome_z is None:
+            if outcome_observation is None:
+                raise ValueError("Must provide either outcome_observation or outcome_z.")
+            
+            tokenizer = self.domain.get_tokenizer()
+            with torch.no_grad():
+                outcome_tokenized = tokenizer(outcome_observation)
+                outcome_tokens = outcome_tokenized.tokens
+                outcome_mask = torch.zeros(
+                    outcome_tokens.shape[0],
+                    outcome_tokens.shape[1],
+                    device=outcome_tokens.device,
+                    dtype=torch.float32,
+                )
+                outcome_hjepa = forward_hjepa(
+                    self.hjepa,
+                    outcome_tokens,
+                    mask=outcome_mask,
+                    input_kind="embedded_tokens",
+                )
+                outcome_z = self._get_scene_summary(outcome_hjepa)
 
         realized_tensor = torch.as_tensor(ic_realized, dtype=torch.float32).flatten()
         if realized_tensor.numel() == 1 and outcome_z.shape[0] > 1:
