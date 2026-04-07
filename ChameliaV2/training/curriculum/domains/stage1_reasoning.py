@@ -205,7 +205,7 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
         self,
         domain_variant: str = "lsat",
         batch_size: int = 16,
-        seq_len: int = 48,
+        seq_len: int = 1024,
         vocab_size: int | None = None,
         data_root: str | Path | None = None,
     ) -> None:
