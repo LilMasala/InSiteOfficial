@@ -12,4 +12,4 @@ class SemanticProbe:
         """Return placeholder semantic metrics."""
         _ = model
         _ = batch
-        return {"semantic_similarity": 0.8, "medical_concept_probe": 0.76}
+        return {"semantic_similarity": 0.0, "medical_concept_probe": 0.0}

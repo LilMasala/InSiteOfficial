@@ -12,4 +12,4 @@ class PatternProbe:
         """Return placeholder pattern metrics."""
         _ = model
         _ = batch
-        return {"rule_probe": 0.86, "regime_detection": 0.9, "counterfactual": 0.84}
+        return {"rule_probe": 0.0, "regime_detection": 0.0, "counterfactual": 0.0}

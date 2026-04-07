@@ -12,4 +12,4 @@ class GameProbe:
         """Return placeholder game metrics."""
         _ = model
         _ = batch
-        return {"game_score": 0.82, "plan_accuracy": 0.79}
+        return {"game_score": 0.0, "plan_accuracy": 0.0}

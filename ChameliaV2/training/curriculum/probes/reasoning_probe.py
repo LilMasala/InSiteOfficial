@@ -12,4 +12,4 @@ class ReasoningProbe:
         """Return placeholder reasoning metrics."""
         _ = model
         _ = batch
-        return {"accuracy": 0.9, "consistency": 0.88, "generation_quality": 0.85}
+        return {"accuracy": 0.0, "consistency": 0.0, "generation_quality": 0.0}
