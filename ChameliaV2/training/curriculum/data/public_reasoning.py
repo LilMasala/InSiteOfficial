@@ -693,11 +693,12 @@ def _dataset_plan_for_variant(domain_variant: str) -> list[tuple[str, tuple[str,
             ("agieval", ("logiqa-en", "logiqa-zh", "jec-qa-ca", "jec-qa-kd")),
         ]
     if domain_variant == "math_competition":
-        # GSM8K + Hendrycks MATH + AQUA-RAT + SAT Math + Gaokao math + AGIEval math
+        # AGIEval MCQ math first (fills max_samples budget before open-answer sources),
+        # then GSM8K + Hendrycks MATH for additional training signal.
         return [
+            ("agieval", ("aqua-rat", "sat-math", "gaokao-mathqa", "math")),
             ("gsm8k", tuple()),
             ("hendrycks_math", tuple()),
-            ("agieval", ("aqua-rat", "sat-math", "gaokao-mathqa", "math")),
         ]
     if domain_variant == "code_reasoning":
         return [("open_platypus", tuple())]
