@@ -25,9 +25,9 @@ SUPPORTED_SUFFIXES = {".json", ".jsonl", ".csv", ".parquet"}
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CURRICULUM_ROOT = PROJECT_ROOT / "data" / "curriculum"
 SPLIT_ALIASES = {
-    "train": ("train",),
-    "val": ("validation", "valid", "val", "dev", "test"),
-    "test": ("test", "eval", "evaluation", "dev"),
+    "train": ("train", "dev"),
+    "val": ("validation", "valid", "val", "test"),
+    "test": ("test", "eval", "evaluation"),
 }
 
 

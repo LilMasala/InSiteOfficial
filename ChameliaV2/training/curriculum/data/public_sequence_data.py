@@ -27,8 +27,8 @@ except ImportError:  # pragma: no cover - optional when reading compressed corpo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SPLIT_ALIASES = {
-    "train": ("train",),
-    "val": ("validation", "valid", "val", "dev", "test", "eval", "evaluation"),
+    "train": ("train", "dev"),
+    "val": ("validation", "valid", "val", "test"),
     "test": ("test", "eval", "evaluation"),
 }
 TEXT_SUFFIXES = {
