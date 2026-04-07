@@ -211,10 +211,9 @@ def split_samples(
     candidate_paths: list[Path],
 ) -> list[dict[str, torch.Tensor]]:
     """Apply deterministic holdout splitting when explicit split files are absent."""
-    if split == "train":
-        return samples
     if candidate_paths and any(split_matches(path, split) for path in candidate_paths):
         return samples
+    # No dedicated split file — apply consistent 80/20 holdout so train and val never overlap.
     train_samples, heldout_samples = holdout_split(samples, fraction=0.2)
     if split in {"val", "test"}:
         return heldout_samples

@@ -648,9 +648,12 @@ def _records_for_dataset(
     records: list[dict[str, Any]] = []
     for path in candidate_paths:
         records.extend(_read_records(path))
-    if not candidate_paths or split == "train":
+    if not candidate_paths:
         return records
-    if candidate_paths and not any(_split_matches(path, split) for path in candidate_paths):
+    has_split_file = any(_split_matches(path, split) for path in candidate_paths)
+    if not has_split_file:
+        # No dedicated split file — apply consistent 80/20 holdout so train and val
+        # never overlap. Both branches use the same deterministic split.
         train_records, heldout_records = holdout_split(records, fraction=0.2)
         return heldout_records if split in {"val", "test"} else train_records
     return records
