@@ -12,7 +12,9 @@ from src.chamelia.plugins.base import AbstractDomain
 from src.chamelia.tokenizers import SequenceTokenizer
 from training.curriculum.data.public_reasoning import (
     DEFAULT_CURRICULUM_ROOT,
+    agieval_subjects_for_variant,
     load_public_reasoning_samples,
+    load_public_reasoning_samples_for_subject,
 )
 from training.curriculum.domains.base import (
     BaseCurriculumDomain,
@@ -393,11 +395,16 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
 
             train_acc = self._probe_split_accuracy(model, runtime_domain, level, split="train", device=device)
             val_acc = self._probe_split_accuracy(model, runtime_domain, level, split="val", device=device)
-            return {
+            metrics: dict[str, float] = {
                 "accuracy": val_acc,
                 "consistency": max(0.0, 1.0 - abs(train_acc - val_acc)),
                 "generalization": val_acc,
             }
+            # Per-subject breakdown for AGIEval subjects
+            for subject in agieval_subjects_for_variant(self.spec.name):
+                subj_acc = self._probe_subject_accuracy(model, runtime_domain, subject, device=device)
+                metrics[subject] = subj_acc
+            return metrics
         finally:
             if previous_domain is not None:
                 model.set_domain(previous_domain)
@@ -430,6 +437,81 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
             for batch in loader:
                 batch = batch.to_device(device)
                 masked_tokens, mask = self.get_masking_strategy(level).apply(batch.tokens, level)  # type: ignore[arg-type]
+                tokenized = runtime_domain.get_tokenizer()(masked_tokens.long())
+                outputs = model(
+                    tokens=tokenized.tokens,
+                    mask=mask.to(device),
+                    domain_state=batch.domain_state,
+                    actor_mode="mode2",
+                    store_to_memory=False,
+                    input_kind="embedded_tokens",
+                )
+                action_vec = outputs["action_vec"]
+                choice_mask = batch.domain_state.get("choice_mask")
+                correct_choice = batch.domain_state.get("correct_choice")
+                if (
+                    choice_mask is not None
+                    and correct_choice is not None
+                    and choice_mask.any()
+                    and (correct_choice >= 0).any()
+                ):
+                    choice_tokens = batch.domain_state["choice_tokens"].long().clamp(min=0, max=action_vec.shape[1] - 1)
+                    gathered = action_vec.gather(1, choice_tokens)
+                    gathered = gathered.masked_fill(~choice_mask.bool(), float("-inf"))
+                    pred = action_vec.argmax(dim=-1)
+                    target = batch.domain_state["answer_token"].long()
+                    valid = (correct_choice >= 0).bool()
+                    if valid.any():
+                        pred[valid] = gathered[valid].argmax(dim=-1)
+                        target[valid] = correct_choice[valid].long()
+                else:
+                    pred = action_vec.argmax(dim=-1)
+                    target = batch.domain_state["answer_token"].long()
+                correct += int((pred == target).sum().item())
+                total += int(target.numel())
+        return correct / max(1, total)
+
+    def _probe_subject_accuracy(
+        self,
+        model: Any,
+        runtime_domain: AbstractDomain,
+        subject: str,
+        device: torch.device,
+    ) -> float:
+        """Evaluate answer-token accuracy on one specific AGIEval subject.
+
+        Args:
+            model: Active model.
+            runtime_domain: Runtime domain plugin.
+            subject: AGIEval subject keyword, e.g. ``"lsat-ar"``.
+            device: Device.
+
+        Returns:
+            Scalar accuracy in ``[0, 1]``, or 0.0 if no data found.
+        """
+        from torch.utils.data import DataLoader
+        from training.curriculum.domains.base import TensorSequenceDataset
+
+        samples = load_public_reasoning_samples_for_subject(
+            subject=subject,
+            split="val",
+            vocab_size=self.vocab_size,
+            seq_len=self.spec.seq_len,
+            max_samples=self.spec.dataset_size,
+            data_root=self.data_root,
+        )
+        if not samples:
+            return 0.0
+        dataset = TensorSequenceDataset(samples)
+        loader = DataLoader(dataset, batch_size=self.spec.batch_size, shuffle=False,
+                            collate_fn=lambda batch: self._collate_samples(batch, "val"))
+        correct = 0
+        total = 0
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to_device(device)
+                masked_tokens, mask = self.get_masking_strategy(0).apply(batch.tokens, 0)
                 tokenized = runtime_domain.get_tokenizer()(masked_tokens.long())
                 outputs = model(
                     tokens=tokenized.tokens,

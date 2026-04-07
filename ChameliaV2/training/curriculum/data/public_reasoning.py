@@ -663,20 +663,85 @@ def _dataset_plan_for_variant(domain_variant: str) -> list[tuple[str, tuple[str,
         # lsat-ar + lsat-lr + lsat-rc cover the three LSAT sections
         return [("agieval", ("lsat-ar", "lsat-lr", "lsat-rc"))]
     if domain_variant == "gre":
-        # SAT reasoning + LogiQA English is the closest proxy for GRE verbal
-        return [("agieval", ("sat-en", "logiqa-en")), ("folio", tuple())]
+        # SAT reasoning + LogiQA English + sat-en-without-passage
+        return [("agieval", ("sat-en", "sat-en-without-passage", "logiqa-en")), ("folio", tuple())]
     if domain_variant == "formal_logic":
-        # ProofWriter (585k deductive chains) + FOLIO (FOL entailment) + LogiQA
-        return [("proofwriter", tuple()), ("folio", tuple()), ("agieval", ("logiqa-en",))]
+        # ProofWriter + FOLIO + LogiQA (EN + ZH) + Chinese law exam (JEC-QA)
+        return [
+            ("proofwriter", tuple()),
+            ("folio", tuple()),
+            ("agieval", ("logiqa-en", "logiqa-zh", "jec-qa-ca", "jec-qa-kd")),
+        ]
     if domain_variant == "math_competition":
-        # GSM8K (grade-school) + all Hendrycks MATH subtypes
-        return [("gsm8k", tuple()), ("hendrycks_math", tuple())]
+        # GSM8K + Hendrycks MATH + AQUA-RAT + SAT Math + Gaokao math + AGIEval math
+        return [
+            ("gsm8k", tuple()),
+            ("hendrycks_math", tuple()),
+            ("agieval", ("aqua-rat", "sat-math", "gaokao-mathqa", "gaokao-mathcloze", "math")),
+        ]
     if domain_variant == "code_reasoning":
         return [("open_platypus", tuple())]
     if domain_variant == "mcat_cars":
-        # LSAT reading comprehension + SAT English passages
-        return [("agieval", ("lsat-rc", "sat-en"))]
+        # LSAT reading comprehension + SAT English passages (with and without passage)
+        return [("agieval", ("lsat-rc", "sat-en", "sat-en-without-passage"))]
+    if domain_variant == "gaokao_science":
+        # Chinese college entrance exam — biology, chemistry, physics
+        return [("agieval", ("gaokao-biology", "gaokao-chemistry", "gaokao-physics"))]
+    if domain_variant == "gaokao_humanities":
+        # Chinese college entrance exam — history, geography, Chinese, English
+        return [("agieval", ("gaokao-history", "gaokao-geography", "gaokao-chinese", "gaokao-english"))]
     return []
+
+
+def agieval_subjects_for_variant(domain_variant: str) -> list[str]:
+    """Return the list of individual AGIEval subject keywords for a domain variant.
+
+    Args:
+        domain_variant: Stage-1 domain variant.
+
+    Returns:
+        Subject keyword list (may be empty for non-AGIEval variants).
+    """
+    subjects: list[str] = []
+    for dataset_name, keywords in _dataset_plan_for_variant(domain_variant):
+        if dataset_name == "agieval":
+            subjects.extend(keywords)
+    return subjects
+
+
+def load_public_reasoning_samples_for_subject(
+    subject: str,
+    split: str,
+    vocab_size: int,
+    seq_len: int,
+    max_samples: int,
+    data_root: Path | None = None,
+) -> list[dict[str, torch.Tensor]]:
+    """Load reasoning samples filtered to one specific AGIEval subject keyword.
+
+    Args:
+        subject: AGIEval subject keyword, e.g. ``"lsat-ar"``.
+        split: Requested split.
+        vocab_size: Vocabulary size V.
+        seq_len: Sequence length N.
+        max_samples: Maximum sample count.
+        data_root: Optional curriculum data root.
+
+    Returns:
+        Normalized sample list.
+    """
+    root = data_root or DEFAULT_CURRICULUM_ROOT
+    stage1_root = root / "stage1"
+    dataset_dir = stage1_root / "agieval"
+    samples: list[dict[str, torch.Tensor]] = []
+    for record in _records_for_dataset(dataset_dir, split=split, keywords=(subject,)):
+        normalized = _normalize_reasoning_record(record, vocab_size=vocab_size, seq_len=seq_len)
+        if normalized is None:
+            continue
+        samples.append(normalized)
+        if len(samples) >= max_samples:
+            return samples
+    return samples
 
 
 def load_public_reasoning_samples(

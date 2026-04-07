@@ -744,6 +744,10 @@ class CurriculumStageRunner:
                     if self.global_step % eval_interval == 0:
                         stage_results = self.graduation_manager.run_stage_probe(self.model, self.stage_idx)
                         domain_results = stage_results[domain.domain_name()]
+                        metrics_str = "  ".join(f"{k}={v:.4f}" for k, v in sorted(domain_results.items()))
+                        _runner_log(
+                            f"probe  domain={domain.domain_name()}  level={domain.cost.current_level}  step={self.global_step}  {metrics_str}"
+                        )
                         if domain.cost.maybe_advance(domain_results):
                             self.save_stage_checkpoint(
                                 self.stage_idx,
