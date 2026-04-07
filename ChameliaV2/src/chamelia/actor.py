@@ -298,8 +298,11 @@ class Actor(nn.Module):
         baseline_paths = candidate_paths.clone()
         baseline_postures = candidate_postures.clone()
         baseline_reasoning = reasoning_states.clone()
+        
+        baseline_paths[:, 0, :, :] = 0.0
         baseline_postures[:, 0, :] = 0.0
         baseline_reasoning[:, 0, :] = state_token.squeeze(1)
+
         return baseline_paths, baseline_postures, baseline_reasoning
 
     def compute_posture_diversity_loss(

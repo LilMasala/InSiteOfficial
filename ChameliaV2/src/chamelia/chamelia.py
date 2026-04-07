@@ -693,42 +693,69 @@ class Chamelia(nn.Module):
         self,
         temperature: float = 0.25,
     ) -> torch.Tensor | None:
-        """Replay stored retrieval decisions against realized outcomes."""
+        """Replay stored retrieval decisions against realized outcomes (Vectorized)."""
         examples = self.memory.get_retrieval_training_examples()
         if not examples:
             return None
 
         device = next(self.parameters()).device
-        losses: list[torch.Tensor] = []
-        for example in examples:
-            scorer_out = self.retrieval_scorer(
-                query_key=example.query_key.unsqueeze(0).to(device),
-                memory_keys=example.memory_keys.unsqueeze(0).to(device),
-                memory_summaries=example.memory_summaries.unsqueeze(0).to(device),
-                memory_quality=example.base_quality_scores.unsqueeze(0).to(device),
-                query_posture=(
-                    example.query_posture.unsqueeze(0).to(device)
-                    if example.query_posture is not None
-                    else None
-                ),
-                memory_postures=(
-                    example.memory_postures.unsqueeze(0).to(device)
-                    if example.memory_postures is not None
-                    else None
-                ),
-            )
-            if example.memory_postures is None:
+        
+        # Group examples by the number of retrieved memories (K) to allow batching
+        from collections import defaultdict
+        grouped_examples = defaultdict(list)
+        for ex in examples:
+            if ex.memory_postures is None:
                 continue
+            k_size = ex.memory_keys.shape[0]
+            grouped_examples[k_size].append(ex)
+
+        losses: list[torch.Tensor] = []
+        total_valid_examples = 0
+
+        for k_size, group in grouped_examples.items():
+            # Stack into full batches: [B, ...]
+            query_keys = torch.stack([ex.query_key for ex in group]).to(device)
+            memory_keys = torch.stack([ex.memory_keys for ex in group]).to(device)
+            memory_summaries = torch.stack([ex.memory_summaries for ex in group]).to(device)
+            base_quality = torch.stack([ex.base_quality_scores for ex in group]).to(device)
+            selected_postures = torch.stack([ex.selected_posture for ex in group]).to(device)
+            memory_postures = torch.stack([ex.memory_postures for ex in group]).to(device)
+            realized_ics = torch.tensor([ex.realized_ic for ex in group], dtype=torch.float32, device=device)
+
+            # Handle optional query_posture
+            if any(ex.query_posture is not None for ex in group):
+                query_postures = torch.stack([
+                    ex.query_posture if ex.query_posture is not None else torch.zeros_like(selected_postures[0])
+                    for ex in group
+                ]).to(device)
+            else:
+                query_postures = None
+
+            # Batched forward pass
+            scorer_out = self.retrieval_scorer(
+                query_key=query_keys,
+                memory_keys=memory_keys,
+                memory_summaries=memory_summaries,
+                memory_quality=base_quality,
+                query_posture=query_postures,
+                memory_postures=memory_postures,
+            )
+
+            # Batched loss computation
             loss = compute_retrieval_relevance_loss(
                 learned_scores=scorer_out["scores"],
-                retrieved_postures=example.memory_postures.unsqueeze(0).to(device),
-                selected_posture=example.selected_posture.unsqueeze(0).to(device),
-                base_quality_scores=example.base_quality_scores.unsqueeze(0).to(device),
-                realized_ic=torch.tensor([example.realized_ic], dtype=torch.float32, device=device),
+                retrieved_postures=memory_postures,
+                selected_posture=selected_postures,
+                base_quality_scores=base_quality,
+                realized_ic=realized_ics,
                 temperature=temperature,
             )
+            
             if loss is not None:
-                losses.append(loss)
-        if not losses:
+                losses.append(loss * len(group))
+                total_valid_examples += len(group)
+
+        if not losses or total_valid_examples == 0:
             return None
-        return torch.stack(losses).mean()
+            
+        return torch.stack(losses).sum() / total_valid_examples

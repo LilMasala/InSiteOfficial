@@ -76,6 +76,7 @@ class Configurator(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         memory_read_k: int = 8,
+        num_hierarchies: int = 3,
     ) -> None:
         """Initialize the configurator.
 
@@ -87,6 +88,7 @@ class Configurator(nn.Module):
             mlp_ratio: Expansion ratio for transformer MLP blocks.
             dropout: Dropout probability.
             memory_read_k: Maximum number of memory episodes consumed per sample.
+            num_hierarchies: Number of structural hierarchy levels expected from the backbone.
 
         Returns:
             None.
@@ -95,6 +97,7 @@ class Configurator(nn.Module):
         self.embed_dim = embed_dim
         self.num_ctx_tokens = num_ctx_tokens
         self.memory_read_k = memory_read_k
+        self.num_hierarchies = num_hierarchies
 
         self.ctx_tokens = nn.Parameter(torch.empty(1, num_ctx_tokens, embed_dim))
         nn.init.trunc_normal_(self.ctx_tokens, std=0.02)
@@ -105,10 +108,10 @@ class Configurator(nn.Module):
                     nn.Linear(embed_dim, embed_dim),
                     nn.LayerNorm(embed_dim),
                 )
-                for _ in range(3)
+                for _ in range(num_hierarchies)
             ]
         )
-        self.level_embed = nn.Embedding(3, embed_dim)
+        self.level_embed = nn.Embedding(num_hierarchies, embed_dim)
         self.memory_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.LayerNorm(embed_dim),
@@ -144,7 +147,7 @@ class Configurator(nn.Module):
         """Generate context tokens from hierarchical latent state and memory.
 
         Args:
-            hjepa_outputs: Dict containing "target_features_per_level" as a list of 3 tensors,
+            hjepa_outputs: Dict containing "target_features_per_level" as a list of tensors,
                 each of shape [B, N_i, D].
             memory_tokens: Optional memory-summary tensor of shape [B, K, D], where
                 K <= memory_read_k.
@@ -158,17 +161,19 @@ class Configurator(nn.Module):
             raise KeyError("hjepa_outputs must contain 'target_features_per_level'.")
 
         target_features_per_level = hjepa_outputs["target_features_per_level"]
-        if len(target_features_per_level) != 3:
-            raise ValueError("Configurator expects exactly 3 hierarchy levels.")
 
         level_features: list[torch.Tensor] = []
         B = target_features_per_level[0].shape[0]
         device = target_features_per_level[0].device
 
+        # Dynamically loop through however many levels HJEPA emitted
         for level_idx, feats in enumerate(target_features_per_level):
-            projected = self.level_proj[level_idx](feats)
+            proj_idx = min(level_idx, len(self.level_proj) - 1)
+            embed_idx = min(level_idx, self.level_embed.num_embeddings - 1)
+            
+            projected = self.level_proj[proj_idx](feats)
             _, N_i, _ = projected.shape
-            level_ids = torch.full((B, N_i), level_idx, device=device, dtype=torch.long)
+            level_ids = torch.full((B, N_i), embed_idx, device=device, dtype=torch.long)
             projected = projected + self.level_embed(level_ids)
             level_features.append(projected)
 

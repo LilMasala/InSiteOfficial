@@ -149,21 +149,18 @@ def forward_hjepa(
     with torch.no_grad():
         target_features = _encode_target_preembedded(cast(HJEPA, hjepa), inputs)
 
-    mask_bool = mask.bool()
-    num_masked_per_sample = mask_bool.sum(dim=1)
-    max_masked = int(num_masked_per_sample.max().item())
-    if max_masked == 0:
-        max_masked = 1
-        mask_indices = torch.zeros((B, 1), dtype=torch.long, device=mask.device)
-        mask_valid = torch.zeros((B, 1), dtype=torch.bool, device=mask.device)
-    else:
-        mask_indices = torch.zeros((B, max_masked), dtype=torch.long, device=mask.device)
-        mask_valid = torch.zeros((B, max_masked), dtype=torch.bool, device=mask.device)
-        for batch_idx in range(B):
-            sample_mask_indices = mask_bool[batch_idx].nonzero(as_tuple=True)[0]
-            num_masked = len(sample_mask_indices)
-            mask_indices[batch_idx, :num_masked] = sample_mask_indices
-            mask_valid[batch_idx, :num_masked] = True
+    # --- VECTORIZED MASKING ---
+    # Sort the mask descending to pack all 1s (masked indices) to the front
+    sorted_mask, mask_indices = torch.sort(mask.to(torch.uint8), dim=1, descending=True)
+    mask_valid = sorted_mask.bool()
+    
+    # We slice to the maximum masked length in the batch to avoid wasted compute.
+    max_masked = int(mask_valid.sum(dim=1).max().item())
+    max_masked = max(1, max_masked)  # Ensure at least 1 dimension to prevent collapse
+    
+    mask_indices = mask_indices[:, :max_masked]
+    mask_valid = mask_valid[:, :max_masked]
+    # --------------------------
 
     pos_embed = hjepa.context_encoder.vit.pos_embed[:, 1 : N + 1, :].expand(B, -1, -1)
     predicted_features = hjepa.predictor(

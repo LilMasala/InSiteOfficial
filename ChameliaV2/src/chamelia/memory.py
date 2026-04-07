@@ -407,50 +407,80 @@ class LatentMemory:
         episode_lists: list[list[EpisodeRecord]],
         retrieval_scores: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Convert retrieved episodes into richer summary tokens and outcome-quality scores."""
+        """Convert retrieved episodes into richer summary tokens and outcome-quality scores (Vectorized)."""
         if not episode_lists:
             return None, None
 
+        B = len(episode_lists)
         max_count = max(len(episodes) for episodes in episode_lists)
         if max_count == 0:
             return None, None
 
-        summary_tokens = torch.zeros(
-            len(episode_lists),
-            max_count,
-            self.embed_dim,
-            dtype=torch.float32,
-        )
-        summary_scores = torch.full(
-            (len(episode_lists), max_count),
-            float("-inf"),
-            dtype=torch.float32,
-        )
-        for batch_idx, episodes in enumerate(episode_lists):
-            for episode_idx, record in enumerate(episodes[:max_count]):
-                components: list[torch.Tensor] = []
-                components.append(_normalize_vector(record.key.float()))
-                components.append(_normalize_vector(record.ctx_tokens.float().mean(dim=0)))
-                action_vec = _lift_to_embed(record.action, self.embed_dim)
-                if action_vec is not None:
-                    components.append(_normalize_vector(action_vec))
+        # Pre-allocate tensors for up to 6 components: [Key, Ctx, Action, Posture, Outcome, Diff]
+        # Shape: [Batch, K_Retrievals, 6_Components, Embed_Dim]
+        comp_vals = torch.zeros(B, max_count, 6, self.embed_dim, dtype=torch.float32)
+        comp_mask = torch.zeros(B, max_count, 6, 1, dtype=torch.float32)
+        summary_scores = torch.full((B, max_count), float("-inf"), dtype=torch.float32)
+
+        for b, episodes in enumerate(episode_lists):
+            for k, record in enumerate(episodes[:max_count]):
+                # 1. Key
+                comp_vals[b, k, 0] = record.key.float()
+                comp_mask[b, k, 0] = 1.0
+                
+                # 2. Ctx tokens (mean)
+                comp_vals[b, k, 1] = record.ctx_tokens.float().mean(dim=0)
+                comp_mask[b, k, 1] = 1.0
+                
+                # 3. Action
+                a_flat = record.action.detach().float().reshape(-1)
+                a_len = min(a_flat.numel(), self.embed_dim)
+                comp_vals[b, k, 2, :a_len] = a_flat[:a_len]
+                comp_mask[b, k, 2] = 1.0
+                
+                # 4. Posture
                 if record.selected_posture is not None:
-                    lifted_posture = _lift_to_embed(record.selected_posture, self.embed_dim)
-                    if lifted_posture is not None:
-                        components.append(_normalize_vector(lifted_posture))
+                    p_flat = record.selected_posture.detach().float().reshape(-1)
+                    p_len = min(p_flat.numel(), self.embed_dim)
+                    comp_vals[b, k, 3, :p_len] = p_flat[:p_len]
+                    comp_mask[b, k, 3] = 1.0
+                    
+                # 5 & 6. Outcome and Difference
                 if record.outcome_key is not None:
-                    outcome_key = record.outcome_key.float()
-                    components.append(_normalize_vector(outcome_key))
-                    components.append(_normalize_vector(outcome_key - record.key.float()))
-                summary = torch.stack(components, dim=0).mean(dim=0)
-                summary_tokens[batch_idx, episode_idx] = _normalize_vector(summary)
-                if retrieval_scores is not None and episode_idx < retrieval_scores.shape[1]:
-                    summary_scores[batch_idx, episode_idx] = retrieval_scores[batch_idx, episode_idx]
+                    out_key = record.outcome_key.float()
+                    comp_vals[b, k, 4] = out_key
+                    comp_mask[b, k, 4] = 1.0
+                    comp_vals[b, k, 5] = out_key - record.key.float()
+                    comp_mask[b, k, 5] = 1.0
+
+                # Determine Score
+                if retrieval_scores is not None and k < retrieval_scores.shape[1]:
+                    summary_scores[b, k] = retrieval_scores[b, k]
                 else:
-                    summary_scores[batch_idx, episode_idx] = _record_quality_score(record)
+                    summary_scores[b, k] = _record_quality_score(record)
+
+        # ------------------------------------------------------------------
+        # Vectorized Math Operations (replaces inner-loop stacking/normalization)
+        # ------------------------------------------------------------------
+        
+        # 1. Normalize individual components (safe against div-by-zero)
+        norms = comp_vals.norm(p=2, dim=-1, keepdim=True)
+        norms = torch.where(norms == 0.0, torch.ones_like(norms), norms)
+        comp_vals_normalized = comp_vals / norms
+        
+        # 2. Compute mean across the valid components
+        sum_components = (comp_vals_normalized * comp_mask).sum(dim=2)
+        valid_counts = comp_mask.sum(dim=2).clamp_min(1.0)
+        summary_mean = sum_components / valid_counts
+        
+        # 3. Final normalization of the resulting summary token
+        final_norms = summary_mean.norm(p=2, dim=-1, keepdim=True)
+        final_norms = torch.where(final_norms == 0.0, torch.ones_like(final_norms), final_norms)
+        summary_tokens = summary_mean / final_norms
 
         if not torch.isfinite(summary_scores).any():
             return None, None
+            
         return summary_tokens, summary_scores
 
     def get_critic_training_pairs(
