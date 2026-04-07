@@ -327,7 +327,7 @@ def test_chamelia_pipeline_shapes() -> None:
         outputs["action_vec"],
         outputs["selected_path"][:, 0, :],
     )
-    stored_record = memory.records[model._pending_record_indices[0]]
+    stored_record = memory.get_record_by_id(model._pending_record_indices[0])
     assert stored_record.candidate_postures is not None
     assert stored_record.selected_posture is not None
     assert stored_record.candidate_reasoning_states is not None
@@ -1552,3 +1552,62 @@ def test_episode_records_capture_model_version() -> None:
     assert outputs["action_vec"].shape == (1, action_dim)
     assert model.memory.records
     assert model.memory.records[-1].model_version == "bridge-test-model-v1"
+
+
+def test_latent_memory_fill_outcome_safe_after_buffer_wrap() -> None:
+    """fill_outcome must not corrupt a newer record when the buffer wraps.
+
+    This is a regression test for the circular-buffer index corruption bug:
+    store() used to return the raw slot position, so if the buffer wrapped
+    between store() and fill_outcome(), the fill would write to a different
+    (newer) record and silently corrupt critic/world-model training pairs.
+
+    After the fix, store() returns a stable record_id; fill_outcome() looks
+    up the slot via _id_to_slot and is a no-op when the record was evicted.
+    """
+    embed_dim = 4
+    max_episodes = 3  # tiny buffer so we can wrap quickly
+    memory = LatentMemory(embed_dim=embed_dim, max_episodes=max_episodes, retrieval_k=2)
+
+    def _make_record(step: int) -> EpisodeRecord:
+        return EpisodeRecord(
+            key=torch.randn(embed_dim),
+            action=torch.randn(2),
+            ctx_tokens=torch.randn(2, embed_dim),
+            ic_at_decision=float(step),
+            ic_realized=None,
+            tc_predicted=0.0,
+            outcome_key=None,
+            step=step,
+            domain_name="test",
+        )
+
+    # Store 3 records to fill the buffer.
+    rid0 = memory.store(_make_record(0))
+    rid1 = memory.store(_make_record(1))
+    rid2 = memory.store(_make_record(2))
+
+    # All three should be retrievable.
+    assert memory.get_record_by_id(rid0) is not None
+    assert memory.get_record_by_id(rid1) is not None
+    assert memory.get_record_by_id(rid2) is not None
+
+    # Fill outcome for rid0 before it is evicted.
+    filled = memory.fill_outcome(rid0, ic_realized=0.5, outcome_key=torch.randn(embed_dim))
+    assert filled
+    assert memory.get_record_by_id(rid0).ic_realized == 0.5  # type: ignore[union-attr]
+
+    # Store one more record — this overwrites slot 0, evicting rid0.
+    rid3 = memory.store(_make_record(3))
+    assert memory.get_record_by_id(rid0) is None  # evicted
+
+    # Attempting to fill the evicted record must be a silent no-op,
+    # not corrupt the new record that now occupies that slot.
+    filled_after_eviction = memory.fill_outcome(
+        rid0, ic_realized=99.0, outcome_key=torch.randn(embed_dim)
+    )
+    assert not filled_after_eviction
+
+    new_record = memory.get_record_by_id(rid3)
+    assert new_record is not None
+    assert new_record.ic_realized is None  # untouched — the bug would have set this to 99.0

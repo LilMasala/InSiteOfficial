@@ -29,6 +29,7 @@ class EpisodeRecord:
     outcome_key: torch.Tensor | None
     step: int
     domain_name: str
+    record_id: int = 0
     model_version: str | None = None
     candidate_postures: torch.Tensor | None = None
     selected_posture: torch.Tensor | None = None
@@ -175,6 +176,8 @@ class LatentMemory:
         self.records: list[EpisodeRecord] = []
         self.size = 0
         self.head = 0
+        self._next_record_id = 0
+        self._id_to_slot: dict[int, int] = {}
 
     def store(self, record: EpisodeRecord) -> int:
         """Store an episode record in the circular buffer.
@@ -183,9 +186,19 @@ class LatentMemory:
             record: EpisodeRecord with key [D], action [A], and ctx_tokens [C, D].
 
         Returns:
-            Integer storage index.
+            Stable integer record ID. This ID remains valid until the slot is
+            overwritten by a future store when the buffer is full. Callers must
+            use this ID (not a raw slot index) when calling fill_outcome.
         """
         idx = self.head
+        record_id = self._next_record_id
+        self._next_record_id += 1
+
+        # If overwriting an existing slot, evict its stable ID from the lookup.
+        if len(self.records) >= self.max_episodes:
+            evicted_id = self.records[idx].record_id
+            self._id_to_slot.pop(evicted_id, None)
+
         self.keys[idx] = record.key.detach().cpu()
         stored_record = EpisodeRecord(
             key=record.key.detach().cpu(),
@@ -197,6 +210,7 @@ class LatentMemory:
             outcome_key=_cpu_optional_tensor(record.outcome_key),
             step=record.step,
             domain_name=record.domain_name,
+            record_id=record_id,
             model_version=record.model_version,
             candidate_postures=_cpu_optional_tensor(record.candidate_postures),
             selected_posture=_cpu_optional_tensor(record.selected_posture),
@@ -216,23 +230,46 @@ class LatentMemory:
             self.records.append(stored_record)
         else:
             self.records[idx] = stored_record
+        self._id_to_slot[record_id] = idx
         self.size = min(self.size + 1, self.max_episodes)
         self.head = (self.head + 1) % self.max_episodes
-        return idx
+        return record_id
 
-    def fill_outcome(self, idx: int, ic_realized: float, outcome_key: torch.Tensor) -> None:
+    def fill_outcome(self, record_id: int, ic_realized: float, outcome_key: torch.Tensor) -> bool:
         """Fill in delayed outcome information for a stored episode.
 
+        If the record has been evicted (buffer wrapped past it), this is a
+        silent no-op and returns False. Callers should not use raw slot indices
+        here — only the stable record_id returned by store().
+
         Args:
-            idx: Integer record index.
+            record_id: Stable record ID returned by store().
             ic_realized: Realized intrinsic cost scalar.
             outcome_key: Outcome latent key tensor of shape [D].
 
         Returns:
-            None.
+            True if the record was found and updated, False if it was evicted.
         """
-        self.records[idx].ic_realized = ic_realized
-        self.records[idx].outcome_key = outcome_key.detach().cpu()
+        slot = self._id_to_slot.get(record_id)
+        if slot is None:
+            return False
+        self.records[slot].ic_realized = ic_realized
+        self.records[slot].outcome_key = outcome_key.detach().cpu()
+        return True
+
+    def get_record_by_id(self, record_id: int) -> EpisodeRecord | None:
+        """Return the record for a given stable record_id, or None if evicted.
+
+        Args:
+            record_id: Stable record ID returned by store().
+
+        Returns:
+            EpisodeRecord or None.
+        """
+        slot = self._id_to_slot.get(record_id)
+        if slot is None:
+            return None
+        return self.records[slot]
 
     def retrieve(
         self,

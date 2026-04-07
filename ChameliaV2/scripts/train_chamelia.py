@@ -548,10 +548,15 @@ def initialize_from_checkpoint(
     else:
         raise ValueError(f"Checkpoint '{checkpoint_path}' does not contain a model_state_dict.")
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=True)
-    if missing or unexpected:
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if unexpected:
         raise RuntimeError(
-            f"Checkpoint '{checkpoint_path}' failed strict load; missing={missing}, unexpected={unexpected}"
+            f"Checkpoint '{checkpoint_path}' has unexpected keys (architecture regression?): {unexpected}"
+        )
+    if missing:
+        _log(
+            f"initialize_from_checkpoint: {len(missing)} keys missing from checkpoint "
+            f"(will use random init) — first 10: {missing[:10]}"
         )
 
 
