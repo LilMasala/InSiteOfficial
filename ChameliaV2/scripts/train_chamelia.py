@@ -523,30 +523,41 @@ def _stage_learning_rate(
     stage_cfg = curriculum_config.get("curriculum", {}).get("stages", {}).get(stage_key, {})
     return float(stage_cfg.get("learning_rate", fallback_lr))
 
-
 def initialize_from_checkpoint(
     model: Chamelia,
     checkpoint_path: str | Path,
     *,
     device: torch.device,
 ) -> None:
-    """Initialize one model from a saved training or bridge artifact checkpoint.
-
-    Args:
-        model: Model to initialize.
-        checkpoint_path: Path to checkpoint payload.
-        device: Active runtime device.
-
-    Returns:
-        None.
-    """
+    """Initialize one model from a saved training or bridge artifact checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
     payload = torch.load(checkpoint_path, map_location=device)
+
+    # if this is a tiny status wrapper, chase the real bridge artifact
+    if isinstance(payload, dict) and "bridge_artifact_path" in payload:
+        bridge_path = Path(payload["bridge_artifact_path"])
+        if not bridge_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint wrapper '{checkpoint_path}' points to missing bridge artifact '{bridge_path}'."
+            )
+        payload = torch.load(bridge_path, map_location=device)
+
+    state_dict = None
+
     if isinstance(payload, dict) and isinstance(payload.get("model_state_dict"), dict):
         state_dict = payload["model_state_dict"]
-    elif isinstance(payload, dict) and all(isinstance(key, str) for key in payload):
-        state_dict = payload
-    else:
-        raise ValueError(f"Checkpoint '{checkpoint_path}' does not contain a model_state_dict.")
+    elif isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
+        state_dict = payload["state_dict"]
+    elif isinstance(payload, dict):
+        keys = list(payload.keys())
+        looks_like_param_dict = any("." in key for key in keys)
+        if looks_like_param_dict:
+            state_dict = payload
+
+    if state_dict is None:
+        raise ValueError(
+            f"Checkpoint '{checkpoint_path}' does not contain loadable model weights."
+        )
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if unexpected:

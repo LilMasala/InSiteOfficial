@@ -782,7 +782,7 @@ class CurriculumStageRunner:
         try:
             torch.save(payload, status_path)
             last_checkpoint_file = self.checkpoint_dir / "last_checkpoint.txt"
-            last_checkpoint_file.write_text(str(status_path))
+            last_checkpoint_file.write_text(str(bridge_artifact_path or status_path))
         except (RuntimeError, OSError) as exc:
             _runner_log(
                 f"WARNING: status checkpoint write failed (transient NFS error?), "
