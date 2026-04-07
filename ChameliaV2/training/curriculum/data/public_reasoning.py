@@ -590,15 +590,12 @@ def _normalize_open_answer_record(
             "correct_choice": torch.tensor(correct_idx, dtype=torch.long),
         }
 
-    # Non-numeric open answer — keep as-is (hash into vocab)
-    return {
-        "tokens": encode_reasoning_text(f"Question: {question}", vocab_size=vocab_size, seq_len=seq_len),
-        "target": _default_target(answer_text, vocab_size=vocab_size, seq_len=seq_len),
-        "answer": torch.tensor(_token_id_for_text(answer_text, vocab_size), dtype=torch.long),
-        "choice_tokens": torch.zeros(MAX_REASONING_CHOICES, dtype=torch.long),
-        "choice_mask": torch.zeros(MAX_REASONING_CHOICES, dtype=torch.bool),
-        "correct_choice": torch.tensor(-1, dtype=torch.long),
-    }
+    # Non-numeric, non-MCQ open answer (e.g. symbolic math like \frac{1}{2},
+    # or free-text code/reasoning answers from open_platypus).
+    # Hashing these into a unique vocab token produces an unlearnable target —
+    # the model can never predict a random hash, so these examples contribute
+    # only noise to the loss without improving accuracy.  Skip them.
+    return None
 
 
 def _normalize_reasoning_record(
