@@ -117,15 +117,10 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
         ]
 
         def probe_fn(model: Any, level: int) -> dict[str, float]:
+            # Fallback only when model is None — never called when model is available.
             _ = model
-            base = min(0.99, 0.68 + 0.07 * level)
-            return {
-                "error_score": base,
-                "calibration": min(0.99, base - 0.02 + 0.05),
-                "rule_probe": min(0.99, base),
-                "regime_detection": min(0.99, base + 0.03),
-                "counterfactual": min(0.99, base + 0.02),
-            }
+            return {"error_score": 0.0, "calibration": 0.0, "rule_probe": 0.0,
+                    "regime_detection": 0.0, "counterfactual": 0.0}
 
         def sample_builder(level: int, split: str, spec: DomainSpec) -> list[dict[str, torch.Tensor]]:
             max_samples = spec.dataset_size if split == "train" else spec.dataset_size * 4
@@ -163,6 +158,69 @@ class PatternCurriculumDomain(BaseCurriculumDomain):
         batch.targets["answer_token"] = answer_token
         batch.domain_state["answer_token"] = answer_token
         return batch
+
+    def run_advancement_probe(self, model: Any, level: int) -> dict[str, float]:
+        """Run held-out next-token accuracy probes when a model is available."""
+        if model is None:
+            return super().run_advancement_probe(model, level)
+
+        device = next(model.parameters()).device
+        previous_domain = getattr(model, "domain", None)
+
+        runtime_domain = self.build_runtime_domain(model.embed_dim)
+        if runtime_domain is None:
+            return super().run_advancement_probe(model, level)
+        model.set_domain(runtime_domain)
+
+        try:
+            train_acc = self._probe_split_accuracy(model, level, split="train", device=device)
+            val_acc = self._probe_split_accuracy(model, level, split="val", device=device)
+            return {
+                "error_score": val_acc,
+                "calibration": max(0.0, 1.0 - abs(train_acc - val_acc)),
+                "rule_probe": val_acc,
+                "regime_detection": val_acc,
+                "counterfactual": val_acc,
+            }
+        finally:
+            if previous_domain is not None:
+                model.set_domain(previous_domain)
+
+    def _probe_split_accuracy(
+        self,
+        model: Any,
+        level: int,
+        split: str,
+        device: torch.device,
+    ) -> float:
+        """Evaluate answer-token accuracy on one split."""
+        loader = self.get_data_loader(level, split=split)
+        correct = 0
+        total = 0
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to_device(device)
+                runtime_domain = getattr(model, "domain", None)
+                if runtime_domain is None or getattr(runtime_domain, "domain_name", "") != self.spec.name:
+                    runtime_domain = self.build_runtime_domain(model.embed_dim)
+                    if runtime_domain is None:
+                        return 0.0
+                    model.set_domain(runtime_domain)
+                tokenized = runtime_domain.get_tokenizer()(batch.tokens.long())
+                outputs = model(
+                    tokens=tokenized.tokens,
+                    mask=batch.input_mask,
+                    domain_state=batch.domain_state,
+                    actor_mode="mode2",
+                    store_to_memory=False,
+                    input_kind="embedded_tokens",
+                )
+                pred = outputs["action_vec"].argmax(dim=-1)
+                target = batch.domain_state["answer_token"].long()
+                correct += int((pred == target).sum().item())
+                total += int(target.numel())
+        return correct / max(1, total)
 
     def build_runtime_domain(self, embed_dim: int):
         """Build a sequence-based runtime plugin for pattern domains."""

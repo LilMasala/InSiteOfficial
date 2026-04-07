@@ -109,6 +109,9 @@ def _health_samples(level: int, split: str, spec: DomainSpec) -> list[dict[str, 
         next_state, _, _, _ = env.step(heuristic_action, {})
         tokens = _state_to_tokens(current_state, spec.seq_len, spec.vocab_size)
         target = _state_to_tokens(next_state, spec.seq_len, spec.vocab_size)
+        answer_token = torch.tensor(
+            HEALTH_ACTION_LABELS.index(heuristic_action), dtype=torch.long
+        )
         crisis = torch.tensor(
             float(
                 level >= 3
@@ -122,6 +125,7 @@ def _health_samples(level: int, split: str, spec: DomainSpec) -> list[dict[str, 
             {
                 "tokens": tokens,
                 "target": target,
+                "answer_token": answer_token,
                 "crisis": crisis,
                 "patient_state": _state_to_tensor(current_state),
             }
@@ -250,15 +254,10 @@ class HealthCurriculumDomain(BaseCurriculumDomain):
         ]
 
         def probe_fn(model: Any, level: int) -> dict[str, float]:
+            # Fallback only when model is None — never called when model is available.
             _ = model
-            base = min(0.99, 0.72 + 0.05 * level)
-            return {
-                "health_score": base,
-                "crisis_recognition": min(0.99, 0.74 + 0.05 * level),
-                "trust_alignment": min(0.99, 0.70 + 0.04 * level),
-                "autonomy_respect": min(0.99, 0.74 + 0.05 * level),
-                "personalization": min(0.99, 0.68 + 0.04 * level),
-            }
+            return {"health_score": 0.0, "crisis_recognition": 0.0, "trust_alignment": 0.0,
+                    "autonomy_respect": 0.0, "personalization": 0.0}
 
         super().__init__(
             spec=DomainSpec(
@@ -274,6 +273,116 @@ class HealthCurriculumDomain(BaseCurriculumDomain):
             probe_fn=probe_fn,
             sample_builder=_health_samples,
         )
+
+    def build_curriculum_batch(self, raw_batch: dict[str, Any], split: str):
+        """Attach answer-token and crisis supervision to the standard curriculum batch."""
+        batch = super().build_curriculum_batch(raw_batch, split)
+        answer_token = raw_batch["answer_token"].long() if "answer_token" in raw_batch else torch.zeros(
+            raw_batch["tokens"].shape[0], dtype=torch.long
+        )
+        batch.targets["answer_token"] = answer_token
+        batch.domain_state["answer_token"] = answer_token
+        if "crisis" in raw_batch:
+            batch.domain_state["crisis"] = raw_batch["crisis"]
+        if "patient_state" in raw_batch:
+            batch.domain_state["patient_state"] = raw_batch["patient_state"]
+        if "target" in raw_batch:
+            batch.domain_state["target"] = raw_batch["target"]
+        return batch
+
+    def run_advancement_probe(self, model: Any, level: int) -> dict[str, float]:
+        """Run held-out action-accuracy and crisis-recognition probes."""
+        if model is None:
+            return super().run_advancement_probe(model, level)
+
+        device = next(model.parameters()).device
+        previous_domain = getattr(model, "domain", None)
+
+        runtime_domain = self.build_runtime_domain(model.embed_dim)
+        if runtime_domain is None:
+            return super().run_advancement_probe(model, level)
+        model.set_domain(runtime_domain)
+
+        try:
+            train_acc, _ = self._probe_split_accuracy(model, level, split="train", device=device)
+            val_acc, crisis_acc = self._probe_split_accuracy(model, level, split="val", device=device)
+            generalization = max(0.0, 1.0 - abs(train_acc - val_acc))
+            return {
+                "health_score": val_acc,
+                "crisis_recognition": crisis_acc,
+                "trust_alignment": generalization,
+                "autonomy_respect": val_acc,
+                "personalization": generalization,
+            }
+        finally:
+            if previous_domain is not None:
+                model.set_domain(previous_domain)
+
+    def _probe_split_accuracy(
+        self,
+        model: Any,
+        level: int,
+        split: str,
+        device: torch.device,
+    ) -> tuple[float, float]:
+        """Evaluate action accuracy and crisis recognition on one split.
+
+        Returns:
+            Tuple of (overall_accuracy, crisis_recognition_accuracy).
+        """
+        loader = self.get_data_loader(level, split=split)
+        correct = 0
+        total = 0
+        crisis_correct = 0
+        crisis_total = 0
+        # Indices of interventionist actions (not "hold")
+        intervention_indices = {
+            HEALTH_ACTION_LABELS.index(a)
+            for a in ("stabilize", "support", "aggressive_optimize")
+            if a in HEALTH_ACTION_LABELS
+        }
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to_device(device)
+                runtime_domain = getattr(model, "domain", None)
+                if runtime_domain is None or getattr(runtime_domain, "domain_name", "") != self.spec.name:
+                    runtime_domain = self.build_runtime_domain(model.embed_dim)
+                    if runtime_domain is None:
+                        return 0.0, 0.0
+                    model.set_domain(runtime_domain)
+                tokenized = runtime_domain.get_tokenizer()(batch.tokens.long())
+                outputs = model(
+                    tokens=tokenized.tokens,
+                    mask=batch.input_mask,
+                    domain_state=batch.domain_state,
+                    actor_mode="mode2",
+                    store_to_memory=False,
+                    input_kind="embedded_tokens",
+                )
+                # Evaluate only over the action-label slice
+                n_labels = len(HEALTH_ACTION_LABELS)
+                action_logits = outputs["action_vec"][:, :n_labels]
+                pred = action_logits.argmax(dim=-1)
+                target = batch.domain_state["answer_token"].long().to(device)
+                correct += int((pred == target).sum().item())
+                total += int(target.numel())
+                # Crisis recognition: on crisis samples, model should pick an intervention
+                crisis = batch.domain_state.get("crisis")
+                if crisis is not None:
+                    crisis_mask = crisis.to(device).bool()
+                    if crisis_mask.any():
+                        crisis_pred = pred[crisis_mask]
+                        is_intervention = torch.tensor(
+                            [int(p.item()) in intervention_indices for p in crisis_pred],
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                        crisis_correct += int(is_intervention.sum().item())
+                        crisis_total += int(crisis_mask.sum().item())
+        overall = correct / max(1, total)
+        crisis_rec = crisis_correct / max(1, crisis_total)
+        return overall, crisis_rec
 
     def build_runtime_domain(self, embed_dim: int):
         """Build a simple sequence-based runtime plugin for health tokens."""

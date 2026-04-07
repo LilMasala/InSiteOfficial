@@ -284,13 +284,10 @@ def build_threshold_probe(metric_name: str) -> Callable[[Any, int], dict[str, fl
     """
 
     def probe_fn(model: Any, level: int) -> dict[str, float]:
+        # Only reached when model is None — real probes override run_advancement_probe.
         _ = model
-        base = min(0.99, 0.55 + 0.1 * level)
-        return {
-            metric_name: base,
-            "consistency": min(0.99, base + 0.05),
-            "generalization": min(0.99, base + 0.03),
-        }
+        _ = level
+        return {metric_name: 0.0, "consistency": 0.0, "generalization": 0.0}
 
     return probe_fn
 
