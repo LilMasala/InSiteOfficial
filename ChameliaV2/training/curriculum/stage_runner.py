@@ -803,16 +803,6 @@ class CurriculumStageRunner:
         metrics: dict[str, Any],
         timestamp: str,
     ) -> Path | None:
-        """Persist a bridge-loadable model artifact alongside stage status.
-
-        Args:
-            stage_idx: Stage index.
-            metrics: Metrics/event metadata.
-            timestamp: Shared checkpoint timestamp.
-
-        Returns:
-            Path to the saved bridge artifact, or ``None`` if export is unavailable.
-        """
         if not isinstance(self.model, torch.nn.Module):
             return None
         if self.export_model_config is None:
@@ -841,7 +831,8 @@ class CurriculumStageRunner:
             )
             return None
 
-        # Track best-scoring artifact and persist it to NFS if using scratch.
+        persistent_path = artifact_path
+
         score = float(metrics.get("best_score", metrics.get("game_score", metrics.get("accuracy", 0.0))))
         if self._nfs_best_artifact_dir is not None and score >= self._best_artifact_score:
             self._best_artifact_score = score
@@ -850,6 +841,7 @@ class CurriculumStageRunner:
             try:
                 import shutil
                 shutil.copy2(artifact_path, nfs_dest)
+                persistent_path = nfs_dest
                 _runner_log(
                     f"best_artifact_persisted score={score:.4f} "
                     f"scratch={artifact_path} nfs={nfs_dest}"
@@ -860,7 +852,7 @@ class CurriculumStageRunner:
                     f"scratch copy retained at {artifact_path} err={exc}"
                 )
 
-        return artifact_path
+        return persistent_path
 
     def resume_from_checkpoint(self, checkpoint_path: str) -> None:
         """Restore runner counters from a saved scaffold checkpoint.
