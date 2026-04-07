@@ -348,10 +348,10 @@ class SequenceRoPE1D(nn.Module):
         N = q.shape[2]
         cos = cast(torch.Tensor, self.cos_cached)[:N][None, None, :, :]  # [1,1,N,D//2]
         sin = cast(torch.Tensor, self.sin_cached)[:N][None, None, :, :]
-        return self._apply(q, cos, sin), self._apply(k, cos, sin)
+        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
 
     @staticmethod
-    def _apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def _rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         x1 = x[..., 0::2]
         x2 = x[..., 1::2]
         rotated = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
