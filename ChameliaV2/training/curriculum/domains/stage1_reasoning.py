@@ -409,6 +409,44 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
             if previous_domain is not None:
                 model.set_domain(previous_domain)
 
+    @staticmethod
+    def _score_batch(action_vec: torch.Tensor, domain_state: dict) -> tuple[int, int]:
+        """Score one batch in pure choice-space for MCQ, token-space for open answers.
+
+        For MCQ rows (choice_mask present and correct_choice >= 0) the prediction is
+        the argmax over the choice-token logits in choice-space — pred and target are
+        both indices into the choice list [0, num_choices).  For non-MCQ rows the
+        prediction is the argmax over the full vocab.  The two spaces never mix.
+
+        Returns:
+            (num_correct, num_total)
+        """
+        choice_mask = domain_state.get("choice_mask")
+        correct_choice = domain_state.get("correct_choice")
+
+        if (
+            choice_mask is not None
+            and correct_choice is not None
+            and isinstance(choice_mask, torch.Tensor)
+            and isinstance(correct_choice, torch.Tensor)
+        ):
+            choice_tokens = domain_state["choice_tokens"].long().clamp(min=0, max=action_vec.shape[1] - 1)
+            # gathered: [B, num_choices] — logits restricted to the choice letters
+            gathered = action_vec.gather(1, choice_tokens)
+            gathered = gathered.masked_fill(~choice_mask.bool(), float("-inf"))
+            # pred/target both live in choice-index space [0, num_choices)
+            mcq_valid = (correct_choice >= 0).bool()
+            if not mcq_valid.any():
+                return 0, 0
+            pred = gathered[mcq_valid].argmax(dim=-1)
+            target = correct_choice[mcq_valid].long()
+            return int((pred == target).sum().item()), int(target.numel())
+
+        # Fallback: open answer, compare full-vocab argmax to answer_token
+        pred = action_vec.argmax(dim=-1)
+        target = domain_state["answer_token"].long()
+        return int((pred == target).sum().item()), int(target.numel())
+
     def _probe_split_accuracy(
         self,
         model: Any,
@@ -447,28 +485,9 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
                     input_kind="embedded_tokens",
                 )
                 action_vec = outputs["action_vec"]
-                choice_mask = batch.domain_state.get("choice_mask")
-                correct_choice = batch.domain_state.get("correct_choice")
-                if (
-                    choice_mask is not None
-                    and correct_choice is not None
-                    and choice_mask.any()
-                    and (correct_choice >= 0).any()
-                ):
-                    choice_tokens = batch.domain_state["choice_tokens"].long().clamp(min=0, max=action_vec.shape[1] - 1)
-                    gathered = action_vec.gather(1, choice_tokens)
-                    gathered = gathered.masked_fill(~choice_mask.bool(), float("-inf"))
-                    pred = action_vec.argmax(dim=-1)
-                    target = batch.domain_state["answer_token"].long()
-                    valid = (correct_choice >= 0).bool()
-                    if valid.any():
-                        pred[valid] = gathered[valid].argmax(dim=-1)
-                        target[valid] = correct_choice[valid].long()
-                else:
-                    pred = action_vec.argmax(dim=-1)
-                    target = batch.domain_state["answer_token"].long()
-                correct += int((pred == target).sum().item())
-                total += int(target.numel())
+                n_correct, n_total = self._score_batch(action_vec, batch.domain_state)
+                correct += n_correct
+                total += n_total
         return correct / max(1, total)
 
     def _probe_subject_accuracy(
@@ -522,28 +541,9 @@ class ReasoningCurriculumDomain(BaseCurriculumDomain):
                     input_kind="embedded_tokens",
                 )
                 action_vec = outputs["action_vec"]
-                choice_mask = batch.domain_state.get("choice_mask")
-                correct_choice = batch.domain_state.get("correct_choice")
-                if (
-                    choice_mask is not None
-                    and correct_choice is not None
-                    and choice_mask.any()
-                    and (correct_choice >= 0).any()
-                ):
-                    choice_tokens = batch.domain_state["choice_tokens"].long().clamp(min=0, max=action_vec.shape[1] - 1)
-                    gathered = action_vec.gather(1, choice_tokens)
-                    gathered = gathered.masked_fill(~choice_mask.bool(), float("-inf"))
-                    pred = action_vec.argmax(dim=-1)
-                    target = batch.domain_state["answer_token"].long()
-                    valid = (correct_choice >= 0).bool()
-                    if valid.any():
-                        pred[valid] = gathered[valid].argmax(dim=-1)
-                        target[valid] = correct_choice[valid].long()
-                else:
-                    pred = action_vec.argmax(dim=-1)
-                    target = batch.domain_state["answer_token"].long()
-                correct += int((pred == target).sum().item())
-                total += int(target.numel())
+                n_correct, n_total = self._score_batch(action_vec, batch.domain_state)
+                correct += n_correct
+                total += n_total
         return correct / max(1, total)
 
 
