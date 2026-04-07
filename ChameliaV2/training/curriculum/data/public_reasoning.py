@@ -269,6 +269,11 @@ def _extract_text(record: dict[str, Any], keys: Iterable[str]) -> str:
     return ""
 
 
+def _strip_choice_prefix(text: str) -> str:
+    """Strip leading option prefixes like '(A)', 'A.', 'A)', '1.' from choice text."""
+    return re.sub(r"^\s*[\(\[]?[A-Ea-e1-5][\)\]\.]\s*", "", text).strip()
+
+
 def _extract_choices(record: dict[str, Any]) -> list[str]:
     """Extract multiple-choice options from a record.
 
@@ -276,7 +281,7 @@ def _extract_choices(record: dict[str, Any]) -> list[str]:
         record: Source record.
 
     Returns:
-        Choice text list.
+        Choice text list (prefixes like '(A)' stripped).
     """
     for key in ("options", "choices", "endings", "candidates"):
         value = record.get(key)
@@ -284,11 +289,11 @@ def _extract_choices(record: dict[str, Any]) -> list[str]:
             choices: list[str] = []
             for item in value:
                 if isinstance(item, str):
-                    choices.append(item.strip())
+                    choices.append(_strip_choice_prefix(item))
                 elif isinstance(item, dict):
                     text = _extract_text(item, ("text", "option", "label", "value"))
                     if text:
-                        choices.append(text)
+                        choices.append(_strip_choice_prefix(text))
             if choices:
                 return choices
     return []
@@ -362,14 +367,13 @@ def _normalize_mcq_record(
     context = _extract_text(record, ("passage", "article", "context", "premise", "premises"))
     if not question or not choices or label_idx is None:
         return None
-    prompt_parts = []
+    # Question and choices first so they're never truncated; context fills remaining space.
+    choices_str = "Choices: " + " ".join(
+        f"{chr(ord('A') + idx)}. {choice}" for idx, choice in enumerate(choices[:MAX_REASONING_CHOICES])
+    )
+    prompt_parts = [f"Question: {question}", choices_str]
     if context:
         prompt_parts.append(f"Context: {context}")
-    prompt_parts.append(f"Question: {question}")
-    prompt_parts.append(
-        "Choices: "
-        + " ".join(f"{chr(ord('A') + idx)}. {choice}" for idx, choice in enumerate(choices[:MAX_REASONING_CHOICES]))
-    )
     prompt = " ".join(prompt_parts)
     target_text = f"Answer: {chr(ord('A') + label_idx)}"
     choice_tokens, choice_mask = _choice_tensor(len(choices), vocab_size)
