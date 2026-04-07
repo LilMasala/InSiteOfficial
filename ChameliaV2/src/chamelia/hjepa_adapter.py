@@ -25,7 +25,8 @@ def _encode_target_preembedded(hjepa: HJEPA, embedded_tokens: torch.Tensor) -> t
     x = embedded_tokens
     cls_token = target_encoder.vit.cls_token.expand(x.shape[0], -1, -1)
     x = torch.cat((cls_token, x), dim=1)
-    x = x + target_encoder.vit.pos_embed[:, : x.shape[1], :]
+    if not getattr(target_encoder, "sequence_mode", False):
+        x = x + target_encoder.vit.pos_embed[:, : x.shape[1], :]
     x = target_encoder.vit.pos_drop(x)
     x = target_encoder.vit.blocks(x)
     x = target_encoder.vit.norm(x)
