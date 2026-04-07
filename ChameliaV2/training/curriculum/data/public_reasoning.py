@@ -320,6 +320,14 @@ def _extract_label_index(record: dict[str, Any], num_choices: int) -> int | None
         if len(stripped) == 1 and stripped.upper() in "ABCDEFGH":
             idx = ord(stripped.upper()) - ord("A")
             return idx if 0 <= idx < num_choices else None
+        # Handle stringified single-element lists like "['C']" (JEC-QA format).
+        # Multi-answer lists like "['A', 'D']" are not solvable as single-answer MCQ — skip.
+        if stripped.startswith("[") and stripped.endswith("]"):
+            inner = stripped[1:-1].replace("'", "").replace('"', "").strip()
+            parts = [p.strip() for p in inner.split(",") if p.strip()]
+            if len(parts) == 1 and len(parts[0]) == 1 and parts[0].upper() in "ABCDEFGH":
+                idx = ord(parts[0].upper()) - ord("A")
+                return idx if 0 <= idx < num_choices else None
     return None
 
 
@@ -689,7 +697,7 @@ def _dataset_plan_for_variant(domain_variant: str) -> list[tuple[str, tuple[str,
         return [
             ("gsm8k", tuple()),
             ("hendrycks_math", tuple()),
-            ("agieval", ("aqua-rat", "sat-math", "gaokao-mathqa", "gaokao-mathcloze", "math")),
+            ("agieval", ("aqua-rat", "sat-math", "gaokao-mathqa", "math")),
         ]
     if domain_variant == "code_reasoning":
         return [("open_platypus", tuple())]
