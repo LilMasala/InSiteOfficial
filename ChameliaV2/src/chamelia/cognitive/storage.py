@@ -478,7 +478,10 @@ class CognitiveStorage:
         return self._episode_table
 
     def archive_episode(self, record_id: int, payload: dict[str, Any]) -> None:
-        table = self._get_episode_table()
+        try:
+            table = self._get_episode_table()
+        except RuntimeError:
+            return
         timestamp = _now_iso()
         key = payload.get("key")
         key_vector: list[float] = []

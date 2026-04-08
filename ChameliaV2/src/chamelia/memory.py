@@ -146,6 +146,113 @@ def _normalize_score_vector(values: torch.Tensor) -> torch.Tensor:
     return torch.tanh(centered / scale)
 
 
+def _serialize_retrieval_trace_step(step: RetrievalTraceStep) -> dict[str, Any]:
+    """Serialize one retrieval trace step for checkpointing."""
+    return {
+        "query_key": step.query_key.detach().cpu(),
+        "memory_keys": step.memory_keys.detach().cpu(),
+        "memory_summaries": step.memory_summaries.detach().cpu(),
+        "base_quality_scores": step.base_quality_scores.detach().cpu(),
+        "query_posture": _detach_to_device(step.query_posture, "cpu"),
+        "memory_postures": _detach_to_device(step.memory_postures, "cpu"),
+        "base_scores": _detach_to_device(step.base_scores, "cpu"),
+        "relevance_scores": _detach_to_device(step.relevance_scores, "cpu"),
+        "relevance_weights": _detach_to_device(step.relevance_weights, "cpu"),
+    }
+
+
+def _deserialize_retrieval_trace_step(payload: dict[str, Any], device: torch.device | str) -> RetrievalTraceStep:
+    """Restore one retrieval trace step from a checkpoint payload."""
+    return RetrievalTraceStep(
+        query_key=payload["query_key"].detach().to(device),
+        memory_keys=payload["memory_keys"].detach().to(device),
+        memory_summaries=payload["memory_summaries"].detach().to(device),
+        base_quality_scores=payload["base_quality_scores"].detach().to(device),
+        query_posture=_detach_to_device(payload.get("query_posture"), device),
+        memory_postures=_detach_to_device(payload.get("memory_postures"), device),
+        base_scores=_detach_to_device(payload.get("base_scores"), device),
+        relevance_scores=_detach_to_device(payload.get("relevance_scores"), device),
+        relevance_weights=_detach_to_device(payload.get("relevance_weights"), device),
+    )
+
+
+def _serialize_episode_record(record: EpisodeRecord) -> dict[str, Any]:
+    """Serialize one episode record for checkpointing."""
+    return {
+        "key": record.key.detach().cpu(),
+        "action": record.action.detach().cpu(),
+        "ctx_tokens": record.ctx_tokens.detach().cpu(),
+        "ic_at_decision": float(record.ic_at_decision),
+        "ic_realized": None if record.ic_realized is None else float(record.ic_realized),
+        "tc_predicted": float(record.tc_predicted),
+        "outcome_key": _detach_to_device(record.outcome_key, "cpu"),
+        "step": int(record.step),
+        "domain_name": record.domain_name,
+        "record_id": int(record.record_id),
+        "model_version": record.model_version,
+        "candidate_postures": _detach_to_device(record.candidate_postures, "cpu"),
+        "selected_posture": _detach_to_device(record.selected_posture, "cpu"),
+        "candidate_reasoning_states": _detach_to_device(record.candidate_reasoning_states, "cpu"),
+        "candidate_paths": _detach_to_device(record.candidate_paths, "cpu"),
+        "selected_path": _detach_to_device(record.selected_path, "cpu"),
+        "candidate_actions": _detach_to_device(record.candidate_actions, "cpu"),
+        "candidate_ic": _detach_to_device(record.candidate_ic, "cpu"),
+        "candidate_tc": _detach_to_device(record.candidate_tc, "cpu"),
+        "candidate_total": _detach_to_device(record.candidate_total, "cpu"),
+        "candidate_terminal_latents": _detach_to_device(record.candidate_terminal_latents, "cpu"),
+        "selected_candidate_idx": record.selected_candidate_idx,
+        "retrieval_trace": None
+        if record.retrieval_trace is None
+        else tuple(_serialize_retrieval_trace_step(step) for step in record.retrieval_trace),
+        "mcts_trace": None if record.mcts_trace is None else dict(record.mcts_trace),
+        "skill_trace": None if record.skill_trace is None else tuple(record.skill_trace),
+        "goal_key": _detach_to_device(record.goal_key, "cpu"),
+        "domain_cluster_id": record.domain_cluster_id,
+        "metadata": None if record.metadata is None else dict(record.metadata),
+    }
+
+
+def _deserialize_episode_record(payload: dict[str, Any], device: torch.device | str) -> EpisodeRecord:
+    """Restore one episode record from a checkpoint payload."""
+    retrieval_trace_payload = payload.get("retrieval_trace")
+    retrieval_trace = None
+    if retrieval_trace_payload is not None:
+        retrieval_trace = tuple(
+            _deserialize_retrieval_trace_step(step, device)
+            for step in retrieval_trace_payload
+        )
+    return EpisodeRecord(
+        key=payload["key"].detach().to(device),
+        action=payload["action"].detach().to(device),
+        ctx_tokens=payload["ctx_tokens"].detach().to(device),
+        ic_at_decision=float(payload["ic_at_decision"]),
+        ic_realized=payload.get("ic_realized"),
+        tc_predicted=float(payload["tc_predicted"]),
+        outcome_key=_detach_to_device(payload.get("outcome_key"), device),
+        step=int(payload["step"]),
+        domain_name=str(payload["domain_name"]),
+        record_id=int(payload["record_id"]),
+        model_version=payload.get("model_version"),
+        candidate_postures=_detach_to_device(payload.get("candidate_postures"), device),
+        selected_posture=_detach_to_device(payload.get("selected_posture"), device),
+        candidate_reasoning_states=_detach_to_device(payload.get("candidate_reasoning_states"), device),
+        candidate_paths=_detach_to_device(payload.get("candidate_paths"), device),
+        selected_path=_detach_to_device(payload.get("selected_path"), device),
+        candidate_actions=_detach_to_device(payload.get("candidate_actions"), device),
+        candidate_ic=_detach_to_device(payload.get("candidate_ic"), device),
+        candidate_tc=_detach_to_device(payload.get("candidate_tc"), device),
+        candidate_total=_detach_to_device(payload.get("candidate_total"), device),
+        candidate_terminal_latents=_detach_to_device(payload.get("candidate_terminal_latents"), device),
+        selected_candidate_idx=payload.get("selected_candidate_idx"),
+        retrieval_trace=retrieval_trace,
+        mcts_trace=None if payload.get("mcts_trace") is None else dict(payload["mcts_trace"]),
+        skill_trace=None if payload.get("skill_trace") is None else tuple(payload["skill_trace"]),
+        goal_key=_detach_to_device(payload.get("goal_key"), device),
+        domain_cluster_id=payload.get("domain_cluster_id"),
+        metadata=None if payload.get("metadata") is None else dict(payload["metadata"]),
+    )
+
+
 class LatentMemory:
     """Device-aware latent key-value episodic memory."""
 
@@ -632,3 +739,63 @@ class LatentMemory:
         self.size = len(kept)
         self.head = self.size % self.max_episodes
         return removed
+
+    def state_dict(self) -> dict[str, Any]:
+        """Serialize the episodic memory buffer into a checkpointable payload."""
+        return {
+            "embed_dim": self.embed_dim,
+            "max_episodes": self.max_episodes,
+            "retrieval_k": self.retrieval_k,
+            "device": str(self.device),
+            "size": self.size,
+            "head": self.head,
+            "next_record_id": self._next_record_id,
+            "keys": self.keys[: self.size].detach().cpu(),
+            "ordered_keys": (
+                None
+                if self.ordered_keys is None
+                else self.ordered_keys[: self.size].detach().cpu()
+            ),
+            "records": tuple(
+                _serialize_episode_record(record)
+                for record in self.records[: self.size]
+            ),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore the episodic memory buffer from a checkpoint payload."""
+        self.embed_dim = int(state["embed_dim"])
+        self.max_episodes = int(state["max_episodes"])
+        self.retrieval_k = int(state["retrieval_k"])
+        self.device = str(state.get("device", self.device))
+        self.keys = torch.zeros(
+            self.max_episodes,
+            self.embed_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        ordered_keys_state = state.get("ordered_keys")
+        self.ordered_keys = None
+        if ordered_keys_state is not None:
+            self.ordered_keys = torch.zeros(
+                self.max_episodes,
+                ordered_keys_state.shape[-1],
+                device=self.device,
+                dtype=torch.float32,
+            )
+        self.records = []
+        self._id_to_slot = {}
+        self.size = int(state["size"])
+        self.head = int(state["head"])
+        self._next_record_id = int(state["next_record_id"])
+        if self.size > 0:
+            self.keys[: self.size] = state["keys"].to(self.device)
+            if self.ordered_keys is not None and ordered_keys_state is not None:
+                self.ordered_keys[: self.size] = ordered_keys_state.to(self.device)
+        restored_records = [
+            _deserialize_episode_record(payload, self.device)
+            for payload in state.get("records", ())
+        ]
+        self.records.extend(restored_records)
+        for idx, record in enumerate(restored_records):
+            self._id_to_slot[record.record_id] = idx

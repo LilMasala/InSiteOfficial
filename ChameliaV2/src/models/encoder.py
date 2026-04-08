@@ -417,13 +417,19 @@ class RoPEAttentionWrapper(nn.Module):
                 use_pytorch_sdpa=True,  # Use PyTorch SDPA when beneficial
             )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
         """
         Forward pass with RoPE applied to Q and K.
 
         Args:
             x: Input tensor [batch, seq_len, embed_dim]
             attn_mask: Optional attention mask (currently ignored with Flash Attention)
+            is_causal: Compatibility flag forwarded by newer timm attention blocks.
 
         Returns:
             Output tensor [batch, seq_len, embed_dim]
@@ -473,6 +479,7 @@ class RoPEAttentionWrapper(nn.Module):
                 v,
                 dropout_p=dropout_p,
                 scale=self.scale,
+                is_causal=is_causal,
             )
             x = x.transpose(1, 2).reshape(B, N, C)
         elif self.use_mps_opt:

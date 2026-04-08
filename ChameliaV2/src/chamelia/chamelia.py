@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.chamelia.actor import Actor
 from src.chamelia.cognitive.clustering import DomainIndex
@@ -66,7 +67,7 @@ class Chamelia(nn.Module):
         domain_index: DomainIndex | None = None,
         sleep_coordinator: SleepCoordinator | None = None,
         world_model: ActionConditionedWorldModel | MambaActionConditionedWorldModel | None = None,
-        world_model_backend: str = "transformer",
+        world_model_backend: str = "mamba",
         retrieval_scorer: MemoryRelevanceScorer | None = None,
         embed_dim: int = 512,
         action_dim: int = 64,
@@ -198,7 +199,25 @@ class Chamelia(nn.Module):
         """
         target_features = hjepa_outputs["target_features"]
         patch_features = target_features[:, 1:, :]
-        level_features = self.hjepa._apply_fpn(patch_features, is_prediction=False)
+        if hasattr(self.hjepa, "_apply_fpn") and (
+            getattr(self.hjepa, "use_fpn", False) or not hasattr(self.hjepa, "num_hierarchies")
+        ):
+            return self.hjepa._apply_fpn(patch_features, is_prediction=False)
+
+        num_hierarchies = int(getattr(self.hjepa, "num_hierarchies", 1))
+        hierarchy_projections = getattr(self.hjepa, "hierarchy_projections", None)
+        if hierarchy_projections is None:
+            return [patch_features]
+        level_features: list[torch.Tensor] = []
+        for level in range(num_hierarchies):
+            projected = hierarchy_projections[level](patch_features)
+            if level > 0:
+                out_len = max(1, projected.shape[1] // (2**level))
+                projected = F.adaptive_avg_pool1d(
+                    projected.transpose(1, 2),
+                    out_len,
+                ).transpose(1, 2)
+            level_features.append(projected)
         return level_features
 
     def _get_scene_summary(self, hjepa_outputs: dict) -> torch.Tensor:
@@ -366,18 +385,32 @@ class Chamelia(nn.Module):
         domain_state: dict[str, Any],
     ) -> torch.Tensor:
         """Resolve goal latents for procedural retrieval and high-level planning."""
+        def _align_to_latent_width(value: torch.Tensor) -> torch.Tensor:
+            if value.dim() == 1:
+                value = value.unsqueeze(0)
+            if value.shape[-1] == z.shape[-1]:
+                return value.to(z)
+            aligned = torch.zeros(value.shape[0], z.shape[-1], dtype=z.dtype, device=z.device)
+            width = min(value.shape[-1], z.shape[-1])
+            aligned[:, :width] = value.to(z.device, dtype=z.dtype)[:, :width]
+            return aligned
+
         goal_latent = domain_state.get("goal_latent")
         if torch.is_tensor(goal_latent):
             if goal_latent.dim() == 1:
-                return goal_latent.unsqueeze(0).expand(z.shape[0], -1).to(z)
-            if goal_latent.dim() == 2 and goal_latent.shape == z.shape:
-                return goal_latent.to(z)
+                return _align_to_latent_width(goal_latent).expand(z.shape[0], -1)
+            if goal_latent.dim() == 2:
+                aligned = _align_to_latent_width(goal_latent)
+                if aligned.shape[0] == z.shape[0]:
+                    return aligned
         regime = self.domain.compute_regime_embedding(domain_state)
         if torch.is_tensor(regime):
             if regime.dim() == 1:
-                return regime.unsqueeze(0).expand(z.shape[0], -1).to(z)
-            if regime.dim() == 2 and regime.shape == z.shape:
-                return regime.to(z)
+                return _align_to_latent_width(regime).expand(z.shape[0], -1)
+            if regime.dim() == 2:
+                aligned = _align_to_latent_width(regime)
+                if aligned.shape[0] == z.shape[0]:
+                    return aligned
         return z.detach()
 
     def _pad_candidate_tensor(
@@ -1075,6 +1108,8 @@ class Chamelia(nn.Module):
             "planner_backend": self.planner_backend,
             "world_model_backend": self.world_model_backend,
             "planner_cluster_ids": planner_cluster_ids,
+            "mcts_traces": planner_mcts_traces,
+            "skill_traces": planner_skill_traces,
         }
 
     def fill_outcome(

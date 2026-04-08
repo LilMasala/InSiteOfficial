@@ -16,6 +16,7 @@ seaborn>=0.12.0
 # Configuration and data handling
 PyYAML>=6.0
 Pillow>=10.0.0
+gymnasium>=0.29.1
 
 # Progress and utilities
 tqdm>=4.65.0

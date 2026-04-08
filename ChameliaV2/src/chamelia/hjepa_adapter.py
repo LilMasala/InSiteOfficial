@@ -97,14 +97,15 @@ def _hierarchical_outputs(
             target_projected = hjepa.hierarchy_projections[level](target_masked)
             mask_valid_level = mask_valid.clone()
             if level > 0:
+                out_len = max(1, pred_projected.shape[1] // (2**level))
                 pred_projected = rearrange(pred_projected, "b n d -> b d n")
                 target_projected = rearrange(target_projected, "b n d -> b d n")
-                pred_projected = hjepa.hierarchy_pooling[level](pred_projected)
-                target_projected = hjepa.hierarchy_pooling[level](target_projected)
+                pred_projected = F.adaptive_avg_pool1d(pred_projected, out_len)
+                target_projected = F.adaptive_avg_pool1d(target_projected, out_len)
                 pred_projected = rearrange(pred_projected, "b d n -> b n d")
                 target_projected = rearrange(target_projected, "b d n -> b n d")
                 mask_valid_float = rearrange(mask_valid_level.float(), "b n -> b 1 n")
-                mask_valid_float = hjepa.hierarchy_pooling[level](mask_valid_float)
+                mask_valid_float = F.adaptive_avg_pool1d(mask_valid_float, out_len)
                 mask_valid_level = rearrange(mask_valid_float, "b 1 n -> b n") > 0.5
             predictions_hierarchy.append(pred_projected)
             targets_hierarchy.append(target_projected)

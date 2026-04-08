@@ -244,3 +244,86 @@ class DomainRegistry:
             Python list of registry keys.
         """
         return list(DomainRegistry._registry.keys())
+
+
+class InteractiveDomainAdapter(AbstractDomain):
+    """Interactive environment contract used by the unified training orchestrator."""
+
+    modality_family: str = "unknown"
+    action_space_type: str = "unknown"
+
+    @abstractmethod
+    def reset(self, seed: int | None = None) -> tuple[Any, dict[str, Any]]:
+        """Reset the environment and return ``(observation, info)``."""
+
+    @abstractmethod
+    def step(self, action: Any) -> tuple[Any, float, bool, bool, dict[str, Any]]:
+        """Apply one environment action and return Gym-style step outputs."""
+
+    def tokenize_observation(self, observation: Any) -> Any:
+        """Tokenize one observation via the domain tokenizer."""
+        tokenizer = self.get_tokenizer()
+        tokenizer_input = self.prepare_bridge_observation(observation)
+        batched_input = (
+            tokenizer.collate([tokenizer_input])
+            if hasattr(tokenizer, "collate")
+            else tokenizer_input
+        )
+        return tokenizer(batched_input)
+
+    def build_domain_state(self, observation: Any, info: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build the training-time domain state payload."""
+        _ = info
+        return self.get_domain_state(observation)
+
+    def legal_action_mask(self, observation: Any, info: dict[str, Any] | None = None) -> torch.Tensor | None:
+        """Return a legal-action mask when the environment exposes one."""
+        _ = observation
+        _ = info
+        return None
+
+    def compute_realized_cost(
+        self,
+        observation: Any,
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict[str, Any] | None = None,
+    ) -> float:
+        """Convert environment feedback into the cost scalar used by Chamelia."""
+        _ = observation
+        _ = terminated
+        _ = truncated
+        _ = info
+        return -float(reward)
+
+    def compute_metrics(self, episode_records: list[dict[str, Any]]) -> dict[str, float]:
+        """Aggregate episode-level metrics for one evaluation pass."""
+        if not episode_records:
+            return {"episode_reward_mean": 0.0}
+        rewards = [float(record.get("episode_reward", 0.0)) for record in episode_records]
+        return {"episode_reward_mean": sum(rewards) / len(rewards)}
+
+    def baseline_action(
+        self,
+        kind: str,
+        observation: Any,
+        info: dict[str, Any] | None = None,
+    ) -> Any:
+        """Return a baseline action for evaluation.
+
+        The default implementation supports ``random`` for discrete domains.
+        """
+        _ = observation
+        legal_mask = self.legal_action_mask(observation, info)
+        if kind != "random":
+            raise ValueError(f"Unsupported baseline '{kind}' for domain '{self.domain_name}'.")
+        if self.action_space_type != "discrete":
+            raise ValueError("Default random baseline only supports discrete action spaces.")
+        if legal_mask is None:
+            return torch.randint(self.get_action_dim(), (1,), dtype=torch.long)
+        legal_indices = torch.nonzero(legal_mask.reshape(-1), as_tuple=False).squeeze(-1)
+        if legal_indices.numel() == 0:
+            return torch.zeros(1, dtype=torch.long)
+        choice = legal_indices[torch.randint(legal_indices.numel(), (1,))]
+        return choice

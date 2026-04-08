@@ -311,10 +311,27 @@ class MCTSSearch:
         candidate_postures = proposal["candidate_postures"]
         reasoning_states = proposal["reasoning_states"]
         if skill_seed_path is not None:
+            if skill_seed_path.dim() == 1:
+                skill_seed_path = skill_seed_path.unsqueeze(0).unsqueeze(0)
             if skill_seed_path.dim() == 2:
                 skill_seed_path = skill_seed_path.unsqueeze(0)
             seed = skill_seed_path.to(candidate_paths)
-            candidate_paths = torch.cat([seed.unsqueeze(0), candidate_paths], dim=1)
+            target_path_len = int(candidate_paths.shape[2])
+            target_action_dim = int(candidate_paths.shape[3])
+            if seed.shape[-1] != target_action_dim:
+                if seed.shape[-1] > target_action_dim:
+                    seed = seed[..., :target_action_dim]
+                else:
+                    pad_width = target_action_dim - int(seed.shape[-1])
+                    seed = F.pad(seed, (0, pad_width))
+            if seed.shape[1] != target_path_len:
+                if seed.shape[1] > target_path_len:
+                    seed = seed[:, :target_path_len, :]
+                else:
+                    pad_steps = target_path_len - int(seed.shape[1])
+                    pad_value = seed[:, -1:, :].expand(-1, pad_steps, -1)
+                    seed = torch.cat([seed, pad_value], dim=1)
+            candidate_paths = torch.cat([seed.unsqueeze(1), candidate_paths], dim=1)
             zero_posture = torch.zeros(
                 1,
                 1,

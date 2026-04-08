@@ -1292,6 +1292,7 @@ class SleepCoordinator:
         self._pending = threading.Event()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
+        self.last_report: SleepCycleReport | None = None
 
     def start(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -1319,7 +1320,7 @@ class SleepCoordinator:
             if not self._pending.is_set():
                 continue
             self._pending.clear()
-            self.run_cycle()
+            self.last_report = self.run_cycle()
 
     def _gather_records(self) -> list[Any]:
         return list(self.episodic_memory.records[: self.episodic_memory.size])
