@@ -20,6 +20,21 @@ Pillow>=10.0.0
 # Progress and utilities
 tqdm>=4.65.0
 
+# Cognitive-architecture storage and adapters
+faiss-cpu>=1.13.2
+h5py>=3.16.0
+loralib>=0.1.2
+lancedb>=0.30.2
+pyarrow>=23.0.1
+stitch-core>=0.1.29
+botorch>=0.17.2
+gpytorch>=1.15.2
+transformers>=5.5.0
+sentencepiece>=0.2.1
+
+# Optional large-scale / research backends
+# mamba-ssm>=2.3.1  # Native backend is typically Linux/NVIDIA oriented.
+
 # Development and testing
 pytest>=7.4.0
 pytest-cov>=4.1.0

@@ -47,6 +47,18 @@ dev = [
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
 ]
+cognitive = [
+    "faiss-cpu>=1.13.2",
+    "h5py>=3.16.0",
+    "loralib>=0.1.2",
+    "lancedb>=0.30.2",
+    "pyarrow>=23.0.1",
+    "stitch-core>=0.1.29",
+    "botorch>=0.17.2",
+    "gpytorch>=1.15.2",
+    "transformers>=5.5.0",
+    "sentencepiece>=0.2.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/jonwiggins/H-JEPA"

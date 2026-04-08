@@ -8,6 +8,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from src.chamelia.cognitive.representation import InformationOrderedBottleneck
+
 
 def _detach_to_device(value: torch.Tensor | None, device: torch.device | str) -> torch.Tensor | None:
     """Detach and move optional tensors to the target memory device."""
@@ -75,6 +77,10 @@ class EpisodeRecord:
     candidate_terminal_latents: torch.Tensor | None = None
     selected_candidate_idx: int | None = None
     retrieval_trace: tuple[RetrievalTraceStep, ...] | None = None
+    mcts_trace: dict[str, Any] | None = None
+    skill_trace: tuple[int, ...] | None = None
+    goal_key: torch.Tensor | None = None
+    domain_cluster_id: int | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -149,6 +155,8 @@ class LatentMemory:
         max_episodes: int = 10000,
         retrieval_k: int = 8,
         device: str = "cpu",
+        iob_encoder: InformationOrderedBottleneck | None = None,
+        iob_widths: tuple[int, ...] | None = None,
     ) -> None:
         """Initialize latent memory.
 
@@ -162,12 +170,78 @@ class LatentMemory:
         self.max_episodes = max_episodes
         self.retrieval_k = retrieval_k
         self.device = device
+        self.iob_encoder = iob_encoder
+        self.iob_widths = iob_widths
         self.keys = torch.zeros(max_episodes, embed_dim, device=device, dtype=torch.float32)
+        self.ordered_keys = None
+        if self.iob_encoder is not None:
+            self.ordered_keys = torch.zeros(
+                max_episodes,
+                self.iob_encoder.bottleneck_dim,
+                device=device,
+                dtype=torch.float32,
+            )
         self.records: list[EpisodeRecord] = []
         self.size = 0
         self.head = 0
         self._next_record_id = 0
         self._id_to_slot: dict[int, int] = {}
+
+    def _encode_iob(self, value: torch.Tensor) -> torch.Tensor:
+        if self.iob_encoder is None:
+            raise RuntimeError("IOB encoder is not configured.")
+        encoder_device = next(self.iob_encoder.parameters()).device
+        with torch.no_grad():
+            encoded = self.iob_encoder(value.detach().to(encoder_device))
+        return encoded.to(self.device)
+
+    def _resolve_iob_widths(self) -> tuple[int, ...]:
+        if self.iob_encoder is None:
+            return ()
+        bottleneck_dim = self.iob_encoder.bottleneck_dim
+        if self.iob_widths:
+            widths = tuple(
+                max(1, min(int(width), bottleneck_dim))
+                for width in self.iob_widths
+            )
+        else:
+            widths = (
+                max(1, bottleneck_dim // 4),
+                max(1, bottleneck_dim // 2),
+                bottleneck_dim,
+            )
+        return tuple(sorted(set(widths)))
+
+    def _iob_shortlist_mask(self, query_embedding: torch.Tensor, k: int) -> torch.Tensor:
+        if self.ordered_keys is None:
+            raise RuntimeError("IOB storage is not initialized.")
+        widths = self._resolve_iob_widths()
+        batch_size = query_embedding.shape[0]
+        shortlist_mask = torch.zeros(batch_size, self.size, dtype=torch.bool, device=self.device)
+        if self.size == 0:
+            return shortlist_mask
+        for batch_idx in range(batch_size):
+            candidate_indices = torch.arange(self.size, device=self.device)
+            for stage_idx, width in enumerate(widths):
+                if candidate_indices.numel() == 0:
+                    break
+                query_slice = F.normalize(
+                    query_embedding[batch_idx : batch_idx + 1, :width],
+                    dim=-1,
+                )
+                stored_slice = F.normalize(
+                    self.ordered_keys[candidate_indices, :width],
+                    dim=-1,
+                )
+                stage_scores = (query_slice @ stored_slice.T).squeeze(0)
+                keep = min(
+                    candidate_indices.numel(),
+                    k if stage_idx == len(widths) - 1 else max(k * 4, k),
+                )
+                top_local = stage_scores.topk(keep).indices
+                candidate_indices = candidate_indices[top_local]
+            shortlist_mask[batch_idx, candidate_indices] = True
+        return shortlist_mask
 
     def store(self, record: EpisodeRecord) -> int:
         """Store an episode record in the circular buffer."""
@@ -180,6 +254,8 @@ class LatentMemory:
             self._id_to_slot.pop(evicted_id, None)
 
         self.keys[idx] = record.key.detach().to(self.device)
+        if self.ordered_keys is not None:
+            self.ordered_keys[idx] = self._encode_iob(record.key.unsqueeze(0)).squeeze(0)
         stored_record = EpisodeRecord(
             key=record.key.detach().to(self.device),
             action=record.action.detach().to(self.device),
@@ -204,6 +280,10 @@ class LatentMemory:
             candidate_terminal_latents=_detach_to_device(record.candidate_terminal_latents, self.device),
             selected_candidate_idx=record.selected_candidate_idx,
             retrieval_trace=_detach_trace_to_device(record.retrieval_trace, self.device),
+            mcts_trace=dict(record.mcts_trace) if record.mcts_trace is not None else None,
+            skill_trace=tuple(record.skill_trace) if record.skill_trace is not None else None,
+            goal_key=_detach_to_device(record.goal_key, self.device),
+            domain_cluster_id=record.domain_cluster_id,
             metadata=dict(record.metadata) if record.metadata is not None else None,
         )
         if len(self.records) < self.max_episodes:
@@ -257,9 +337,17 @@ class LatentMemory:
             query_key = query_key.unsqueeze(0)
         stored = self.keys[: self.size]
 
-        q_norm = F.normalize(query_key.detach().to(self.device), dim=-1)
-        k_norm = F.normalize(stored, dim=-1)
-        combined_scores = torch.mm(q_norm, k_norm.T)
+        shortlist_mask = None
+        if self.iob_encoder is not None and self.ordered_keys is not None:
+            encoded_query = self._encode_iob(query_key)
+            q_norm = F.normalize(encoded_query, dim=-1)
+            k_norm = F.normalize(self.ordered_keys[: self.size], dim=-1)
+            combined_scores = torch.mm(q_norm, k_norm.T)
+            shortlist_mask = self._iob_shortlist_mask(encoded_query, k)
+        else:
+            q_norm = F.normalize(query_key.detach().to(self.device), dim=-1)
+            k_norm = F.normalize(stored, dim=-1)
+            combined_scores = torch.mm(q_norm, k_norm.T)
 
         if quality_weight != 0.0:
             quality_scores = torch.tensor(
@@ -290,6 +378,9 @@ class LatentMemory:
                 posture_scores = posture_query @ posture_bank.T
                 posture_scores = posture_scores.masked_fill(~valid_mask.unsqueeze(0), 0.0)
                 combined_scores = combined_scores + posture_weight * posture_scores
+
+        if shortlist_mask is not None:
+            combined_scores = combined_scores.masked_fill(~shortlist_mask, float("-inf"))
 
         top_k_indices = combined_scores.topk(min(k, self.size), dim=-1).indices
         retrieved_keys = stored[top_k_indices]
@@ -519,3 +610,25 @@ class LatentMemory:
                     )
                 )
         return examples
+
+    def iter_records(self) -> list[EpisodeRecord]:
+        """Return a stable snapshot of the currently retained records."""
+        return list(self.records[: self.size])
+
+    def prune(self, predicate: Any) -> int:
+        """Remove records matching ``predicate`` while preserving order."""
+        kept = [record for record in self.records[: self.size] if not predicate(record)]
+        removed = self.size - len(kept)
+        self.records = list(kept)
+        self.keys.zero_()
+        if self.ordered_keys is not None:
+            self.ordered_keys.zero_()
+        self._id_to_slot = {}
+        for idx, record in enumerate(kept):
+            self.keys[idx] = record.key.detach().to(self.device)
+            if self.ordered_keys is not None:
+                self.ordered_keys[idx] = self._encode_iob(record.key.unsqueeze(0)).squeeze(0)
+            self._id_to_slot[record.record_id] = idx
+        self.size = len(kept)
+        self.head = self.size % self.max_episodes
+        return removed

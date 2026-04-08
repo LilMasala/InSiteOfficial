@@ -9,10 +9,48 @@ from typing import Any, cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 from .encoder import create_encoder
 from .predictor import create_predictor
+
+
+class _TokenVectorQuantizer(nn.Module):
+    """Shared token-level VQ bottleneck for H-JEPA encoder outputs."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        *,
+        codebook_size: int = 512,
+        beta: float = 0.25,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.codebook_size = codebook_size
+        self.beta = float(beta)
+        self.codebook = nn.Embedding(codebook_size, embed_dim)
+        nn.init.uniform_(self.codebook.weight, -1.0 / codebook_size, 1.0 / codebook_size)
+
+    def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        original_shape = inputs.shape
+        flat_inputs = inputs.reshape(-1, self.embed_dim)
+        distances = (
+            flat_inputs.pow(2).sum(dim=1, keepdim=True)
+            - 2.0 * flat_inputs @ self.codebook.weight.T
+            + self.codebook.weight.pow(2).sum(dim=1).unsqueeze(0)
+        )
+        codes = distances.argmin(dim=1)
+        quantized = self.codebook(codes).view(*original_shape)
+        straight_through = inputs + (quantized - inputs).detach()
+        commitment = F.mse_loss(inputs, quantized.detach())
+        codebook = F.mse_loss(quantized, inputs.detach())
+        return {
+            "quantized": straight_through,
+            "codes": codes.view(*original_shape[:-1]),
+            "loss": codebook + (self.beta * commitment),
+        }
 
 
 class HJEPA(nn.Module):
@@ -79,6 +117,9 @@ class HJEPA(nn.Module):
         layerscale_init: float = 1e-5,
         use_flash_attention: bool = True,
         sequence_mode: bool = False,
+        use_vq: bool = False,
+        vq_codebook_size: int = 512,
+        vq_beta: float = 0.25,
     ) -> None:
         super().__init__()
 
@@ -99,6 +140,7 @@ class HJEPA(nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_layerscale = use_layerscale
         self.use_flash_attention = use_flash_attention
+        self.use_vq = use_vq
 
         # Create encoders
         self.context_encoder, self.target_encoder = create_encoder(
@@ -110,6 +152,15 @@ class HJEPA(nn.Module):
             use_layerscale=use_layerscale,
             layerscale_init=layerscale_init,
             sequence_mode=sequence_mode,
+        )
+        self.vq = (
+            _TokenVectorQuantizer(
+                embed_dim=embed_dim,
+                codebook_size=vq_codebook_size,
+                beta=vq_beta,
+            )
+            if use_vq
+            else None
         )
 
         # Override EMA parameters for target encoder
@@ -156,6 +207,15 @@ class HJEPA(nn.Module):
             self._build_fpn()
 
         self.apply(self._init_weights)
+
+    def _quantize_features(
+        self,
+        features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if self.vq is None:
+            return features, None, None
+        quantized = self.vq(features)
+        return quantized["quantized"], quantized["codes"], quantized["loss"]
 
     def _init_weights(self, m: nn.Module) -> None:
         """Initialize weights."""
@@ -362,6 +422,11 @@ class HJEPA(nn.Module):
         # Encode target (full image) with no gradient
         with torch.no_grad():
             target_features = self.target_encoder(images)
+        context_features, context_codes, context_vq_loss = self._quantize_features(context_features)
+        target_features, target_codes, target_vq_loss = self._quantize_features(target_features)
+        vq_commitment_loss = None
+        if context_vq_loss is not None and target_vq_loss is not None:
+            vq_commitment_loss = context_vq_loss + target_vq_loss
 
         # Get mask indices for prediction
         # mask shape: [B, N] where N is number of patches
@@ -411,6 +476,9 @@ class HJEPA(nn.Module):
                 "mask_valid": mask_valid,  # Validity mask for padded positions
                 "context_features": context_features,
                 "target_features": target_features,
+                "context_codes": context_codes,
+                "target_codes": target_codes,
+                "vq_commitment_loss": vq_commitment_loss,
             }
 
         # Compute hierarchical predictions and targets
@@ -483,6 +551,9 @@ class HJEPA(nn.Module):
             "masks_valid": masks_valid_hierarchy,  # Validity masks for each hierarchy level
             "context_features": context_features,
             "target_features": target_features,
+            "context_codes": context_codes,
+            "target_codes": target_codes,
+            "vq_commitment_loss": vq_commitment_loss,
         }
 
     @torch.no_grad()
@@ -505,7 +576,9 @@ class HJEPA(nn.Module):
         Returns:
             Context features [B, N+1, D] where N is number of patches (includes CLS token)
         """
-        return self.context_encoder(images, mask=mask)  # type: ignore[no-any-return]
+        features = self.context_encoder(images, mask=mask)
+        features, _, _ = self._quantize_features(features)
+        return features  # type: ignore[no-any-return]
 
     @torch.no_grad()
     def extract_features(
@@ -533,6 +606,7 @@ class HJEPA(nn.Module):
             features = self.target_encoder(images)
         else:
             features = self.context_encoder(images)
+        features, _, _ = self._quantize_features(features)
 
         # Exclude CLS token
         features = features[:, 1:, :]
@@ -597,6 +671,9 @@ def create_hjepa(
     use_layerscale: bool = False,
     layerscale_init: float = 1e-5,
     use_flash_attention: bool = True,
+    use_vq: bool = False,
+    vq_codebook_size: int = 512,
+    vq_beta: float = 0.25,
 ) -> HJEPA:
     """
     Factory function to create H-JEPA model.
@@ -645,6 +722,9 @@ def create_hjepa(
         use_layerscale=use_layerscale,
         layerscale_init=layerscale_init,
         use_flash_attention=use_flash_attention,
+        use_vq=use_vq,
+        vq_codebook_size=vq_codebook_size,
+        vq_beta=vq_beta,
     )
 
 
@@ -682,6 +762,7 @@ def create_hjepa_from_config(config: dict[str, Any]) -> HJEPA:
 
     # Get Flash Attention configuration
     use_flash_attention = model_config.get("use_flash_attention", True)
+    vq_config = model_config.get("vq", {})
 
     return create_hjepa(
         encoder_type=model_config.get("encoder_type", "vit_base_patch16_224"),
@@ -703,4 +784,7 @@ def create_hjepa_from_config(config: dict[str, Any]) -> HJEPA:
         use_layerscale=use_layerscale,
         layerscale_init=layerscale_init,
         use_flash_attention=use_flash_attention,
+        use_vq=vq_config.get("use_vq", False),
+        vq_codebook_size=vq_config.get("codebook_size", 512),
+        vq_beta=vq_config.get("beta", 0.25),
     )

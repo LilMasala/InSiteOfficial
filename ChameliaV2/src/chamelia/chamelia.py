@@ -8,6 +8,20 @@ import torch
 import torch.nn as nn
 
 from src.chamelia.actor import Actor
+from src.chamelia.cognitive.clustering import DomainIndex
+from src.chamelia.cognitive.mamba_world_model import MambaActionConditionedWorldModel
+from src.chamelia.cognitive.planning import (
+    FrozenReasoningChain,
+    HighLevelPlanner,
+    MCTSSearch,
+    ReasoningStep,
+    ThinkerOutput,
+)
+from src.chamelia.cognitive.procedural import (
+    ProceduralMemory as CognitiveProceduralMemory,
+    RetrievedSkill,
+)
+from src.chamelia.cognitive.sleep import SleepCoordinator
 from src.chamelia.configurator import Configurator
 from src.chamelia.cost import CostModule
 from src.chamelia.hjepa_adapter import forward_hjepa
@@ -46,13 +60,21 @@ class Chamelia(nn.Module):
         cost: CostModule,
         memory: LatentMemory,
         domain: AbstractDomain,
-        world_model: ActionConditionedWorldModel | None = None,
+        procedural_memory: CognitiveProceduralMemory | None = None,
+        high_level_planner: HighLevelPlanner | None = None,
+        mcts_search: MCTSSearch | None = None,
+        domain_index: DomainIndex | None = None,
+        sleep_coordinator: SleepCoordinator | None = None,
+        world_model: ActionConditionedWorldModel | MambaActionConditionedWorldModel | None = None,
+        world_model_backend: str = "transformer",
         retrieval_scorer: MemoryRelevanceScorer | None = None,
         embed_dim: int = 512,
         action_dim: int = 64,
         num_ctx_tokens: int = 16,
         rollout_horizon: int = 2,
         reasoning_steps: int = 2,
+        planner_backend: str = "flat",
+        skill_confidence_threshold: float = 0.35,
         model_version: str | None = None,
     ) -> None:
         """Initialize the assembled Chamelia model.
@@ -77,12 +99,23 @@ class Chamelia(nn.Module):
         self.actor = actor
         self.cost = cost
         self.memory = memory
+        self.procedural_memory = procedural_memory
         self.world_model = (
             world_model
             if world_model is not None
-            else ActionConditionedWorldModel(
-                embed_dim=embed_dim,
-                action_dim=action_dim,
+            else (
+                MambaActionConditionedWorldModel(
+                    embed_dim=embed_dim,
+                    action_dim=action_dim,
+                    posture_dim=actor.posture_dim,
+                    max_horizon=max(rollout_horizon, actor.path_length),
+                )
+                if world_model_backend == "mamba"
+                else ActionConditionedWorldModel(
+                    embed_dim=embed_dim,
+                    action_dim=action_dim,
+                    posture_dim=actor.posture_dim,
+                )
             )
         )
         self.retrieval_scorer = (
@@ -98,9 +131,29 @@ class Chamelia(nn.Module):
         self.num_ctx_tokens = num_ctx_tokens
         self.rollout_horizon = rollout_horizon
         self.reasoning_steps = reasoning_steps
+        self.planner_backend = planner_backend
+        self.world_model_backend = world_model_backend
+        self.skill_confidence_threshold = skill_confidence_threshold
         self.model_version = model_version
         self._pending_record_indices: list[int] = []
         self._step_counter = 0
+        self.high_level_planner = high_level_planner
+        if self.high_level_planner is None and planner_backend == "mcts":
+            self.high_level_planner = HighLevelPlanner(
+                embed_dim=embed_dim,
+                skill_dim=embed_dim,
+            )
+        self.mcts_search = mcts_search
+        if self.mcts_search is None and planner_backend == "mcts":
+            self.mcts_search = MCTSSearch(
+                actor=self.actor,
+                world_model=self.world_model,
+                cost_module=self.cost,
+                high_level_planner=self.high_level_planner,
+                rollout_horizon=rollout_horizon,
+            )
+        self.domain_index = domain_index
+        self.sleep_coordinator = sleep_coordinator
         self.set_domain(domain)
 
     def set_domain(self, domain: AbstractDomain) -> None:
@@ -293,6 +346,246 @@ class Chamelia(nn.Module):
             ),
         )
 
+    def _slice_domain_state(
+        self,
+        domain_state: dict[str, Any],
+        batch_idx: int,
+    ) -> dict[str, Any]:
+        """Slice a possibly batched domain-state dict down to one sample."""
+        sliced: dict[str, Any] = {}
+        for key, value in domain_state.items():
+            if torch.is_tensor(value) and value.dim() > 0 and batch_idx < value.shape[0]:
+                sliced[key] = value[batch_idx : batch_idx + 1]
+            else:
+                sliced[key] = value
+        return sliced
+
+    def _resolve_goal_latents(
+        self,
+        z: torch.Tensor,
+        domain_state: dict[str, Any],
+    ) -> torch.Tensor:
+        """Resolve goal latents for procedural retrieval and high-level planning."""
+        goal_latent = domain_state.get("goal_latent")
+        if torch.is_tensor(goal_latent):
+            if goal_latent.dim() == 1:
+                return goal_latent.unsqueeze(0).expand(z.shape[0], -1).to(z)
+            if goal_latent.dim() == 2 and goal_latent.shape == z.shape:
+                return goal_latent.to(z)
+        regime = self.domain.compute_regime_embedding(domain_state)
+        if torch.is_tensor(regime):
+            if regime.dim() == 1:
+                return regime.unsqueeze(0).expand(z.shape[0], -1).to(z)
+            if regime.dim() == 2 and regime.shape == z.shape:
+                return regime.to(z)
+        return z.detach()
+
+    def _pad_candidate_tensor(
+        self,
+        tensors: list[torch.Tensor],
+        pad_value: float = 0.0,
+    ) -> torch.Tensor:
+        """Pad variable-width candidate tensors to a common candidate count."""
+        if not tensors:
+            raise ValueError("tensors must be non-empty")
+        max_candidates = max(tensor.shape[0] for tensor in tensors)
+        tail_shape = tensors[0].shape[1:]
+        padded = torch.full(
+            (len(tensors), max_candidates, *tail_shape),
+            fill_value=pad_value,
+            dtype=tensors[0].dtype,
+            device=tensors[0].device,
+        )
+        for batch_idx, tensor in enumerate(tensors):
+            padded[batch_idx, : tensor.shape[0]] = tensor
+        return padded
+
+    def _run_system1_skill(
+        self,
+        *,
+        z: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        domain_state: dict[str, Any],
+        goal_z: torch.Tensor,
+        retrieved_skills: list[RetrievedSkill],
+    ) -> dict[str, Any] | None:
+        """Execute a confident retrieved skill directly through the low-level planner."""
+        if (
+            self.high_level_planner is None
+            or not retrieved_skills
+            or retrieved_skills[0].score < self.skill_confidence_threshold
+        ):
+            return None
+        plan = self.high_level_planner.plan(z=z, goal_z=goal_z, retrieved_skills=retrieved_skills)
+        if plan is None:
+            return None
+        candidate_paths = plan.action_path.detach().to(z)
+        if candidate_paths.dim() == 2:
+            candidate_paths = candidate_paths.unsqueeze(0)
+        candidate_postures = torch.zeros(
+            1,
+            self.actor.posture_dim,
+            dtype=z.dtype,
+            device=z.device,
+        )
+        reasoning_states = z.unsqueeze(0)
+        rollout = self.world_model(
+            z=z.unsqueeze(0),
+            actions=candidate_paths.unsqueeze(0),
+            ctx_tokens=ctx_tokens.unsqueeze(0),
+            candidate_postures=candidate_postures.unsqueeze(0),
+            reasoning_states=reasoning_states.unsqueeze(0),
+            horizon=min(self.rollout_horizon, candidate_paths.shape[1]),
+        )
+        candidate_costs = self.cost.score_candidates(
+            z=z.unsqueeze(0),
+            actions=candidate_paths.unsqueeze(0),
+            ctx_tokens=ctx_tokens.unsqueeze(0),
+            domain_state=domain_state,
+            future_z=rollout["terminal_latents"],
+            future_trajectory=rollout["trajectory"],
+        )
+        reasoning_chain = FrozenReasoningChain(
+            steps=(
+                ReasoningStep(
+                    state=z.detach(),
+                    candidate_paths=candidate_paths.detach(),
+                    candidate_costs=candidate_costs["total"][0].detach(),
+                    selected_path=candidate_paths[0].detach(),
+                    source="system1_skill",
+                    depth=0,
+                ),
+            )
+        )
+        return {
+            "selected_action": candidate_paths[0, 0].detach(),
+            "selected_path": candidate_paths[0].detach(),
+            "selected_posture": candidate_postures[0].detach(),
+            "selected_candidate_idx": 0,
+            "candidate_paths": candidate_paths.detach(),
+            "candidate_actions": candidate_paths[:, 0, :].detach(),
+            "candidate_postures": candidate_postures.detach(),
+            "candidate_reasoning_states": reasoning_states.detach(),
+            "candidate_ic": candidate_costs["ic"][0].detach(),
+            "candidate_tc": candidate_costs["tc"][0].detach(),
+            "candidate_total": candidate_costs["total"][0].detach(),
+            "candidate_terminal_latents": rollout["terminal_latents"][0].detach(),
+            "rollout": rollout,
+            "reasoning_chain": reasoning_chain,
+            "thinker_output": ThinkerOutput(
+                reasoning_chain=reasoning_chain,
+                action_vec=candidate_paths[0, 0].detach().unsqueeze(0),
+                selected_path=candidate_paths[0].detach().unsqueeze(0),
+                metadata={
+                    "planner_source": "system1_skill",
+                    "skill_id": retrieved_skills[0].record.skill_id,
+                    "score": retrieved_skills[0].score,
+                },
+            ),
+            "planner_source": "system1_skill",
+            "mcts_trace": {
+                "mode": "system1_skill",
+                "skill_id": retrieved_skills[0].record.skill_id,
+                "score": retrieved_skills[0].score,
+            },
+            "skill_trace": (retrieved_skills[0].record.skill_id,),
+        }
+
+    def _run_planner_sample(
+        self,
+        *,
+        z: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        domain_state: dict[str, Any],
+        goal_z: torch.Tensor,
+        retrieved_skills: list[RetrievedSkill],
+        retrieved_postures: torch.Tensor | None = None,
+        retrieved_posture_scores: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Run either direct-skill execution or MCTS for one sample."""
+        system1 = self._run_system1_skill(
+            z=z,
+            ctx_tokens=ctx_tokens,
+            domain_state=domain_state,
+            goal_z=goal_z,
+            retrieved_skills=retrieved_skills,
+        )
+        if system1 is not None:
+            return system1
+        if self.mcts_search is None:
+            raise RuntimeError("planner_backend='mcts' requires an MCTSSearch instance.")
+        result = self.mcts_search.search(
+            z=z,
+            ctx_tokens=ctx_tokens,
+            domain_state=domain_state,
+            goal_z=goal_z,
+            retrieved_postures=retrieved_postures,
+            retrieved_posture_scores=retrieved_posture_scores,
+            retrieved_skills=retrieved_skills,
+        )
+        zero_rollout = {
+            "terminal_latents": result.candidate_terminal_latents.unsqueeze(0)
+            if result.candidate_terminal_latents is not None
+            else None,
+        }
+        return {
+            "selected_action": result.selected_action.detach(),
+            "selected_path": result.selected_path.detach(),
+            "selected_posture": (
+                result.selected_posture.detach()
+                if result.selected_posture is not None
+                else torch.zeros(self.actor.posture_dim, device=z.device, dtype=z.dtype)
+            ),
+            "selected_candidate_idx": result.selected_candidate_idx,
+            "candidate_paths": result.candidate_paths.detach(),
+            "candidate_actions": result.candidate_paths[:, 0, :].detach(),
+            "candidate_postures": (
+                result.candidate_postures.detach()
+                if result.candidate_postures is not None
+                else torch.zeros(
+                    result.candidate_paths.shape[0],
+                    self.actor.posture_dim,
+                    dtype=z.dtype,
+                    device=z.device,
+                )
+            ),
+            "candidate_reasoning_states": (
+                result.candidate_reasoning_states.detach()
+                if result.candidate_reasoning_states is not None
+                else z.unsqueeze(0).expand(result.candidate_paths.shape[0], -1).detach()
+            ),
+            "candidate_ic": (
+                result.candidate_ic.detach()
+                if result.candidate_ic is not None
+                else torch.zeros_like(result.candidate_costs)
+            ),
+            "candidate_tc": (
+                result.candidate_tc.detach()
+                if result.candidate_tc is not None
+                else torch.zeros_like(result.candidate_costs)
+            ),
+            "candidate_total": result.candidate_costs.detach(),
+            "candidate_terminal_latents": (
+                result.candidate_terminal_latents.detach()
+                if result.candidate_terminal_latents is not None
+                else None
+            ),
+            "rollout": zero_rollout,
+            "reasoning_chain": result.reasoning_chain,
+            "thinker_output": ThinkerOutput(
+                reasoning_chain=result.reasoning_chain,
+                action_vec=result.selected_action.detach().unsqueeze(0),
+                selected_path=result.selected_path.detach().unsqueeze(0),
+                metadata={
+                    "planner_source": "mcts",
+                    "reused_tree": result.reused_tree,
+                },
+            ),
+            "planner_source": "mcts",
+            "mcts_trace": result.tree_trace,
+            "skill_trace": tuple(item.record.skill_id for item in retrieved_skills[:1]),
+        }
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -363,8 +656,166 @@ class Chamelia(nn.Module):
                 else None
             ),
         )
+        planner_cluster_ids: list[int | None] = [None] * z.shape[0]
+        planner_skill_traces: list[tuple[int, ...] | None] = [None] * z.shape[0]
+        planner_mcts_traces: list[dict[str, Any] | None] = [None] * z.shape[0]
+        thinker_output: ThinkerOutput | None = None
         reasoning_trace: list[dict[str, torch.Tensor]] = []
-        if actor_mode == "mode1":
+        if self.planner_backend == "mcts" and self.mcts_search is not None:
+            goal_latents = self._resolve_goal_latents(z, domain_state)
+            planner_results: list[dict[str, Any]] = []
+            for batch_idx in range(z.shape[0]):
+                domain_state_i = self._slice_domain_state(domain_state, batch_idx)
+                trigger_weights: dict[int, float] | None = None
+                if self.domain_index is not None:
+                    route = self.domain_index.route(
+                        z[batch_idx].detach(),
+                        self.domain.domain_name,
+                    )
+                    planner_cluster_ids[batch_idx] = route.cluster_id
+                    trigger_weights = self.domain_index.get_trigger_weights(route.cluster_id)
+                    if (
+                        self.domain_index.adapter_bank is not None
+                        and z.shape[0] == 1
+                    ):
+                        self.domain_index.adapter_bank.apply_cluster(route.cluster_id)
+                retrieved_skills = (
+                    self.procedural_memory.retrieve(
+                        goal_latents[batch_idx].detach() - z[batch_idx].detach(),
+                        k=self.actor.num_candidates,
+                        domain_name=self.domain.domain_name,
+                        trigger_weights=trigger_weights,
+                    )
+                    if self.procedural_memory is not None
+                    else []
+                )
+                retrieved_postures_i = (
+                    retrieved_postures[batch_idx].detach()
+                    if retrieved_postures is not None and batch_idx < retrieved_postures.shape[0]
+                    else None
+                )
+                retrieved_posture_scores_i = (
+                    retrieved_posture_scores[batch_idx].detach()
+                    if retrieved_posture_scores is not None
+                    and batch_idx < retrieved_posture_scores.shape[0]
+                    else None
+                )
+                result = self._run_planner_sample(
+                    z=z[batch_idx].detach(),
+                    ctx_tokens=ctx_tokens[batch_idx].detach(),
+                    domain_state=domain_state_i,
+                    goal_z=goal_latents[batch_idx].detach(),
+                    retrieved_skills=retrieved_skills,
+                    retrieved_postures=retrieved_postures_i,
+                    retrieved_posture_scores=retrieved_posture_scores_i,
+                )
+                planner_results.append(result)
+                planner_skill_traces[batch_idx] = result["skill_trace"]
+                planner_mcts_traces[batch_idx] = result["mcts_trace"]
+
+            candidate_paths = self._pad_candidate_tensor(
+                [result["candidate_paths"].to(z.device) for result in planner_results]
+            )
+            candidate_actions = self._pad_candidate_tensor(
+                [result["candidate_actions"].to(z.device) for result in planner_results]
+            )
+            candidate_postures = self._pad_candidate_tensor(
+                [result["candidate_postures"].to(z.device) for result in planner_results]
+            )
+            reasoning_states = self._pad_candidate_tensor(
+                [
+                    result["candidate_reasoning_states"].to(z.device)
+                    for result in planner_results
+                ]
+            )
+            candidate_ic = self._pad_candidate_tensor(
+                [result["candidate_ic"].to(z.device).unsqueeze(-1) for result in planner_results]
+            ).squeeze(-1)
+            candidate_tc = self._pad_candidate_tensor(
+                [result["candidate_tc"].to(z.device).unsqueeze(-1) for result in planner_results]
+            ).squeeze(-1)
+            candidate_total = self._pad_candidate_tensor(
+                [result["candidate_total"].to(z.device).unsqueeze(-1) for result in planner_results],
+                pad_value=1.0e6,
+            ).squeeze(-1)
+            candidate_terminal_latents = self._pad_candidate_tensor(
+                [
+                    (
+                        result["candidate_terminal_latents"].to(z.device)
+                        if result["candidate_terminal_latents"] is not None
+                        else torch.zeros(
+                            result["candidate_paths"].shape[0],
+                            z.shape[-1],
+                            device=z.device,
+                            dtype=z.dtype,
+                        )
+                    )
+                    for result in planner_results
+                ]
+            )
+            candidate_costs = {
+                "ic": candidate_ic,
+                "tc": candidate_tc,
+                "total": candidate_total,
+            }
+            selected_candidate_idx = torch.tensor(
+                [int(result["selected_candidate_idx"]) for result in planner_results],
+                dtype=torch.long,
+                device=z.device,
+            )
+            selected_path = torch.stack(
+                [result["selected_path"].to(z.device) for result in planner_results],
+                dim=0,
+            )
+            selected_posture = torch.stack(
+                [result["selected_posture"].to(z.device) for result in planner_results],
+                dim=0,
+            )
+            action_vec = torch.stack(
+                [result["selected_action"].to(z.device) for result in planner_results],
+                dim=0,
+            )
+            action = self.domain.decode_action(action_vec)
+            cost_out = {
+                "ic": torch.tensor(
+                    [
+                        float(result["candidate_ic"][int(result["selected_candidate_idx"])].item())
+                        for result in planner_results
+                    ],
+                    dtype=z.dtype,
+                    device=z.device,
+                ),
+                "tc": torch.tensor(
+                    [
+                        float(result["candidate_tc"][int(result["selected_candidate_idx"])].item())
+                        for result in planner_results
+                    ],
+                    dtype=z.dtype,
+                    device=z.device,
+                ),
+                "total": torch.tensor(
+                    [
+                        float(result["candidate_total"][int(result["selected_candidate_idx"])].item())
+                        for result in planner_results
+                    ],
+                    dtype=z.dtype,
+                    device=z.device,
+                ),
+            }
+            rollout = {
+                "terminal_latents": candidate_terminal_latents,
+                "trajectory": None,
+                "summary_tokens": None,
+            }
+            reasoning_trace = [
+                {
+                    "candidate_total": candidate_total.detach(),
+                    "candidate_tc": candidate_tc.detach(),
+                }
+            ]
+            if len(planner_results) == 1:
+                thinker_output = planner_results[0]["thinker_output"]
+        elif actor_mode == "mode1":
             candidate_actions = self.actor(z, ctx_tokens, mode="mode1").unsqueeze(1)
             candidate_paths = candidate_actions.unsqueeze(2)
             candidate_postures = torch.zeros(
@@ -395,127 +846,131 @@ class Chamelia(nn.Module):
             candidate_postures = proposal["candidate_postures"]
             reasoning_states = proposal["reasoning_states"]
 
-        rollout = None
-        candidate_costs = None
-        for round_idx in range(max(1, self.reasoning_steps if actor_mode == "mode2" else 1)):
-            rollout = self.world_model(
-                z=z,
-                actions=candidate_paths,
-                ctx_tokens=ctx_tokens,
-                candidate_postures=candidate_postures,
-                reasoning_states=reasoning_states,
-                horizon=self.rollout_horizon,
-            )
-            candidate_costs = self.cost.score_candidates(
-                z=z,
-                actions=candidate_paths,
-                ctx_tokens=ctx_tokens,
-                domain_state=domain_state,
-                future_z=rollout["terminal_latents"],
-                future_trajectory=rollout["trajectory"],
-            )
-            reasoning_trace.append(
-                {
-                    "candidate_total": candidate_costs["total"].detach(),
-                    "candidate_tc": candidate_costs["tc"].detach(),
-                }
-            )
-            if actor_mode != "mode2" or round_idx + 1 >= self.reasoning_steps:
-                break
-            next_retrieved_episode_summaries = retrieved_episode_summaries
-            next_retrieved_episode_scores = retrieved_episode_scores
-            next_retrieved_postures = retrieved_postures
-            next_retrieved_posture_scores = retrieved_posture_scores
-            next_retrieval_base_scores = retrieval_base_scores
-            next_retrieval_base_quality_scores = retrieval_base_quality_scores
-            next_retrieval_relevance_scores = retrieval_relevance_scores
-            next_retrieval_relevance_weights = retrieval_relevance_weights
-            next_retrieval_relevance_features = retrieval_relevance_features
-            if candidate_postures.shape[1] > 1:
-                nonbaseline_scores = candidate_costs["total"][:, 1:].detach()
-                posture_weights = torch.softmax(-nonbaseline_scores, dim=1)
-                posture_query = (
-                    candidate_postures[:, 1:, :].detach() * posture_weights.unsqueeze(-1)
-                ).sum(dim=1)
-                refreshed_keys, refreshed_episodes = self.memory.retrieve(
-                    z,
+        if self.planner_backend == "mcts" and self.mcts_search is not None:
+            pass
+        else:
+            rollout = None
+            candidate_costs = None
+            for round_idx in range(max(1, self.reasoning_steps if actor_mode == "mode2" else 1)):
+                rollout = self.world_model(
+                    z=z,
+                    actions=candidate_paths,
+                    ctx_tokens=ctx_tokens,
+                    candidate_postures=candidate_postures,
+                    reasoning_states=reasoning_states,
+                    horizon=self.rollout_horizon,
                 )
-                refreshed_bundle = self._rerank_retrieved_memory(
-                    query_key=z,
-                    episodes=refreshed_episodes,
-                    retrieved_keys=refreshed_keys,
-                    query_posture=posture_query,
+                candidate_costs = self.cost.score_candidates(
+                    z=z,
+                    actions=candidate_paths,
+                    ctx_tokens=ctx_tokens,
+                    domain_state=domain_state,
+                    future_z=rollout["terminal_latents"],
+                    future_trajectory=rollout["trajectory"],
                 )
-                retrieval_trace_rounds.append(
+                reasoning_trace.append(
                     {
-                        "query_key": z,
-                        "query_posture": posture_query,
-                        "retrieved_keys": refreshed_keys,
-                        "bundle": refreshed_bundle,
+                        "candidate_total": candidate_costs["total"].detach(),
+                        "candidate_tc": candidate_costs["tc"].detach(),
                     }
                 )
-                next_retrieved_episode_summaries = refreshed_bundle["episode_summaries"]
-                next_retrieved_episode_scores = refreshed_bundle["episode_scores"]
-                next_retrieved_postures = refreshed_bundle["postures"]
-                next_retrieved_posture_scores = refreshed_bundle["posture_scores"]
-                next_retrieval_base_scores = refreshed_bundle["base_scores"]
-                next_retrieval_base_quality_scores = refreshed_bundle["base_quality_scores"]
-                next_retrieval_relevance_scores = refreshed_bundle["relevance_scores"]
-                next_retrieval_relevance_weights = refreshed_bundle["relevance_weights"]
-                next_retrieval_relevance_features = refreshed_bundle["relevance_features"]
-            candidate_paths, candidate_postures, reasoning_states = self.actor.refine(
-                z=z,
-                ctx_tokens=ctx_tokens,
-                candidate_paths=candidate_paths,
-                candidate_postures=candidate_postures,
-                reasoning_states=reasoning_states,
-                rollout_summary=rollout["summary_tokens"],
-                candidate_scores=candidate_costs["total"],
-                retrieved_postures=(
-                    next_retrieved_postures.to(z.device)
-                    if next_retrieved_postures is not None
-                    else None
-                ),
-                retrieved_posture_scores=(
-                    next_retrieved_posture_scores.to(z.device)
-                    if next_retrieved_posture_scores is not None
-                    else None
-                ),
-                retrieved_episode_summaries=(
-                    next_retrieved_episode_summaries.to(z.device)
-                    if next_retrieved_episode_summaries is not None
-                    else None
-                ),
-                retrieved_episode_scores=(
-                    next_retrieved_episode_scores.to(z.device)
-                    if next_retrieved_episode_scores is not None
-                    else None
-                ),
-            )
-            retrieved_episode_summaries = next_retrieved_episode_summaries
-            retrieved_episode_scores = next_retrieved_episode_scores
-            retrieved_postures = next_retrieved_postures
-            retrieved_posture_scores = next_retrieved_posture_scores
-            retrieval_base_scores = next_retrieval_base_scores
-            retrieval_base_quality_scores = next_retrieval_base_quality_scores
-            retrieval_relevance_scores = next_retrieval_relevance_scores
-            retrieval_relevance_weights = next_retrieval_relevance_weights
-            retrieval_relevance_features = next_retrieval_relevance_features
-            candidate_actions = candidate_paths[:, :, 0, :]
+                if actor_mode != "mode2" or round_idx + 1 >= self.reasoning_steps:
+                    break
+                next_retrieved_episode_summaries = retrieved_episode_summaries
+                next_retrieved_episode_scores = retrieved_episode_scores
+                next_retrieved_postures = retrieved_postures
+                next_retrieved_posture_scores = retrieved_posture_scores
+                next_retrieval_base_scores = retrieval_base_scores
+                next_retrieval_base_quality_scores = retrieval_base_quality_scores
+                next_retrieval_relevance_scores = retrieval_relevance_scores
+                next_retrieval_relevance_weights = retrieval_relevance_weights
+                next_retrieval_relevance_features = retrieval_relevance_features
+                if candidate_postures.shape[1] > 1:
+                    nonbaseline_scores = candidate_costs["total"][:, 1:].detach()
+                    posture_weights = torch.softmax(-nonbaseline_scores, dim=1)
+                    posture_query = (
+                        candidate_postures[:, 1:, :].detach() * posture_weights.unsqueeze(-1)
+                    ).sum(dim=1)
+                    refreshed_keys, refreshed_episodes = self.memory.retrieve(
+                        z,
+                    )
+                    refreshed_bundle = self._rerank_retrieved_memory(
+                        query_key=z,
+                        episodes=refreshed_episodes,
+                        retrieved_keys=refreshed_keys,
+                        query_posture=posture_query,
+                    )
+                    retrieval_trace_rounds.append(
+                        {
+                            "query_key": z,
+                            "query_posture": posture_query,
+                            "retrieved_keys": refreshed_keys,
+                            "bundle": refreshed_bundle,
+                        }
+                    )
+                    next_retrieved_episode_summaries = refreshed_bundle["episode_summaries"]
+                    next_retrieved_episode_scores = refreshed_bundle["episode_scores"]
+                    next_retrieved_postures = refreshed_bundle["postures"]
+                    next_retrieved_posture_scores = refreshed_bundle["posture_scores"]
+                    next_retrieval_base_scores = refreshed_bundle["base_scores"]
+                    next_retrieval_base_quality_scores = refreshed_bundle["base_quality_scores"]
+                    next_retrieval_relevance_scores = refreshed_bundle["relevance_scores"]
+                    next_retrieval_relevance_weights = refreshed_bundle["relevance_weights"]
+                    next_retrieval_relevance_features = refreshed_bundle["relevance_features"]
+                candidate_paths, candidate_postures, reasoning_states = self.actor.refine(
+                    z=z,
+                    ctx_tokens=ctx_tokens,
+                    candidate_paths=candidate_paths,
+                    candidate_postures=candidate_postures,
+                    reasoning_states=reasoning_states,
+                    rollout_summary=rollout["summary_tokens"],
+                    candidate_scores=candidate_costs["total"],
+                    retrieved_postures=(
+                        next_retrieved_postures.to(z.device)
+                        if next_retrieved_postures is not None
+                        else None
+                    ),
+                    retrieved_posture_scores=(
+                        next_retrieved_posture_scores.to(z.device)
+                        if next_retrieved_posture_scores is not None
+                        else None
+                    ),
+                    retrieved_episode_summaries=(
+                        next_retrieved_episode_summaries.to(z.device)
+                        if next_retrieved_episode_summaries is not None
+                        else None
+                    ),
+                    retrieved_episode_scores=(
+                        next_retrieved_episode_scores.to(z.device)
+                        if next_retrieved_episode_scores is not None
+                        else None
+                    ),
+                )
+                retrieved_episode_summaries = next_retrieved_episode_summaries
+                retrieved_episode_scores = next_retrieved_episode_scores
+                retrieved_postures = next_retrieved_postures
+                retrieved_posture_scores = next_retrieved_posture_scores
+                retrieval_base_scores = next_retrieval_base_scores
+                retrieval_base_quality_scores = next_retrieval_base_quality_scores
+                retrieval_relevance_scores = next_retrieval_relevance_scores
+                retrieval_relevance_weights = next_retrieval_relevance_weights
+                retrieval_relevance_features = next_retrieval_relevance_features
+                candidate_actions = candidate_paths[:, :, 0, :]
 
         if candidate_costs is None or rollout is None:
             raise RuntimeError("Chamelia forward must produce candidate costs and rollout outputs.")
 
-        selected_candidate_idx = candidate_costs["total"].argmin(dim=1)
-        selected_path = _select_candidate_tensor(candidate_paths, selected_candidate_idx)
-        selected_posture = _select_candidate_tensor(candidate_postures, selected_candidate_idx)
-        action_vec = _select_candidate_tensor(candidate_actions, selected_candidate_idx)
-        action = self.domain.decode_action(action_vec)
-        cost_out = {
-            "ic": _select_candidate_tensor(candidate_costs["ic"], selected_candidate_idx),
-            "tc": _select_candidate_tensor(candidate_costs["tc"], selected_candidate_idx),
-            "total": _select_candidate_tensor(candidate_costs["total"], selected_candidate_idx),
-        }
+        if not (self.planner_backend == "mcts" and self.mcts_search is not None):
+            selected_candidate_idx = candidate_costs["total"].argmin(dim=1)
+            selected_path = _select_candidate_tensor(candidate_paths, selected_candidate_idx)
+            selected_posture = _select_candidate_tensor(candidate_postures, selected_candidate_idx)
+            action_vec = _select_candidate_tensor(candidate_actions, selected_candidate_idx)
+            action = self.domain.decode_action(action_vec)
+            cost_out = {
+                "ic": _select_candidate_tensor(candidate_costs["ic"], selected_candidate_idx),
+                "tc": _select_candidate_tensor(candidate_costs["tc"], selected_candidate_idx),
+                "total": _select_candidate_tensor(candidate_costs["total"], selected_candidate_idx),
+            }
 
         if store_to_memory:
             self._pending_record_indices = []
@@ -540,7 +995,11 @@ class Chamelia(nn.Module):
                     candidate_ic=candidate_costs["ic"].detach()[batch_idx],
                     candidate_tc=candidate_costs["tc"].detach()[batch_idx],
                     candidate_total=candidate_costs["total"].detach()[batch_idx],
-                    candidate_terminal_latents=rollout["terminal_latents"].detach()[batch_idx],
+                    candidate_terminal_latents=(
+                        rollout["terminal_latents"].detach()[batch_idx]
+                        if isinstance(rollout.get("terminal_latents"), torch.Tensor)
+                        else None
+                    ),
                     selected_candidate_idx=int(selected_candidate_idx[batch_idx].item()),
                     retrieval_trace=tuple(
                         trace_step
@@ -556,12 +1015,22 @@ class Chamelia(nn.Module):
                         )
                         if trace_step is not None
                     ),
+                    mcts_trace=planner_mcts_traces[batch_idx],
+                    skill_trace=planner_skill_traces[batch_idx],
+                    goal_key=(
+                        goal_latents.detach()[batch_idx]
+                        if self.planner_backend == "mcts" and self.mcts_search is not None
+                        else None
+                    ),
+                    domain_cluster_id=planner_cluster_ids[batch_idx],
                 )
                 self._pending_record_indices.append(self.memory.store(record))
         else:
             self._pending_record_indices = []
 
         self._step_counter += 1
+        if self.sleep_coordinator is not None:
+            self.sleep_coordinator.maybe_trigger(self._step_counter)
         return {
             "action": action,
             "action_vec": action_vec,
@@ -602,6 +1071,10 @@ class Chamelia(nn.Module):
             "selected_path": selected_path,
             "rollout": rollout,
             "reasoning_trace": reasoning_trace,
+            "thinker_output": thinker_output,
+            "planner_backend": self.planner_backend,
+            "world_model_backend": self.world_model_backend,
+            "planner_cluster_ids": planner_cluster_ids,
         }
 
     def fill_outcome(
