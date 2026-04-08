@@ -78,7 +78,22 @@ class SleepCycleReport:
 
 
 class LOVEDecomposer:
-    """Frequency-weighted path decomposition approximating LOVE."""
+    """Partition traces with a compression-style objective inspired by LOVE."""
+
+    @dataclass
+    class _FragmentStats:
+        count: int = 0
+        total_quality: float = 0.0
+        total_utility: float = 0.0
+        episode_ids: set[int] = field(default_factory=set)
+        paths: list[torch.Tensor] = field(default_factory=list)
+
+    @dataclass(frozen=True)
+    class _TraceExample:
+        record_id: int
+        action_path: torch.Tensor
+        program: tuple[int, ...]
+        quality: float
 
     def __init__(
         self,
@@ -96,55 +111,168 @@ class LOVEDecomposer:
         weights = torch.arange(1, clipped.shape[-1] + 1, dtype=torch.int64)
         return (clipped * weights.unsqueeze(0)).sum(dim=-1)
 
-    def decompose(self, records: list[Any]) -> list[DecomposedSegment]:
-        buckets: dict[tuple[int, ...], dict[str, Any]] = {}
-        for record in records:
-            selected_path = getattr(record, "selected_path", None)
-            if selected_path is None:
+    def _episode_quality(self, record: Any) -> float:
+        realized = getattr(record, "ic_realized", None)
+        if realized is not None:
+            return -float(realized)
+        return -float(getattr(record, "ic_at_decision", 0.0) + getattr(record, "tc_predicted", 0.0))
+
+    def _is_solved(self, record: Any) -> bool:
+        realized = getattr(record, "ic_realized", None)
+        return realized is not None and float(realized) <= 0.0
+
+    def _trace_corpus(self, records: list[Any]) -> list[_TraceExample]:
+        usable = [
+            record
+            for record in records
+            if getattr(record, "selected_path", None) is not None and self._is_solved(record)
+        ]
+        if not usable:
+            usable = [
+                record
+                for record in records
+                if getattr(record, "selected_path", None) is not None
+            ]
+        corpus: list[LOVEDecomposer._TraceExample] = []
+        for record in usable:
+            path = getattr(record, "selected_path").detach().float()
+            program = tuple(int(value) for value in self._path_signature(path).tolist())
+            if not program:
                 continue
-            path = selected_path.detach().float()
-            quality = -float(
-                getattr(record, "ic_realized", None)
-                if getattr(record, "ic_realized", None) is not None
-                else getattr(record, "ic_at_decision", 0.0) + getattr(record, "tc_predicted", 0.0)
-            )
-            signature = self._path_signature(path)
-            for length in range(1, min(self.max_segment_length, path.shape[0]) + 1):
-                prefix = signature[:length]
-                key = tuple(int(value) for value in prefix.tolist())
-                bucket = buckets.setdefault(
-                    key,
-                    {
-                        "count": 0,
-                        "quality": 0.0,
-                        "paths": [],
-                        "episodes": [],
-                        "codes": prefix.clone(),
-                    },
+            corpus.append(
+                LOVEDecomposer._TraceExample(
+                    record_id=int(getattr(record, "record_id", 0)),
+                    action_path=path,
+                    program=program,
+                    quality=self._episode_quality(record),
                 )
-                bucket["count"] += 1
-                bucket["quality"] += quality
-                bucket["paths"].append(path[:length].clone())
-                bucket["episodes"].append(int(getattr(record, "record_id", 0)))
-        segments: list[DecomposedSegment] = []
-        for bucket in buckets.values():
-            if bucket["count"] < self.min_frequency:
+            )
+        return corpus
+
+    def _candidate_library(
+        self,
+        corpus: list[_TraceExample],
+    ) -> dict[tuple[int, ...], _FragmentStats]:
+        library: dict[tuple[int, ...], LOVEDecomposer._FragmentStats] = {}
+        for trace in corpus:
+            max_length = min(self.max_segment_length, len(trace.program))
+            for length in range(1, max_length + 1):
+                for start in range(len(trace.program) - length + 1):
+                    fragment = trace.program[start : start + length]
+                    stats = library.setdefault(fragment, LOVEDecomposer._FragmentStats())
+                    stats.count += 1
+                    stats.total_quality += trace.quality
+                    stats.episode_ids.add(trace.record_id)
+                    stats.paths.append(trace.action_path[start : start + length].clone())
+        return library
+
+    def _segment_utility(
+        self,
+        fragment: tuple[int, ...],
+        stats: _FragmentStats,
+        *,
+        num_traces: int,
+    ) -> float:
+        avg_quality = stats.total_quality / max(stats.count, 1)
+        frequency_surrogate = math.log1p(stats.count) + math.log((len(stats.episode_ids) + 1.0) / (num_traces + 1.0))
+        compression_gain = max(0.0, float(len(fragment) - 1))
+        description_length = float(len(fragment))
+        return frequency_surrogate + compression_gain + (0.1 * avg_quality) - (self.beta * description_length)
+
+    def _partition_trace(
+        self,
+        trace: _TraceExample,
+        library: dict[tuple[int, ...], _FragmentStats],
+        *,
+        num_traces: int,
+    ) -> list[tuple[int, int, tuple[int, ...], float]]:
+        program = trace.program
+        n = len(program)
+        dp = [-float("inf")] * (n + 1)
+        choice: list[tuple[int, int, tuple[int, ...], float] | None] = [None] * (n + 1)
+        dp[0] = 0.0
+        for end in range(1, n + 1):
+            max_length = min(self.max_segment_length, end)
+            for length in range(1, max_length + 1):
+                start = end - length
+                fragment = program[start:end]
+                stats = library.get(fragment)
+                if stats is None:
+                    continue
+                utility = self._segment_utility(fragment, stats, num_traces=num_traces)
+                candidate_score = dp[start] + utility
+                if candidate_score > dp[end]:
+                    dp[end] = candidate_score
+                    choice[end] = (start, end, fragment, utility)
+        partition: list[tuple[int, int, tuple[int, ...], float]] = []
+        cursor = n
+        while cursor > 0:
+            selected = choice[cursor]
+            if selected is None:
+                start = cursor - 1
+                fragment = (program[start],)
+                stats = library[fragment]
+                selected = (
+                    start,
+                    cursor,
+                    fragment,
+                    self._segment_utility(fragment, stats, num_traces=num_traces),
+                )
+            partition.append(selected)
+            cursor = selected[0]
+        partition.reverse()
+        return partition
+
+    def decompose(self, records: list[Any]) -> list[DecomposedSegment]:
+        corpus = self._trace_corpus(records)
+        if not corpus:
+            return []
+        library = self._candidate_library(corpus)
+        aggregated: dict[tuple[int, ...], LOVEDecomposer._FragmentStats] = {}
+        for trace in corpus:
+            for start, end, fragment, utility in self._partition_trace(
+                trace,
+                library,
+                num_traces=len(corpus),
+            ):
+                stats = aggregated.setdefault(fragment, LOVEDecomposer._FragmentStats())
+                stats.count += 1
+                stats.total_quality += trace.quality
+                stats.total_utility += utility
+                stats.episode_ids.add(trace.record_id)
+                stats.paths.append(trace.action_path[start:end].clone())
+        promoted: list[DecomposedSegment] = []
+        for fragment, stats in aggregated.items():
+            if len(fragment) <= 1 or stats.count < self.min_frequency:
                 continue
-            avg_quality = bucket["quality"] / bucket["count"]
-            score = (bucket["count"] * avg_quality) - (self.beta * len(bucket["paths"][0]))
-            if score <= 0:
+            score = stats.total_utility / max(stats.count, 1)
+            if score <= 0.0:
                 continue
-            prototype = torch.stack(bucket["paths"], dim=0).mean(dim=0)
-            segments.append(
+            prototype = torch.stack(stats.paths, dim=0).mean(dim=0)
+            promoted.append(
                 DecomposedSegment(
-                    symbolic_codes=bucket["codes"],
+                    symbolic_codes=torch.tensor(fragment, dtype=torch.long),
                     prototype_path=prototype,
-                    source_episodes=tuple(sorted(set(bucket["episodes"]))),
+                    source_episodes=tuple(sorted(stats.episode_ids)),
                     score=float(score),
                 )
             )
-        segments.sort(key=lambda item: item.score, reverse=True)
-        return segments
+        promoted.sort(key=lambda item: item.score, reverse=True)
+        if promoted:
+            return promoted
+        fallback = max(aggregated.items(), key=lambda item: item[1].total_utility, default=None)
+        if fallback is None:
+            return []
+        fragment, stats = fallback
+        prototype = torch.stack(stats.paths, dim=0).mean(dim=0)
+        return [
+            DecomposedSegment(
+                symbolic_codes=torch.tensor(fragment, dtype=torch.long),
+                prototype_path=prototype,
+                source_episodes=tuple(sorted(stats.episode_ids)),
+                score=float(stats.total_utility / max(stats.count, 1)),
+            )
+        ]
 
 
 class StitchProgramCodec:
@@ -260,34 +388,36 @@ class StitchCompressor:
 
 
 class BODEGenOptimizer:
-    """Bayesian optimisation over continuous action-sequence space."""
+    """Bayesian optimisation over latent prompts that decode to executable skills."""
 
     def __init__(
         self,
         *,
-        action_dim: int,
-        path_length: int,
+        latent_prompt_dim: int | None = None,
         latent_bound: float = 2.0,
         num_initial_points: int = 8,
         num_iterations: int = 8,
+        lipschitz_weight: float = 0.05,
+        max_lipschitz_ratio: float = 1.0,
     ) -> None:
-        self.action_dim = action_dim
-        self.path_length = path_length
+        self.latent_prompt_dim = latent_prompt_dim
         self.latent_bound = float(latent_bound)
         self.num_initial_points = num_initial_points
         self.num_iterations = num_iterations
-
-    @property
-    def search_dim(self) -> int:
-        return self.action_dim * self.path_length
+        self.lipschitz_weight = float(lipschitz_weight)
+        self.max_lipschitz_ratio = float(max_lipschitz_ratio)
 
     def optimize(
         self,
         objective: Any,
         *,
+        latent_action_encoder: LatentActionEncoder,
+        path_length: int,
+        symbolic_codes: torch.Tensor | None = None,
+        seed_prompts: list[torch.Tensor] | None = None,
         seed_paths: list[torch.Tensor] | None = None,
         device: torch.device | str = "cpu",
-    ) -> tuple[torch.Tensor, float]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         if (
             SingleTaskGP is None
             or ExpectedImprovement is None
@@ -296,45 +426,96 @@ class BODEGenOptimizer:
             or ExactMarginalLogLikelihood is None
         ):
             raise RuntimeError("botorch and gpytorch are required for BODE-GEN optimisation.")
+        search_dim = int(self.latent_prompt_dim or latent_action_encoder.latent_prompt_dim)
         bounds = torch.tensor(
-            [[0.0] * self.search_dim, [1.0] * self.search_dim],
+            [[0.0] * search_dim, [1.0] * search_dim],
             dtype=torch.double,
             device=device,
         )
-        low = torch.full((self.search_dim,), -self.latent_bound, dtype=torch.double, device=device)
-        high = torch.full((self.search_dim,), self.latent_bound, dtype=torch.double, device=device)
+        low = torch.full((search_dim,), -self.latent_bound, dtype=torch.double, device=device)
+        high = torch.full((search_dim,), self.latent_bound, dtype=torch.double, device=device)
 
         def _actualize(unit_candidate: torch.Tensor) -> torch.Tensor:
             return low + ((high - low) * unit_candidate)
 
         train_x = []
-        if seed_paths:
-            for path in seed_paths[: self.num_initial_points]:
-                actual = path.detach().reshape(-1).to(device=device, dtype=torch.double)
+        if seed_prompts:
+            for prompt in seed_prompts[: self.num_initial_points]:
+                actual = prompt.detach().reshape(-1).to(device=device, dtype=torch.double)
+                if actual.numel() != search_dim:
+                    continue
                 normalized = (actual - low) / (high - low).clamp_min(1.0e-6)
                 train_x.append(normalized.clamp(0.0, 1.0))
-        sobol = torch.quasirandom.SobolEngine(self.search_dim, scramble=True)
+        if seed_paths:
+            for path in seed_paths[: self.num_initial_points]:
+                inferred = latent_action_encoder.infer_prompt(
+                    path.detach().to(device),
+                    symbolic_codes=(
+                        symbolic_codes.to(device=device)
+                        if symbolic_codes is not None
+                        else None
+                    ),
+                ).squeeze(0)
+                actual = inferred.detach().reshape(-1).to(device=device, dtype=torch.double)
+                normalized = (actual - low) / (high - low).clamp_min(1.0e-6)
+                train_x.append(normalized.clamp(0.0, 1.0))
+        sobol = torch.quasirandom.SobolEngine(search_dim, scramble=True)
         while len(train_x) < self.num_initial_points:
             sample = sobol.draw(1, dtype=torch.double).squeeze(0).to(device)
             train_x.append(sample)
         train_x_tensor = torch.stack(train_x, dim=0)
+        observed_prompts: list[torch.Tensor] = []
+        observed_embeddings: list[torch.Tensor] = []
+
+        def _evaluate_prompt(prompt_vector: torch.Tensor) -> tuple[float, torch.Tensor, torch.Tensor]:
+            prompt_batch = prompt_vector.to(device=device, dtype=torch.float32).view(1, -1)
+            with torch.no_grad():
+                action_path = latent_action_encoder.decode_prompt(
+                    prompt_batch,
+                    path_length=path_length,
+                ).squeeze(0)
+                embedding = latent_action_encoder(
+                    action_path,
+                    symbolic_codes=(
+                        symbolic_codes.to(device=device)
+                        if symbolic_codes is not None
+                        else None
+                    ),
+                    prompt_vector=prompt_batch,
+                    path_length=path_length,
+                ).squeeze(0)
+            observed_prompts.append(prompt_batch.detach())
+            observed_embeddings.append(embedding.detach().unsqueeze(0))
+            regularized_score = float(objective(prompt_batch.squeeze(0), action_path, embedding))
+            if len(observed_prompts) > 1:
+                prompt_bank = torch.cat(observed_prompts, dim=0)
+                embedding_bank = torch.cat(observed_embeddings, dim=0)
+                lipschitz_penalty = latent_action_encoder.lipschitz_penalty(
+                    prompt_bank,
+                    embedding_bank,
+                    max_ratio=self.max_lipschitz_ratio,
+                )
+                regularized_score -= self.lipschitz_weight * float(lipschitz_penalty.item())
+            return regularized_score, action_path.detach().cpu().float(), embedding.detach().cpu().float()
+
+        initial_scores: list[float] = []
+        initial_paths: list[torch.Tensor] = []
+        initial_embeddings: list[torch.Tensor] = []
+        for candidate in train_x_tensor:
+            score, path, embedding = _evaluate_prompt(_actualize(candidate))
+            initial_scores.append(score)
+            initial_paths.append(path)
+            initial_embeddings.append(embedding)
         train_y_tensor = torch.tensor(
-            [
-                [
-                    float(
-                        objective(
-                            _actualize(candidate).view(self.path_length, self.action_dim)
-                        )
-                    )
-                ]
-                for candidate in train_x_tensor
-            ],
+            [[score] for score in initial_scores],
             dtype=torch.double,
             device=device,
         )
         best_index = int(train_y_tensor.argmax().item())
         best_x = train_x_tensor[best_index].clone()
         best_y = float(train_y_tensor[best_index].item())
+        best_path = initial_paths[best_index].clone()
+        best_embedding = initial_embeddings[best_index].clone()
         for _ in range(self.num_iterations):
             model = SingleTaskGP(train_x_tensor, train_y_tensor)
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
@@ -351,9 +532,7 @@ class BODEGenOptimizer:
                 raw_samples=128,
             )
             candidate_x = candidate_x.squeeze(0)
-            candidate_y = float(
-                objective(_actualize(candidate_x).view(self.path_length, self.action_dim))
-            )
+            candidate_y, candidate_path, candidate_embedding = _evaluate_prompt(_actualize(candidate_x))
             train_x_tensor = torch.cat([train_x_tensor, candidate_x.unsqueeze(0)], dim=0)
             train_y_tensor = torch.cat(
                 [
@@ -365,7 +544,9 @@ class BODEGenOptimizer:
             if candidate_y > best_y:
                 best_x = candidate_x.clone()
                 best_y = candidate_y
-        return _actualize(best_x).view(self.path_length, self.action_dim).detach().cpu().float(), best_y
+                best_path = candidate_path.clone()
+                best_embedding = candidate_embedding.clone()
+        return _actualize(best_x).detach().cpu().float(), best_path, best_embedding, best_y
 
 
 class DreamDecompiler:
@@ -1169,13 +1350,16 @@ class SleepCoordinator:
             return generated
         for candidate in rsd_candidates[:4]:
             optimizer = BODEGenOptimizer(
-                action_dim=self.latent_action_encoder.action_dim,
-                path_length=candidate.action_path.shape[0],
+                latent_prompt_dim=self.latent_action_encoder.latent_prompt_dim,
                 num_initial_points=4,
                 num_iterations=4,
             )
 
-            def objective(path: torch.Tensor) -> float:
+            def objective(
+                prompt_vector: torch.Tensor,
+                path: torch.Tensor,
+                embedding: torch.Tensor,
+            ) -> float:
                 rollout = self.world_model(
                     z=reference_record.key.detach().unsqueeze(0),
                     actions=path.detach().unsqueeze(0).unsqueeze(0),
@@ -1193,6 +1377,9 @@ class SleepCoordinator:
                     future_trajectory=rollout["trajectory"],
                 )["total"][0, 0]
                 objective_value = -float(score.item())
+                retrieved = self.procedural_memory.retrieve(embedding.detach().cpu(), k=1)
+                if retrieved:
+                    objective_value -= 0.1 * retrieved[0].similarity
                 if candidate.target_delta is not None and getattr(reference_record, "outcome_key", None) is not None:
                     predicted_delta = rollout["terminal_latents"][0, 0] - reference_record.key.detach()
                     alignment = F.cosine_similarity(
@@ -1201,11 +1388,20 @@ class SleepCoordinator:
                         dim=-1,
                     )
                     objective_value += float(alignment.item())
+                objective_value -= 0.01 * float(prompt_vector.norm().item())
                 return objective_value
 
             try:
-                optimized_path, best_score = optimizer.optimize(
+                optimized_prompt, optimized_path, _optimized_embedding, best_score = optimizer.optimize(
                     objective,
+                    latent_action_encoder=self.latent_action_encoder,
+                    path_length=candidate.action_path.shape[0],
+                    symbolic_codes=candidate.symbolic_codes,
+                    seed_prompts=(
+                        [candidate.prompt_vector]
+                        if candidate.prompt_vector is not None
+                        else None
+                    ),
                     seed_paths=[candidate.action_path],
                     device=reference_record.key.device,
                 )
@@ -1218,6 +1414,7 @@ class SleepCoordinator:
                     target_delta=candidate.target_delta,
                     source_weight=max(candidate.source_weight, best_score),
                     source_episodes=candidate.source_episodes,
+                    prompt_vector=optimized_prompt,
                 )
             )
         return generated

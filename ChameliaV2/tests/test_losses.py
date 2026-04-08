@@ -240,6 +240,24 @@ class TestHJEPALoss:
         # (max distance between two unit vectors is 2, so MSE would be 4)
         assert 0 <= loss.item() <= 10  # Allow some margin
 
+    def test_vq_commitment_loss_is_added_to_total(self, setup):
+        """Test that optional VQ commitment loss is threaded into the total loss."""
+        loss_fn = HJEPALoss(vq_weight=0.5)
+        base_loss = loss_fn(self.predictions, self.targets)["loss"]
+        vq_commitment_loss = torch.tensor(2.0)
+
+        loss_dict = loss_fn(
+            self.predictions,
+            self.targets,
+            vq_commitment_loss=vq_commitment_loss,
+        )
+
+        assert "vq_loss" in loss_dict
+        assert "vq_loss_weighted" in loss_dict
+        assert torch.allclose(loss_dict["vq_loss"], vq_commitment_loss)
+        assert torch.allclose(loss_dict["vq_loss_weighted"], torch.tensor(1.0))
+        assert torch.allclose(loss_dict["loss"], base_loss + torch.tensor(1.0), atol=1e-6)
+
     def test_deterministic_loss(self):
         """Test that loss computation is deterministic."""
         torch.manual_seed(42)

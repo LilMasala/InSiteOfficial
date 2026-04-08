@@ -84,6 +84,7 @@ class CombinedLoss(nn.Module):
         num_hierarchies: int = 3,
         normalize_embeddings: bool = True,
         huber_delta: float = 1.0,
+        vq_weight: float = 1.0,
         # VICReg parameters
         vicreg_weight: float | list[float] = 0.1,
         vicreg_invariance_weight: float = 25.0,
@@ -111,6 +112,7 @@ class CombinedLoss(nn.Module):
             reduction=reduction,
             normalize_embeddings=normalize_embeddings,
             huber_delta=huber_delta,
+            vq_weight=vq_weight,
             eps=eps,
         )
 
@@ -147,6 +149,7 @@ class CombinedLoss(nn.Module):
         targets: list[torch.Tensor] | torch.Tensor,
         masks: list[torch.Tensor] | None = None,
         context_features: torch.Tensor | None = None,
+        vq_commitment_loss: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute combined H-JEPA + VICReg loss.
@@ -177,7 +180,12 @@ class CombinedLoss(nn.Module):
             targets = [targets]
 
         # 1. Compute JEPA loss
-        jepa_dict = self.jepa_loss(predictions, targets, masks)
+        jepa_dict = self.jepa_loss(
+            predictions,
+            targets,
+            masks,
+            vq_commitment_loss=vq_commitment_loss,
+        )
 
         # 2. Compute VICReg loss
         loss_dict = {}
@@ -345,6 +353,7 @@ class HierarchicalCombinedLoss(CombinedLoss):
         normalize_embeddings: bool = True,
         vicreg_weight: float | list[float] = 0.1,
         vicreg_configs: list[dict[str, Any]] | None = None,
+        vq_weight: float = 1.0,
         **kwargs: Any,
     ) -> None:
         # Initialize base class with default VICReg parameters
@@ -354,6 +363,7 @@ class HierarchicalCombinedLoss(CombinedLoss):
             num_hierarchies=num_hierarchies,
             normalize_embeddings=normalize_embeddings,
             vicreg_weight=vicreg_weight,
+            vq_weight=vq_weight,
             **kwargs,
         )
 
@@ -375,6 +385,8 @@ class HierarchicalCombinedLoss(CombinedLoss):
         predictions: list[torch.Tensor] | torch.Tensor,
         targets: list[torch.Tensor] | torch.Tensor,
         masks: list[torch.Tensor] | None = None,
+        context_features: torch.Tensor | None = None,
+        vq_commitment_loss: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute loss with hierarchy-specific VICReg."""
         if isinstance(predictions, torch.Tensor):
@@ -383,7 +395,13 @@ class HierarchicalCombinedLoss(CombinedLoss):
             targets = [targets]
 
         # 1. Compute JEPA loss
-        jepa_dict = self.jepa_loss(predictions, targets, masks)
+        jepa_dict = self.jepa_loss(
+            predictions,
+            targets,
+            masks,
+            context_features=context_features,
+            vq_commitment_loss=vq_commitment_loss,
+        )
         loss_dict = {}
 
         # 2. Compute VICReg loss with hierarchy-specific configurations
@@ -471,6 +489,7 @@ def _build_jepa(loss_config: dict[str, Any], num_hierarchies: int) -> nn.Module:
         hierarchy_weights=loss_config.get("hierarchy_weights", 1.0),
         num_hierarchies=num_hierarchies,
         normalize_embeddings=loss_config.get("normalize_embeddings", True),
+        vq_weight=loss_config.get("vq_weight", 1.0),
     )
 
     if loss_config.get("use_contrastive", False):
@@ -518,6 +537,7 @@ def _build_combined(loss_config: dict[str, Any], num_hierarchies: int) -> nn.Mod
         jepa_hierarchy_weights=loss_config.get("hierarchy_weights", 1.0),
         num_hierarchies=num_hierarchies,
         normalize_embeddings=loss_config.get("normalize_embeddings", True),
+        vq_weight=loss_config.get("vq_weight", 1.0),
         vicreg_weight=loss_config.get("vicreg_weight", 0.1),
         vicreg_invariance_weight=loss_config.get("vicreg_invariance_weight", 25.0),
         vicreg_variance_weight=loss_config.get("vicreg_variance_weight", 25.0),
@@ -531,6 +551,7 @@ def _build_hierarchical_combined(loss_config: dict[str, Any], num_hierarchies: i
         jepa_loss_type=loss_config.get("jepa_loss_type", "smoothl1"),
         jepa_hierarchy_weights=loss_config.get("hierarchy_weights", 1.0),
         num_hierarchies=num_hierarchies,
+        vq_weight=loss_config.get("vq_weight", 1.0),
         vicreg_weight=loss_config.get("vicreg_weight", 0.1),
         vicreg_configs=loss_config.get("vicreg_configs", None),
     )
@@ -545,6 +566,7 @@ def _build_cjepa(loss_config: dict[str, Any], num_hierarchies: int) -> nn.Module
         hierarchy_weights=loss_config.get("hierarchy_weights", 1.0),
         num_hierarchies=num_hierarchies,
         normalize_embeddings=loss_config.get("normalize_embeddings", True),
+        vq_weight=loss_config.get("vq_weight", 1.0),
     )
 
     return ContrastiveJEPALoss(

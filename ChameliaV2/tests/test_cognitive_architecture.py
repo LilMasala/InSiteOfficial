@@ -455,12 +455,21 @@ def test_stitch_bodegen_and_gemma_worker_harness() -> None:
     compressed = StitchCompressor(iterations=2).compress(segments)
     assert len(compressed) >= 1
 
-    optimizer = BODEGenOptimizer(action_dim=2, path_length=2, num_initial_points=3, num_iterations=1)
-    best_path, best_score = optimizer.optimize(
-        lambda path: -float(((path - 0.5) ** 2).mean().item()),
+    encoder = LatentActionEncoder(action_dim=2, skill_dim=16, num_heads=2, num_layers=1, max_path_length=2)
+    optimizer = BODEGenOptimizer(
+        latent_prompt_dim=encoder.latent_prompt_dim,
+        num_initial_points=3,
+        num_iterations=1,
+    )
+    best_prompt, best_path, best_embedding, best_score = optimizer.optimize(
+        lambda prompt, _path, _embedding: -float(((prompt - 0.5) ** 2).mean().item()),
+        latent_action_encoder=encoder,
+        path_length=2,
         seed_paths=[torch.zeros(2, 2)],
     )
+    assert best_prompt.shape == (encoder.latent_prompt_dim,)
     assert best_path.shape == (2, 2)
+    assert best_embedding.shape == (16,)
     assert isinstance(best_score, float)
 
     worker = GemmaAutoDocWorker(

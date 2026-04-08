@@ -7,6 +7,7 @@ hierarchical levels.
 
 Mathematical Formulation:
     L_HJEPA = Σ_h w_h * L(pred_h, target_h)
+              + λ_vq * L_vq
 
     where:
     - h: hierarchy level index
@@ -45,6 +46,7 @@ class HJEPALoss(nn.Module):
         reduction: Reduction method ('mean', 'sum', or 'none')
         normalize_embeddings: Whether to L2-normalize embeddings before computing loss
         huber_delta: Delta parameter for Huber loss (only used if loss_type='huber')
+        vq_weight: Weight applied to the optional VQ commitment loss emitted by the model
         eps: Small constant for numerical stability
 
     Example:
@@ -69,6 +71,7 @@ class HJEPALoss(nn.Module):
         reduction: Literal["mean", "sum", "none"] = "mean",
         normalize_embeddings: bool = True,
         huber_delta: float = 1.0,
+        vq_weight: float = 1.0,
         eps: float = 1e-8,
     ):
         super().__init__()
@@ -78,6 +81,7 @@ class HJEPALoss(nn.Module):
         self.reduction = reduction
         self.normalize_embeddings = normalize_embeddings
         self.huber_delta = huber_delta
+        self.vq_weight = float(vq_weight)
         self.eps = eps
 
         # Process hierarchy weights
@@ -154,6 +158,7 @@ class HJEPALoss(nn.Module):
         targets: list[torch.Tensor] | torch.Tensor,
         masks: list[torch.Tensor] | None = None,
         context_features: torch.Tensor | None = None,  # Ignored, for API compatibility
+        vq_commitment_loss: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute hierarchical JEPA loss.
@@ -166,6 +171,7 @@ class HJEPALoss(nn.Module):
             masks: Optional binary masks [B, N] indicating which patches to include
                 in loss computation. One per hierarchy level or None.
             context_features: Ignored. Present for API compatibility with CombinedLoss.
+            vq_commitment_loss: Optional VQ commitment loss from the encoder bottleneck.
 
         Returns:
             Dictionary containing:
@@ -281,6 +287,11 @@ class HJEPALoss(nn.Module):
         # Compute weighted sum
         weighted_losses = losses_tensor * self._hierarchy_weights
         total_loss = weighted_losses.sum()
+        if vq_commitment_loss is not None and self.vq_weight != 0.0:
+            weighted_vq = self.vq_weight * vq_commitment_loss
+            total_loss = total_loss + weighted_vq
+            loss_dict["vq_loss"] = vq_commitment_loss
+            loss_dict["vq_loss_weighted"] = weighted_vq
 
         # Add to loss dictionary
         loss_dict["loss"] = total_loss
@@ -295,5 +306,6 @@ class HJEPALoss(nn.Module):
             f"num_hierarchies={self.num_hierarchies}, "
             f"hierarchy_weights={self.hierarchy_weights}, "
             f"normalize={self.normalize_embeddings}, "
+            f"vq_weight={self.vq_weight}, "
             f"reduction={self.reduction}"
         )

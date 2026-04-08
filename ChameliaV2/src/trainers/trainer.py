@@ -532,6 +532,7 @@ class HJEPATrainer:
             # context_features are the encoder outputs (with gradients) that we want
             # to regularize to prevent representation collapse
             context_features = outputs.get("context_features", None)
+            vq_commitment_loss = outputs.get("vq_commitment_loss", None)
 
             # Compute loss
             # Loss function returns a dict with 'loss' key and other metrics
@@ -540,6 +541,7 @@ class HJEPATrainer:
                 predictions=predictions,
                 targets=targets,
                 context_features=context_features,
+                vq_commitment_loss=vq_commitment_loss,
             )
             loss = loss_dict["loss"]
 
@@ -606,11 +608,13 @@ class HJEPATrainer:
                 predictions = outputs["predictions"]
                 targets = outputs["targets"]
                 context_features = outputs.get("context_features", None)
+                vq_commitment_loss = outputs.get("vq_commitment_loss", None)
 
                 loss_dict = self.loss_fn(
                     predictions=predictions,
                     targets=targets,
                     context_features=context_features,
+                    vq_commitment_loss=vq_commitment_loss,
                 )
                 loss = loss_dict["loss"]
 
