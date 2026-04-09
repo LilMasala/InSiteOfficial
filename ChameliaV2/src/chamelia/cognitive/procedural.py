@@ -238,6 +238,20 @@ class LanceSkillIndex:
         except Exception:
             return
 
+    def close(self) -> None:
+        """Release LanceDB handles before Python interpreter teardown."""
+        for handle_name in ("table", "db"):
+            handle = getattr(self, handle_name, None)
+            if handle is None:
+                continue
+            close_fn = getattr(handle, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            setattr(self, handle_name, None)
+
 
 class ProceduralMemory:
     """Hot procedural memory with SQLite metadata and FAISS retrieval."""
@@ -516,3 +530,17 @@ class ProceduralMemory:
             self.storage.paths.skill_index_path,
             self.storage.paths.skill_index_meta_path,
         )
+
+    def close(self) -> None:
+        """Persist and release backing indexes/storage."""
+        try:
+            self.save()
+        except Exception:
+            pass
+        close_index = getattr(self.index, "close", None)
+        if callable(close_index):
+            try:
+                close_index()
+            except Exception:
+                pass
+        self.storage.close()

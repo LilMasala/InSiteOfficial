@@ -524,3 +524,17 @@ class CognitiveStorage:
             if limit is not None and len(archived) >= int(limit):
                 break
         return archived
+
+    def close(self) -> None:
+        """Release optional LanceDB archival handles before interpreter shutdown."""
+        for handle_name in ("_episode_table", "_episode_db"):
+            handle = getattr(self, handle_name, None)
+            if handle is None:
+                continue
+            close_fn = getattr(handle, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            setattr(self, handle_name, None)

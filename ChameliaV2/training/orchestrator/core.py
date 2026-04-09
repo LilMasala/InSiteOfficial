@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import random
 import shutil
+import time
 from typing import Any
 
 import torch
@@ -462,6 +463,34 @@ class UnifiedTrainingOrchestrator:
         for domain_cfg in self.config.domains:
             results[domain_cfg.name] = self._run_domain(domain_cfg)
         return results
+
+    def _cleanup_model(self, model: Chamelia | None, adapter: InteractiveDomainAdapter | None = None) -> None:
+        """Tear down background workers and storage handles deterministically."""
+        if model is not None:
+            if model.sleep_coordinator is not None:
+                try:
+                    model.sleep_coordinator.stop()
+                except Exception:
+                    pass
+            if model.procedural_memory is not None:
+                try:
+                    model.procedural_memory.close()
+                except Exception:
+                    pass
+            if model.domain_index is not None:
+                try:
+                    model.domain_index.close()
+                except Exception:
+                    pass
+        if adapter is not None:
+            close_fn = getattr(adapter, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+        # Give Rust/tokio worker pools a beat to settle before interpreter exit.
+        time.sleep(0.1)
 
     def _build_adapter(self, domain_cfg: DomainRunConfig) -> InteractiveDomainAdapter:
         if domain_cfg.name not in self.adapter_builders:
@@ -1292,30 +1321,34 @@ class UnifiedTrainingOrchestrator:
 
     def _run_domain(self, domain_cfg: DomainRunConfig) -> dict[str, Any]:
         adapter = self._build_adapter(domain_cfg)
-        bootstrap_observations = self._collect_random_bootstrap(adapter, domain_cfg)
-        self._pretrain_hjepa(
-            domain_cfg.family,
-            adapter,
-            bootstrap_observations,
-            steps=domain_cfg.bootstrap_pretrain_steps,
-            batch_size=domain_cfg.bootstrap_batch_size,
-            mask_ratio=domain_cfg.mask_ratio,
-            lr=1.0e-4,
-        )
-        model = self._build_model(domain_cfg, adapter)
-        representation_loss_fn = self._build_representation_loss(domain_cfg.family)
-        domain_results: dict[str, Any] = {}
-        ordered_phases = ("core_control", "episodic_memory", "sleep")
-        for phase_name in ordered_phases:
-            phase_cfg = domain_cfg.phases.get(phase_name)
-            if phase_cfg is None or phase_cfg.episodes <= 0:
-                continue
-            domain_results[phase_name] = self._run_phase(
-                phase_name=phase_name,
-                phase_cfg=phase_cfg,
-                domain_cfg=domain_cfg,
-                adapter=adapter,
-                model=model,
-                representation_loss_fn=representation_loss_fn,
+        model: Chamelia | None = None
+        try:
+            bootstrap_observations = self._collect_random_bootstrap(adapter, domain_cfg)
+            self._pretrain_hjepa(
+                domain_cfg.family,
+                adapter,
+                bootstrap_observations,
+                steps=domain_cfg.bootstrap_pretrain_steps,
+                batch_size=domain_cfg.bootstrap_batch_size,
+                mask_ratio=domain_cfg.mask_ratio,
+                lr=1.0e-4,
             )
-        return domain_results
+            model = self._build_model(domain_cfg, adapter)
+            representation_loss_fn = self._build_representation_loss(domain_cfg.family)
+            domain_results: dict[str, Any] = {}
+            ordered_phases = ("core_control", "episodic_memory", "sleep")
+            for phase_name in ordered_phases:
+                phase_cfg = domain_cfg.phases.get(phase_name)
+                if phase_cfg is None or phase_cfg.episodes <= 0:
+                    continue
+                domain_results[phase_name] = self._run_phase(
+                    phase_name=phase_name,
+                    phase_cfg=phase_cfg,
+                    domain_cfg=domain_cfg,
+                    adapter=adapter,
+                    model=model,
+                    representation_loss_fn=representation_loss_fn,
+                )
+            return domain_results
+        finally:
+            self._cleanup_model(model, adapter)

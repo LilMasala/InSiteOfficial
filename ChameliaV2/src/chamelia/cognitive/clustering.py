@@ -249,6 +249,12 @@ class DomainIndex:
             spawned_new=False,
         )
 
+    def close(self) -> None:
+        """Release persisted storage handles and active adapter state."""
+        if self.adapter_bank is not None:
+            self.adapter_bank.clear_active()
+        self.storage.close()
+
     def _spawn_cluster(self, z: torch.Tensor, domain_name: str) -> int:
         cluster_id = self.storage.upsert_cluster(
             cluster_id=None,

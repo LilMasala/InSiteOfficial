@@ -1301,14 +1301,18 @@ class SleepCoordinator:
         if self._worker is not None and self._worker.is_alive():
             return
         self._stop.clear()
-        self._worker = threading.Thread(target=self._loop, daemon=True)
+        # Keep shutdown explicit so LanceDB-backed sleep jobs fully tear down
+        # before interpreter finalization.
+        self._worker = threading.Thread(target=self._loop, daemon=False)
         self._worker.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._pending.set()
         if self._worker is not None:
-            self._worker.join(timeout=2.0)
+            self._worker.join(timeout=5.0)
+            if not self._worker.is_alive():
+                self._worker = None
 
     def request_run(self) -> None:
         self._pending.set()
