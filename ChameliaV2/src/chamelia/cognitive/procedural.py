@@ -276,7 +276,14 @@ class ProceduralMemory:
         self._load_existing_skills()
 
     def _index_vector(self, vector: torch.Tensor) -> torch.Tensor:
-        candidate = vector.detach().float().to(self.device)
+        candidate = vector.detach().float()
+        target_device = torch.device(self.device)
+        if self.csr_encoder is not None:
+            try:
+                target_device = next(self.csr_encoder.parameters()).device
+            except StopIteration:
+                target_device = torch.device(self.device)
+        candidate = candidate.to(target_device)
         if candidate.dim() == 1:
             candidate = candidate.unsqueeze(0)
         if self.csr_encoder is not None:
@@ -288,9 +295,15 @@ class ProceduralMemory:
         dense_embedding = embedding.detach().float().cpu().view(-1)
         if self.codec is None:
             return dense_embedding, None, "dense"
+        codec_device = dense_embedding.device
+        try:
+            codec_device = next(self.codec.parameters()).device
+        except StopIteration:
+            codec_device = dense_embedding.device
         with torch.no_grad():
-            codes = self.codec.encode_codes(dense_embedding.unsqueeze(0)).squeeze(0).cpu()
-            reconstructed = self.codec.decode(codes.unsqueeze(0)).squeeze(0).cpu()
+            codec_input = dense_embedding.unsqueeze(0).to(codec_device)
+            codes = self.codec.encode_codes(codec_input).squeeze(0).cpu()
+            reconstructed = self.codec.decode(codes.unsqueeze(0).to(codec_device)).squeeze(0).cpu()
         storage_format = f"isotropic_vq_{self.codec.num_tokens}"
         return reconstructed, codes, storage_format
 

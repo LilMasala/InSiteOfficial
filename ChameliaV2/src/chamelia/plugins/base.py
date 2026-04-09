@@ -269,6 +269,12 @@ class InteractiveDomainAdapter(AbstractDomain):
             if hasattr(tokenizer, "collate")
             else tokenizer_input
         )
+        if isinstance(tokenizer, torch.nn.Module) and torch.is_tensor(batched_input):
+            try:
+                tokenizer_device = next(tokenizer.parameters()).device
+                batched_input = batched_input.to(tokenizer_device)
+            except StopIteration:
+                pass
         return tokenizer(batched_input)
 
     def build_domain_state(self, observation: Any, info: dict[str, Any] | None = None) -> dict[str, Any]:
