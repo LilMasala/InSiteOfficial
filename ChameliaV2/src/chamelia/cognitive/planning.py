@@ -128,7 +128,17 @@ class HighLevelPlanner(nn.Module):
             return None
         if z.dim() != 1 or goal_z.dim() != 1:
             raise ValueError("HighLevelPlanner.plan currently expects 1D latent vectors.")
-        skill_embeddings = torch.stack([item.record.embedding for item in retrieved_skills], dim=0).to(z)
+        planner_device = z.device
+        try:
+            planner_device = next(self.parameters()).device
+        except StopIteration:
+            planner_device = z.device
+        z = z.to(planner_device)
+        goal_z = goal_z.to(planner_device)
+        skill_embeddings = torch.stack(
+            [item.record.embedding for item in retrieved_skills],
+            dim=0,
+        ).to(planner_device)
         repeated_state = z.unsqueeze(0).expand(skill_embeddings.shape[0], -1)
         candidate_subgoals = self.subgoal_norm(
             z.unsqueeze(0) + self.subgoal_head(torch.cat([repeated_state, skill_embeddings], dim=-1))
