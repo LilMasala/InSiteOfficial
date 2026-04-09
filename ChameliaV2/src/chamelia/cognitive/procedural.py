@@ -347,8 +347,13 @@ class ProceduralMemory:
             if dense_embedding is None or action_path is None:
                 continue
             if codes is not None and self.codec is not None:
+                codec_device = codes.device
+                try:
+                    codec_device = next(self.codec.parameters()).device
+                except StopIteration:
+                    codec_device = codes.device
                 with torch.no_grad():
-                    embedding = self.codec.decode(codes.unsqueeze(0)).squeeze(0).cpu()
+                    embedding = self.codec.decode(codes.unsqueeze(0).to(codec_device)).squeeze(0).cpu()
             else:
                 embedding = dense_embedding
             if retrieval_vector is None:
