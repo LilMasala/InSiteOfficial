@@ -805,16 +805,19 @@ class ChoreographerEvaluator:
         evaluated: list[tuple[LatentSkillCandidate, float]] = []
         if not reference_records:
             return evaluated
+        world_device = next(iter(world_model.parameters()), None)
+        world_device = world_device.device if world_device is not None else torch.device("cpu")
         for candidate in candidates:
             sample_scores: list[float] = []
             for record in reference_records[: min(8, len(reference_records))]:
                 if getattr(record, "ctx_tokens", None) is None:
                     continue
-                z = record.key.detach().unsqueeze(0)
-                ctx_tokens = record.ctx_tokens.detach().unsqueeze(0)
+                z = record.key.detach().float().unsqueeze(0).to(world_device)
+                ctx_tokens = record.ctx_tokens.detach().float().unsqueeze(0).to(world_device)
+                actions = candidate.action_path.detach().float().unsqueeze(0).unsqueeze(0).to(world_device)
                 rollout = world_model(
                     z=z,
-                    actions=candidate.action_path.detach().unsqueeze(0).unsqueeze(0),
+                    actions=actions,
                     ctx_tokens=ctx_tokens,
                     candidate_postures=None,
                     reasoning_states=None,
@@ -822,7 +825,7 @@ class ChoreographerEvaluator:
                 )
                 score = cost_module.score_candidates(
                     z=z,
-                    actions=candidate.action_path.detach().unsqueeze(0).unsqueeze(0),
+                    actions=actions,
                     ctx_tokens=ctx_tokens,
                     domain_state={},
                     future_z=rollout["terminal_latents"],
@@ -1355,24 +1358,28 @@ class SleepCoordinator:
                 num_initial_points=4,
                 num_iterations=4,
             )
+            world_device = self.rsd_adversary._module_device(self.world_model)
 
             def objective(
                 prompt_vector: torch.Tensor,
                 path: torch.Tensor,
                 embedding: torch.Tensor,
             ) -> float:
+                z = reference_record.key.detach().float().unsqueeze(0).to(world_device)
+                ctx_tokens = reference_record.ctx_tokens.detach().float().unsqueeze(0).to(world_device)
+                actions = path.detach().float().unsqueeze(0).unsqueeze(0).to(world_device)
                 rollout = self.world_model(
-                    z=reference_record.key.detach().unsqueeze(0),
-                    actions=path.detach().unsqueeze(0).unsqueeze(0),
-                    ctx_tokens=reference_record.ctx_tokens.detach().unsqueeze(0),
+                    z=z,
+                    actions=actions,
+                    ctx_tokens=ctx_tokens,
                     candidate_postures=None,
                     reasoning_states=None,
                     horizon=min(path.shape[0], self.world_model.max_horizon),
                 )
                 score = self.cost_module.score_candidates(
-                    z=reference_record.key.detach().unsqueeze(0),
-                    actions=path.detach().unsqueeze(0).unsqueeze(0),
-                    ctx_tokens=reference_record.ctx_tokens.detach().unsqueeze(0),
+                    z=z,
+                    actions=actions,
+                    ctx_tokens=ctx_tokens,
                     domain_state={},
                     future_z=rollout["terminal_latents"],
                     future_trajectory=rollout["trajectory"],
@@ -1382,7 +1389,7 @@ class SleepCoordinator:
                 if retrieved:
                     objective_value -= 0.1 * retrieved[0].similarity
                 if candidate.target_delta is not None and getattr(reference_record, "outcome_key", None) is not None:
-                    predicted_delta = rollout["terminal_latents"][0, 0] - reference_record.key.detach()
+                    predicted_delta = rollout["terminal_latents"][0, 0] - z[0]
                     alignment = F.cosine_similarity(
                         predicted_delta.unsqueeze(0),
                         candidate.target_delta.detach().unsqueeze(0),
