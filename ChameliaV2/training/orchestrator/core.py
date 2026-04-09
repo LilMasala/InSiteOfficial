@@ -1188,9 +1188,22 @@ class UnifiedTrainingOrchestrator:
         optimizer = torch.optim.AdamW(self._parameter_groups(model, domain_cfg, phase_cfg))
         best_metric = float("-inf")
         phase_metrics: dict[str, Any] = {}
+        print(
+            f"[{domain_cfg.name}] starting phase={phase_name} "
+            f"episodes={phase_cfg.episodes} memory={phase_cfg.use_memory} "
+            f"sleep={phase_cfg.use_sleep} train_hjepa={phase_cfg.train_hjepa}",
+            flush=True,
+        )
         if phase_cfg.use_sleep and model.sleep_coordinator is not None:
             model.sleep_coordinator.start()
         global_step = 0
+        progress_interval = max(
+            1,
+            min(
+                domain_cfg.checkpoint_interval_episodes,
+                max(phase_cfg.episodes // 10, 10),
+            ),
+        )
         for episode_idx in range(1, phase_cfg.episodes + 1):
             observation, info = adapter.reset(seed=self.config.seed + episode_idx)
             episode_reward = 0.0
@@ -1258,7 +1271,18 @@ class UnifiedTrainingOrchestrator:
                 if terminated or truncated:
                     winner = int(info.get("winner", 0))
                     break
+            if episode_idx % progress_interval == 0 or episode_idx == 1:
+                print(
+                    f"[{domain_cfg.name}][{phase_name}] episode={episode_idx}/{phase_cfg.episodes} "
+                    f"reward={episode_reward:.3f} winner={winner} replay={len(self.replay)} "
+                    f"memory_size={model.memory.size}",
+                    flush=True,
+                )
             if phase_cfg.use_sleep and episode_idx % max(1, domain_cfg.sleep_interval_episodes) == 0 and model.sleep_coordinator is not None:
+                print(
+                    f"[{domain_cfg.name}][{phase_name}] sleep requested at episode={episode_idx}",
+                    flush=True,
+                )
                 model.sleep_coordinator.request_run()
             if episode_idx % max(1, domain_cfg.checkpoint_interval_episodes) == 0 or episode_idx == phase_cfg.episodes:
                 metrics = {
@@ -1303,6 +1327,13 @@ class UnifiedTrainingOrchestrator:
                 )
                 phase_metrics = metrics
                 metric_value = float(metrics["full"].get(domain_cfg.primary_metric, 0.0))
+                print(
+                    f"[{domain_cfg.name}][{phase_name}] checkpoint episode={episode_idx} "
+                    f"full_{domain_cfg.primary_metric}={metrics['full'].get(domain_cfg.primary_metric, 0.0):.4f} "
+                    f"no_memory_{domain_cfg.primary_metric}={metrics['no_memory'].get(domain_cfg.primary_metric, 0.0):.4f} "
+                    f"no_sleep_{domain_cfg.primary_metric}={metrics['no_sleep'].get(domain_cfg.primary_metric, 0.0):.4f}",
+                    flush=True,
+                )
                 if domain_cfg.primary_mode == "min":
                     metric_value = -metric_value
                 is_best = metric_value >= best_metric
@@ -1315,14 +1346,32 @@ class UnifiedTrainingOrchestrator:
                 )
         if phase_cfg.use_sleep and model.sleep_coordinator is not None:
             model.sleep_coordinator.stop()
+            if model.sleep_coordinator.last_report is not None:
+                report = model.sleep_coordinator.last_report
+                print(
+                    f"[{domain_cfg.name}][{phase_name}] sleep report promotions={len(report.promotions)} "
+                    f"segments={report.decomposed_segments} dream={report.dream_candidates} "
+                    f"rsd={report.rsd_candidates} bodegen={report.bodegen_candidates}",
+                    flush=True,
+                )
         phase_metrics["phase_passed"] = self._phase_passed(phase_metrics, domain_cfg) if phase_metrics else False
         phase_metrics["best_metric"] = best_metric
+        print(
+            f"[{domain_cfg.name}] completed phase={phase_name} "
+            f"passed={phase_metrics['phase_passed']} best_metric={best_metric:.4f}",
+            flush=True,
+        )
         return phase_metrics
 
     def _run_domain(self, domain_cfg: DomainRunConfig) -> dict[str, Any]:
         adapter = self._build_adapter(domain_cfg)
         model: Chamelia | None = None
         try:
+            print(
+                f"[{domain_cfg.name}] bootstrap_random_episodes={domain_cfg.bootstrap_random_episodes} "
+                f"bootstrap_pretrain_steps={domain_cfg.bootstrap_pretrain_steps}",
+                flush=True,
+            )
             bootstrap_observations = self._collect_random_bootstrap(adapter, domain_cfg)
             self._pretrain_hjepa(
                 domain_cfg.family,
@@ -1349,6 +1398,7 @@ class UnifiedTrainingOrchestrator:
                     model=model,
                     representation_loss_fn=representation_loss_fn,
                 )
+            print(f"[{domain_cfg.name}] domain complete", flush=True)
             return domain_results
         finally:
             self._cleanup_model(model, adapter)

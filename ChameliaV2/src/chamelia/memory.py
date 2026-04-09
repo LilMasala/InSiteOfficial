@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from typing import Any
 
 import torch
@@ -293,6 +294,7 @@ class LatentMemory:
         self.head = 0
         self._next_record_id = 0
         self._id_to_slot: dict[int, int] = {}
+        self._lock = threading.RLock()
 
     def _encode_iob(self, value: torch.Tensor) -> torch.Tensor:
         if self.iob_encoder is None:
@@ -352,71 +354,75 @@ class LatentMemory:
 
     def store(self, record: EpisodeRecord) -> int:
         """Store an episode record in the circular buffer."""
-        idx = self.head
-        record_id = self._next_record_id
-        self._next_record_id += 1
+        with self._lock:
+            idx = self.head
+            record_id = self._next_record_id
+            self._next_record_id += 1
 
-        if len(self.records) >= self.max_episodes:
-            evicted_id = self.records[idx].record_id
-            self._id_to_slot.pop(evicted_id, None)
+            if len(self.records) >= self.max_episodes:
+                evicted_id = self.records[idx].record_id
+                self._id_to_slot.pop(evicted_id, None)
 
-        self.keys[idx] = record.key.detach().to(self.device)
-        if self.ordered_keys is not None:
-            self.ordered_keys[idx] = self._encode_iob(record.key.unsqueeze(0)).squeeze(0)
-        stored_record = EpisodeRecord(
-            key=record.key.detach().to(self.device),
-            action=record.action.detach().to(self.device),
-            ctx_tokens=record.ctx_tokens.detach().to(self.device),
-            ic_at_decision=record.ic_at_decision,
-            ic_realized=record.ic_realized,
-            tc_predicted=record.tc_predicted,
-            outcome_key=_detach_to_device(record.outcome_key, self.device),
-            step=record.step,
-            domain_name=record.domain_name,
-            record_id=record_id,
-            model_version=record.model_version,
-            candidate_postures=_detach_to_device(record.candidate_postures, self.device),
-            selected_posture=_detach_to_device(record.selected_posture, self.device),
-            candidate_reasoning_states=_detach_to_device(record.candidate_reasoning_states, self.device),
-            candidate_paths=_detach_to_device(record.candidate_paths, self.device),
-            selected_path=_detach_to_device(record.selected_path, self.device),
-            candidate_actions=_detach_to_device(record.candidate_actions, self.device),
-            candidate_ic=_detach_to_device(record.candidate_ic, self.device),
-            candidate_tc=_detach_to_device(record.candidate_tc, self.device),
-            candidate_total=_detach_to_device(record.candidate_total, self.device),
-            candidate_terminal_latents=_detach_to_device(record.candidate_terminal_latents, self.device),
-            selected_candidate_idx=record.selected_candidate_idx,
-            retrieval_trace=_detach_trace_to_device(record.retrieval_trace, self.device),
-            mcts_trace=dict(record.mcts_trace) if record.mcts_trace is not None else None,
-            skill_trace=tuple(record.skill_trace) if record.skill_trace is not None else None,
-            goal_key=_detach_to_device(record.goal_key, self.device),
-            domain_cluster_id=record.domain_cluster_id,
-            metadata=dict(record.metadata) if record.metadata is not None else None,
-        )
-        if len(self.records) < self.max_episodes:
-            self.records.append(stored_record)
-        else:
-            self.records[idx] = stored_record
-        self._id_to_slot[record_id] = idx
-        self.size = min(self.size + 1, self.max_episodes)
-        self.head = (self.head + 1) % self.max_episodes
-        return record_id
+            self.keys[idx] = record.key.detach().to(self.device)
+            if self.ordered_keys is not None:
+                self.ordered_keys[idx] = self._encode_iob(record.key.unsqueeze(0)).squeeze(0)
+            stored_record = EpisodeRecord(
+                key=record.key.detach().to(self.device),
+                action=record.action.detach().to(self.device),
+                ctx_tokens=record.ctx_tokens.detach().to(self.device),
+                ic_at_decision=record.ic_at_decision,
+                ic_realized=record.ic_realized,
+                tc_predicted=record.tc_predicted,
+                outcome_key=_detach_to_device(record.outcome_key, self.device),
+                step=record.step,
+                domain_name=record.domain_name,
+                record_id=record_id,
+                model_version=record.model_version,
+                candidate_postures=_detach_to_device(record.candidate_postures, self.device),
+                selected_posture=_detach_to_device(record.selected_posture, self.device),
+                candidate_reasoning_states=_detach_to_device(record.candidate_reasoning_states, self.device),
+                candidate_paths=_detach_to_device(record.candidate_paths, self.device),
+                selected_path=_detach_to_device(record.selected_path, self.device),
+                candidate_actions=_detach_to_device(record.candidate_actions, self.device),
+                candidate_ic=_detach_to_device(record.candidate_ic, self.device),
+                candidate_tc=_detach_to_device(record.candidate_tc, self.device),
+                candidate_total=_detach_to_device(record.candidate_total, self.device),
+                candidate_terminal_latents=_detach_to_device(record.candidate_terminal_latents, self.device),
+                selected_candidate_idx=record.selected_candidate_idx,
+                retrieval_trace=_detach_trace_to_device(record.retrieval_trace, self.device),
+                mcts_trace=dict(record.mcts_trace) if record.mcts_trace is not None else None,
+                skill_trace=tuple(record.skill_trace) if record.skill_trace is not None else None,
+                goal_key=_detach_to_device(record.goal_key, self.device),
+                domain_cluster_id=record.domain_cluster_id,
+                metadata=dict(record.metadata) if record.metadata is not None else None,
+            )
+            if len(self.records) < self.max_episodes:
+                self.records.append(stored_record)
+            else:
+                self.records[idx] = stored_record
+            self._id_to_slot[record_id] = idx
+            self.size = min(self.size + 1, self.max_episodes)
+            self.head = (self.head + 1) % self.max_episodes
+            return record_id
 
     def fill_outcome(self, record_id: int, ic_realized: float, outcome_key: torch.Tensor) -> bool:
         """Fill in delayed outcome information for a stored episode."""
-        slot = self._id_to_slot.get(record_id)
-        if slot is None:
-            return False
-        self.records[slot].ic_realized = ic_realized
-        self.records[slot].outcome_key = outcome_key.detach().to(self.device)
-        return True
+        with self._lock:
+            slot = self._id_to_slot.get(record_id)
+            if slot is None or slot >= len(self.records):
+                self._id_to_slot.pop(record_id, None)
+                return False
+            self.records[slot].ic_realized = ic_realized
+            self.records[slot].outcome_key = outcome_key.detach().to(self.device)
+            return True
 
     def get_record_by_id(self, record_id: int) -> EpisodeRecord | None:
         """Return the record for a given stable record_id, or None if evicted."""
-        slot = self._id_to_slot.get(record_id)
-        if slot is None:
-            return None
-        return self.records[slot]
+        with self._lock:
+            slot = self._id_to_slot.get(record_id)
+            if slot is None or slot >= len(self.records):
+                return None
+            return self.records[slot]
 
     def retrieve(
         self,
@@ -436,67 +442,68 @@ class LatentMemory:
         posture_weight: float = 0.25,
     ) -> tuple[torch.Tensor | None, list[list[EpisodeRecord]], torch.Tensor | None]:
         """Retrieve top-k episodes using state similarity plus optional quality/posture reranking."""
-        k = k or self.retrieval_k
-        if self.size == 0:
-            return None, [], None
+        with self._lock:
+            k = k or self.retrieval_k
+            if self.size == 0:
+                return None, [], None
 
-        if query_key.dim() == 1:
-            query_key = query_key.unsqueeze(0)
-        stored = self.keys[: self.size]
+            if query_key.dim() == 1:
+                query_key = query_key.unsqueeze(0)
+            stored = self.keys[: self.size]
 
-        shortlist_mask = None
-        if self.iob_encoder is not None and self.ordered_keys is not None:
-            encoded_query = self._encode_iob(query_key)
-            q_norm = F.normalize(encoded_query, dim=-1)
-            k_norm = F.normalize(self.ordered_keys[: self.size], dim=-1)
-            combined_scores = torch.mm(q_norm, k_norm.T)
-            shortlist_mask = self._iob_shortlist_mask(encoded_query, k)
-        else:
-            q_norm = F.normalize(query_key.detach().to(self.device), dim=-1)
-            k_norm = F.normalize(stored, dim=-1)
-            combined_scores = torch.mm(q_norm, k_norm.T)
+            shortlist_mask = None
+            if self.iob_encoder is not None and self.ordered_keys is not None:
+                encoded_query = self._encode_iob(query_key)
+                q_norm = F.normalize(encoded_query, dim=-1)
+                k_norm = F.normalize(self.ordered_keys[: self.size], dim=-1)
+                combined_scores = torch.mm(q_norm, k_norm.T)
+                shortlist_mask = self._iob_shortlist_mask(encoded_query, k)
+            else:
+                q_norm = F.normalize(query_key.detach().to(self.device), dim=-1)
+                k_norm = F.normalize(stored, dim=-1)
+                combined_scores = torch.mm(q_norm, k_norm.T)
 
-        if quality_weight != 0.0:
-            quality_scores = torch.tensor(
-                [_record_quality_score(record) for record in self.records[: self.size]],
-                dtype=torch.float32,
-                device=self.device
-            )
-            combined_scores = combined_scores + quality_weight * _normalize_score_vector(
-                quality_scores
-            ).unsqueeze(0)
+            if quality_weight != 0.0:
+                quality_scores = torch.tensor(
+                    [_record_quality_score(record) for record in self.records[: self.size]],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                combined_scores = combined_scores + quality_weight * _normalize_score_vector(
+                    quality_scores
+                ).unsqueeze(0)
 
-        if query_posture is not None and posture_weight != 0.0:
-            if query_posture.dim() == 1:
-                query_posture = query_posture.unsqueeze(0)
-            posture_dim = query_posture.shape[-1]
-            posture_bank = torch.zeros(self.size, posture_dim, dtype=torch.float32, device=self.device)
-            valid_mask = torch.zeros(self.size, dtype=torch.bool, device=self.device)
-            for idx, record in enumerate(self.records[: self.size]):
-                if (
-                    record.selected_posture is not None
-                    and record.selected_posture.shape[-1] == posture_dim
-                ):
-                    posture_bank[idx] = record.selected_posture.float()
-                    valid_mask[idx] = True
-            if valid_mask.any():
-                posture_query = F.normalize(query_posture.detach().to(self.device), dim=-1)
-                posture_bank = F.normalize(posture_bank, dim=-1)
-                posture_scores = posture_query @ posture_bank.T
-                posture_scores = posture_scores.masked_fill(~valid_mask.unsqueeze(0), 0.0)
-                combined_scores = combined_scores + posture_weight * posture_scores
+            if query_posture is not None and posture_weight != 0.0:
+                if query_posture.dim() == 1:
+                    query_posture = query_posture.unsqueeze(0)
+                posture_dim = query_posture.shape[-1]
+                posture_bank = torch.zeros(self.size, posture_dim, dtype=torch.float32, device=self.device)
+                valid_mask = torch.zeros(self.size, dtype=torch.bool, device=self.device)
+                for idx, record in enumerate(self.records[: self.size]):
+                    if (
+                        record.selected_posture is not None
+                        and record.selected_posture.shape[-1] == posture_dim
+                    ):
+                        posture_bank[idx] = record.selected_posture.float()
+                        valid_mask[idx] = True
+                if valid_mask.any():
+                    posture_query = F.normalize(query_posture.detach().to(self.device), dim=-1)
+                    posture_bank = F.normalize(posture_bank, dim=-1)
+                    posture_scores = posture_query @ posture_bank.T
+                    posture_scores = posture_scores.masked_fill(~valid_mask.unsqueeze(0), 0.0)
+                    combined_scores = combined_scores + posture_weight * posture_scores
 
-        if shortlist_mask is not None:
-            combined_scores = combined_scores.masked_fill(~shortlist_mask, float("-inf"))
+            if shortlist_mask is not None:
+                combined_scores = combined_scores.masked_fill(~shortlist_mask, float("-inf"))
 
-        top_k_indices = combined_scores.topk(min(k, self.size), dim=-1).indices
-        retrieved_keys = stored[top_k_indices]
-        episode_lists = [
-            [self.records[idx.item()] for idx in top_k_indices[b]]
-            for b in range(query_key.shape[0])
-        ]
-        retrieved_scores = combined_scores.gather(1, top_k_indices)
-        return retrieved_keys, episode_lists, retrieved_scores
+            top_k_indices = combined_scores.topk(min(k, self.size), dim=-1).indices
+            retrieved_keys = stored[top_k_indices]
+            episode_lists = [
+                [self.records[idx.item()] for idx in top_k_indices[b]]
+                for b in range(query_key.shape[0])
+            ]
+            retrieved_scores = combined_scores.gather(1, top_k_indices)
+            return retrieved_keys, episode_lists, retrieved_scores
 
     def summarize_retrieved_postures(
         self,
@@ -640,11 +647,12 @@ class LatentMemory:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Return future latents, stored context, and realized intrinsic costs for critic training."""
         _ = min_outcome_delay
-        valid = [
-            r
-            for r in self.records[: self.size]
-            if r.ic_realized is not None and r.outcome_key is not None
-        ]
+        with self._lock:
+            valid = [
+                r
+                for r in self.records[: self.size]
+                if r.ic_realized is not None and r.outcome_key is not None
+            ]
         if not valid:
             return None, None, None
         keys = torch.stack([r.outcome_key for r in valid if r.outcome_key is not None])
@@ -662,7 +670,8 @@ class LatentMemory:
         torch.Tensor | None,
     ]:
         """Return stored transitions for world-model training."""
-        valid = [r for r in self.records[: self.size] if r.outcome_key is not None]
+        with self._lock:
+            valid = [r for r in self.records[: self.size] if r.outcome_key is not None]
         if not valid:
             return None, None, None, None, None
         z_t = torch.stack([r.key for r in valid])
@@ -686,7 +695,9 @@ class LatentMemory:
     def get_retrieval_training_examples(self) -> list[RetrievalReplayExample]:
         """Return replayable retrieval decisions with realized outcomes."""
         examples: list[RetrievalReplayExample] = []
-        for record in self.records[: self.size]:
+        with self._lock:
+            records = list(self.records[: self.size])
+        for record in records:
             if record.ic_realized is None or record.selected_posture is None:
                 continue
             if record.retrieval_trace is None:
@@ -720,82 +731,86 @@ class LatentMemory:
 
     def iter_records(self) -> list[EpisodeRecord]:
         """Return a stable snapshot of the currently retained records."""
-        return list(self.records[: self.size])
+        with self._lock:
+            return list(self.records[: self.size])
 
     def prune(self, predicate: Any) -> int:
         """Remove records matching ``predicate`` while preserving order."""
-        kept = [record for record in self.records[: self.size] if not predicate(record)]
-        removed = self.size - len(kept)
-        self.records = list(kept)
-        self.keys.zero_()
-        if self.ordered_keys is not None:
-            self.ordered_keys.zero_()
-        self._id_to_slot = {}
-        for idx, record in enumerate(kept):
-            self.keys[idx] = record.key.detach().to(self.device)
+        with self._lock:
+            kept = [record for record in self.records[: self.size] if not predicate(record)]
+            removed = self.size - len(kept)
+            self.records = list(kept)
+            self.keys.zero_()
             if self.ordered_keys is not None:
-                self.ordered_keys[idx] = self._encode_iob(record.key.unsqueeze(0)).squeeze(0)
-            self._id_to_slot[record.record_id] = idx
-        self.size = len(kept)
-        self.head = self.size % self.max_episodes
-        return removed
+                self.ordered_keys.zero_()
+            self._id_to_slot = {}
+            for idx, record in enumerate(kept):
+                self.keys[idx] = record.key.detach().to(self.device)
+                if self.ordered_keys is not None:
+                    self.ordered_keys[idx] = self._encode_iob(record.key.unsqueeze(0)).squeeze(0)
+                self._id_to_slot[record.record_id] = idx
+            self.size = len(kept)
+            self.head = self.size % self.max_episodes
+            return removed
 
     def state_dict(self) -> dict[str, Any]:
         """Serialize the episodic memory buffer into a checkpointable payload."""
-        return {
-            "embed_dim": self.embed_dim,
-            "max_episodes": self.max_episodes,
-            "retrieval_k": self.retrieval_k,
-            "device": str(self.device),
-            "size": self.size,
-            "head": self.head,
-            "next_record_id": self._next_record_id,
-            "keys": self.keys[: self.size].detach().cpu(),
-            "ordered_keys": (
-                None
-                if self.ordered_keys is None
-                else self.ordered_keys[: self.size].detach().cpu()
-            ),
-            "records": tuple(
-                _serialize_episode_record(record)
-                for record in self.records[: self.size]
-            ),
-        }
+        with self._lock:
+            return {
+                "embed_dim": self.embed_dim,
+                "max_episodes": self.max_episodes,
+                "retrieval_k": self.retrieval_k,
+                "device": str(self.device),
+                "size": self.size,
+                "head": self.head,
+                "next_record_id": self._next_record_id,
+                "keys": self.keys[: self.size].detach().cpu(),
+                "ordered_keys": (
+                    None
+                    if self.ordered_keys is None
+                    else self.ordered_keys[: self.size].detach().cpu()
+                ),
+                "records": tuple(
+                    _serialize_episode_record(record)
+                    for record in self.records[: self.size]
+                ),
+            }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Restore the episodic memory buffer from a checkpoint payload."""
-        self.embed_dim = int(state["embed_dim"])
-        self.max_episodes = int(state["max_episodes"])
-        self.retrieval_k = int(state["retrieval_k"])
-        self.device = str(state.get("device", self.device))
-        self.keys = torch.zeros(
-            self.max_episodes,
-            self.embed_dim,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        ordered_keys_state = state.get("ordered_keys")
-        self.ordered_keys = None
-        if ordered_keys_state is not None:
-            self.ordered_keys = torch.zeros(
+        with self._lock:
+            self.embed_dim = int(state["embed_dim"])
+            self.max_episodes = int(state["max_episodes"])
+            self.retrieval_k = int(state["retrieval_k"])
+            self.device = str(state.get("device", self.device))
+            self.keys = torch.zeros(
                 self.max_episodes,
-                ordered_keys_state.shape[-1],
+                self.embed_dim,
                 device=self.device,
                 dtype=torch.float32,
             )
-        self.records = []
-        self._id_to_slot = {}
-        self.size = int(state["size"])
-        self.head = int(state["head"])
-        self._next_record_id = int(state["next_record_id"])
-        if self.size > 0:
-            self.keys[: self.size] = state["keys"].to(self.device)
-            if self.ordered_keys is not None and ordered_keys_state is not None:
-                self.ordered_keys[: self.size] = ordered_keys_state.to(self.device)
-        restored_records = [
-            _deserialize_episode_record(payload, self.device)
-            for payload in state.get("records", ())
-        ]
-        self.records.extend(restored_records)
-        for idx, record in enumerate(restored_records):
-            self._id_to_slot[record.record_id] = idx
+            ordered_keys_state = state.get("ordered_keys")
+            self.ordered_keys = None
+            if ordered_keys_state is not None:
+                self.ordered_keys = torch.zeros(
+                    self.max_episodes,
+                    ordered_keys_state.shape[-1],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            self.records = []
+            self._id_to_slot = {}
+            self.size = int(state["size"])
+            self.head = int(state["head"])
+            self._next_record_id = int(state["next_record_id"])
+            if self.size > 0:
+                self.keys[: self.size] = state["keys"].to(self.device)
+                if self.ordered_keys is not None and ordered_keys_state is not None:
+                    self.ordered_keys[: self.size] = ordered_keys_state.to(self.device)
+            restored_records = [
+                _deserialize_episode_record(payload, self.device)
+                for payload in state.get("records", ())
+            ]
+            self.records.extend(restored_records)
+            for idx, record in enumerate(restored_records):
+                self._id_to_slot[record.record_id] = idx
