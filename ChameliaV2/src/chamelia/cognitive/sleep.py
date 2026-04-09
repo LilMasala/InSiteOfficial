@@ -1362,7 +1362,7 @@ class SleepCoordinator:
                 num_initial_points=4,
                 num_iterations=4,
             )
-            world_device = self.rsd_adversary._module_device(self.world_model)
+            world_device = self.rsd._module_device(self.world_model)
 
             def objective(
                 prompt_vector: torch.Tensor,
