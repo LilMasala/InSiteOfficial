@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 import random
 import shutil
 import time
+from statistics import mean
 from typing import Any
 
 import torch
@@ -453,6 +455,9 @@ class UnifiedTrainingOrchestrator:
         self.backbones = BackboneRegistry(config.family_backbones, device=self.device)
         random.seed(config.seed)
         torch.manual_seed(config.seed)
+        self._loss_window: defaultdict[str, deque[float]] = defaultdict(lambda: deque(maxlen=50))
+        self._optimization_calls = 0
+        self._optimizer_steps = 0
         self.adapter_builders: dict[str, Any] = {
             "cartpole": CartPoleDomain,
             "connect4": Connect4Domain,
@@ -841,6 +846,13 @@ class UnifiedTrainingOrchestrator:
         target_actions = torch.stack([record.action_logits_or_vec for record in valid], dim=0).to(self.device)
         return torch.nn.functional.mse_loss(logits, target_actions)
 
+    def _count_actor_valid(self, records: list[ReplayRecord]) -> int:
+        return sum(
+            1
+            for record in records
+            if record.latent_z is not None and record.ctx_tokens is not None
+        )
+
     def _compute_world_model_loss(self, model: Chamelia, records: list[ReplayRecord]) -> torch.Tensor | None:
         valid = [
             record
@@ -867,6 +879,16 @@ class UnifiedTrainingOrchestrator:
             horizon=horizon,
         )
 
+    def _count_world_model_valid(self, records: list[ReplayRecord]) -> int:
+        return sum(
+            1
+            for record in records
+            if record.latent_z is not None
+            and record.next_latent_z is not None
+            and record.selected_path is not None
+            and record.ctx_tokens is not None
+        )
+
     def _compute_critic_loss(self, model: Chamelia, records: list[ReplayRecord]) -> torch.Tensor | None:
         valid = [
             record
@@ -880,6 +902,13 @@ class UnifiedTrainingOrchestrator:
         costs = torch.tensor([record.cost for record in valid], dtype=torch.float32, device=self.device)
         predicted = model.cost.trainable_critic(keys, ctx_tokens)
         return model.cost.trainable_critic.compute_critic_loss(predicted, costs)
+
+    def _count_critic_valid(self, records: list[ReplayRecord]) -> int:
+        return sum(
+            1
+            for record in records
+            if record.next_latent_z is not None and record.ctx_tokens is not None
+        )
 
     def _compute_representation_loss(
         self,
@@ -907,34 +936,70 @@ class UnifiedTrainingOrchestrator:
         domain_cfg: DomainRunConfig,
         global_step: int,
     ) -> dict[str, float]:
+        self._optimization_calls += 1
         losses: dict[str, torch.Tensor] = {}
         actor_batch = self.replay.sample(32, domain_id=domain_cfg.name, require_next_latent=False)
+        actor_valid = self._count_actor_valid(actor_batch)
         actor_loss = self._compute_actor_loss(model, actor_batch, action_space_type=model.domain.action_space_type if isinstance(model.domain, InteractiveDomainAdapter) else "discrete")
         if actor_loss is not None:
             losses["actor"] = phase_cfg.actor_loss_weight * actor_loss
         world_model_batch = self.replay.sample(32, domain_id=domain_cfg.name)
+        world_model_valid = self._count_world_model_valid(world_model_batch)
         world_model_loss = self._compute_world_model_loss(model, world_model_batch)
         if world_model_loss is not None:
             losses["world_model"] = phase_cfg.world_model_loss_weight * world_model_loss
+        critic_valid = self._count_critic_valid(world_model_batch)
         critic_loss = self._compute_critic_loss(model, world_model_batch)
         if critic_loss is not None:
             losses["critic"] = phase_cfg.critic_loss_weight * critic_loss
+        rep_active = phase_cfg.train_hjepa
         if phase_cfg.train_hjepa:
             losses["rep"] = phase_cfg.representation_loss_weight * self._compute_representation_loss(
                 representation_loss_fn,
                 outputs,
             )
+        retrieval_active = False
         if phase_cfg.use_memory and global_step % max(1, self.config.memory.get("retrieval_train_interval", 8)) == 0:
+            retrieval_active = True
             retrieval_loss = model.train_retrieval_from_memory()
             if retrieval_loss is not None:
                 losses["retrieval"] = phase_cfg.retrieval_loss_weight * retrieval_loss
         if not losses:
+            if self._optimization_calls % 50 == 0:
+                print(
+                    f"[{domain_cfg.name}] opt_call={self._optimization_calls} optimizer_skipped=1 "
+                    f"actor_batch={len(actor_batch)} actor_valid={actor_valid} "
+                    f"wm_batch={len(world_model_batch)} wm_valid={world_model_valid} "
+                    f"critic_valid={critic_valid} retrieval_active={int(retrieval_active)} "
+                    f"rep_active={int(rep_active)} replay={len(self.replay)}",
+                    flush=True,
+                )
             return {}
         total = torch.stack(list(losses.values())).sum()
         optimizer.zero_grad(set_to_none=True)
         total.backward()
         optimizer.step()
-        return {key: float(value.detach().item()) for key, value in losses.items()}
+        detached_losses = {key: float(value.detach().item()) for key, value in losses.items()}
+        for key, value in detached_losses.items():
+            self._loss_window[key].append(value)
+        self._optimizer_steps += 1
+        if self._optimizer_steps % 50 == 0:
+            loss_parts = []
+            for key in ("world_model", "actor", "critic", "retrieval", "rep"):
+                window = self._loss_window.get(key)
+                if window:
+                    loss_parts.append(f"{key}_loss={mean(window):.4f}")
+            if loss_parts:
+                print(
+                    f"[{domain_cfg.name}] opt_call={self._optimization_calls} opt_step={self._optimizer_steps} "
+                    + " ".join(loss_parts)
+                    + (
+                        f" replay={len(self.replay)} actor_valid={actor_valid} "
+                        f"wm_valid={world_model_valid} critic_valid={critic_valid}"
+                    ),
+                    flush=True,
+                )
+        return detached_losses
 
     def _episode_record(
         self,
@@ -1186,6 +1251,9 @@ class UnifiedTrainingOrchestrator:
         representation_loss_fn: torch.nn.Module,
     ) -> dict[str, Any]:
         optimizer = torch.optim.AdamW(self._parameter_groups(model, domain_cfg, phase_cfg))
+        self._loss_window.clear()
+        self._optimization_calls = 0
+        self._optimizer_steps = 0
         best_metric = float("-inf")
         phase_metrics: dict[str, Any] = {}
         print(
