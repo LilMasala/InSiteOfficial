@@ -57,7 +57,11 @@ export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 RUN_TAG="${RUN_TAG:-orchestrator-$(date +%Y%m%dT%H%M%S)}"
 ORCHESTRATOR_CONFIG="${ORCHESTRATOR_CONFIG:-${ROOT_DIR}/configs/orchestrator_foundation.yaml}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${ROOT_DIR}/checkpoints/${RUN_TAG}}"
-SCRATCH_DIR="${SCRATCH_DIR:-${TMPDIR:-/tmp/chamelia_${SLURM_JOB_ID:-$$}}/${RUN_TAG}}"
+DEFAULT_SCRATCH_BASE="/sanscratch/${USER}/chamelia"
+if [[ ! -d "/sanscratch" ]]; then
+  DEFAULT_SCRATCH_BASE="${TMPDIR:-/tmp/chamelia_${SLURM_JOB_ID:-$$}}"
+fi
+SCRATCH_DIR="${SCRATCH_DIR:-${DEFAULT_SCRATCH_BASE}/${RUN_TAG}}"
 DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-42}"
 DOMAINS="${DOMAINS:-}"
