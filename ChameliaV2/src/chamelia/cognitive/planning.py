@@ -252,6 +252,7 @@ class MCTSSearch:
         tree_reuse_similarity: float = 0.98,
         safety_cost_ceiling: float | None = None,
         imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
+        simple_baseline_builder: Callable[[dict[str, Any], int, int], torch.Tensor | None] | None = None,
     ) -> None:
         self.actor = actor
         self.world_model = world_model
@@ -264,6 +265,7 @@ class MCTSSearch:
         self.tree_reuse_similarity = tree_reuse_similarity
         self.safety_cost_ceiling = safety_cost_ceiling
         self.imagined_domain_state_builder = imagined_domain_state_builder
+        self.simple_baseline_builder = simple_baseline_builder
         self._previous_root: MCTSNode | None = None
 
     def _maybe_reuse_root(self, z: torch.Tensor, ctx_tokens: torch.Tensor) -> tuple[MCTSNode, bool]:
@@ -279,6 +281,18 @@ class MCTSSearch:
             self._previous_root.ctx_tokens = ctx_tokens
             return self._previous_root, True
         return MCTSNode(latent_state=z, ctx_tokens=ctx_tokens, depth=0), False
+
+    def _re_root_subtree(self, node: MCTSNode, *, depth: int = 0) -> MCTSNode:
+        node.depth = depth
+        if depth == 0:
+            node.immediate_cost = 0.0
+            node.path_from_parent = None
+            node.action_from_parent = None
+            node.total_cost = 0.0
+            node.visit_count = 0
+        for child in node.children:
+            self._re_root_subtree(child, depth=depth + 1)
+        return node
 
     def _make_skill_seed(
         self,
@@ -306,6 +320,13 @@ class MCTSSearch:
         retrieved_posture_scores: torch.Tensor | None = None,
         skill_seed_path: torch.Tensor | None = None,
     ) -> None:
+        simple_baseline_path = None
+        if self.simple_baseline_builder is not None:
+            simple_baseline_path = self.simple_baseline_builder(
+                domain_state,
+                self.actor.path_length,
+                self.actor.action_dim,
+            )
         proposal = self.actor.propose(
             node.latent_state.unsqueeze(0),
             node.ctx_tokens.unsqueeze(0),
@@ -319,6 +340,7 @@ class MCTSSearch:
                 if retrieved_posture_scores is not None and retrieved_posture_scores.dim() == 1
                 else retrieved_posture_scores
             ),
+            simple_baseline_path=simple_baseline_path,
         )
         candidate_paths = proposal["candidate_paths"]
         candidate_postures = proposal["candidate_postures"]
@@ -344,7 +366,7 @@ class MCTSSearch:
                     pad_steps = target_path_len - int(seed.shape[1])
                     pad_value = seed[:, -1:, :].expand(-1, pad_steps, -1)
                     seed = torch.cat([seed, pad_value], dim=1)
-            candidate_paths = torch.cat([seed.unsqueeze(1), candidate_paths], dim=1)
+            candidate_paths = torch.cat([candidate_paths, seed.unsqueeze(1)], dim=1)
             zero_posture = torch.zeros(
                 1,
                 1,
@@ -352,10 +374,10 @@ class MCTSSearch:
                 device=candidate_postures.device,
                 dtype=candidate_postures.dtype,
             )
-            candidate_postures = torch.cat([zero_posture, candidate_postures], dim=1)
+            candidate_postures = torch.cat([candidate_postures, zero_posture], dim=1)
             seed_reasoning = node.latent_state.unsqueeze(0).unsqueeze(0)
             candidate_reasoning = seed_reasoning.expand(-1, 1, reasoning_states.shape[-1])
-            reasoning_states = torch.cat([candidate_reasoning, reasoning_states], dim=1)
+            reasoning_states = torch.cat([reasoning_states, candidate_reasoning], dim=1)
         rollout = self.world_model(
             z=node.latent_state.unsqueeze(0),
             actions=candidate_paths,
@@ -412,9 +434,20 @@ class MCTSSearch:
         )
 
     def _backpropagate(self, selection_path: list[MCTSNode], leaf_cost: float) -> None:
-        for node in selection_path:
+        gamma = float(getattr(self.cost_module, "gamma", 1.0))
+        if len(selection_path) == 1:
+            selection_path[0].visit_count += 1
+            selection_path[0].total_cost += float(leaf_cost)
+            return
+
+        cumulative_return = 0.0
+        for path_idx in range(len(selection_path) - 1, 0, -1):
+            node = selection_path[path_idx]
+            cumulative_return = float(node.immediate_cost) + (gamma * cumulative_return)
             node.visit_count += 1
-            node.total_cost += float(leaf_cost)
+            node.total_cost += cumulative_return
+        selection_path[0].visit_count += 1
+        selection_path[0].total_cost += cumulative_return
 
     def search(
         self,
@@ -480,7 +513,7 @@ class MCTSSearch:
                 ),
             )
         )
-        self._previous_root = root
+        self._previous_root = self._re_root_subtree(best_child, depth=0)
         return MCTSResult(
             selected_path=selected_path.detach(),
             selected_action=selected_path[0].detach(),

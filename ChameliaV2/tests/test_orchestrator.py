@@ -54,6 +54,26 @@ def test_interactive_domain_single_observation_tokenization() -> None:
     assert int(greedy_action.item()) == 3
 
 
+def test_domain_baselines_and_imagined_states_are_not_constant() -> None:
+    cartpole = CartPoleDomain(embed_dim=16)
+    observation, info = cartpole.reset(seed=7)
+    domain_state = cartpole.build_domain_state(observation, info)
+    baseline = cartpole.build_simple_baseline_path(domain_state, path_length=3, action_dim=2)
+    assert baseline is not None
+    assert baseline.shape == (1, 3, 2)
+    assert torch.all(baseline.argmax(dim=-1).reshape(-1) == baseline.argmax(dim=-1).reshape(-1)[0])
+
+    connect4 = Connect4Domain(embed_dim=16)
+    board_obs, board_info = connect4.reset(seed=7)
+    connect_state = connect4.build_domain_state(board_obs, board_info)
+    assert connect_state["board"].shape == (1, 6, 7)
+    assert connect_state["current_player"].shape == (1,)
+    assert connect_state["legal_actions_mask"].shape == (1, 7)
+    imagined = connect4.build_imagined_domain_state(connect_state, torch.randn(3, 16), step_idx=0)
+    assert imagined["legal_actions_mask"].shape == (3, 7)
+    assert imagined["winning_actions"].shape == (3, 7)
+
+
 def test_replay_and_latent_memory_roundtrip() -> None:
     """Replay records and episodic-memory snapshots should round-trip cleanly."""
     replay = TransitionReplayBuffer(capacity=8)
@@ -120,6 +140,46 @@ def test_replay_and_latent_memory_roundtrip() -> None:
     assert restored_record.ic_realized == 0.15
 
 
+def test_replay_buffer_samples_contiguous_windows() -> None:
+    replay = TransitionReplayBuffer(capacity=16)
+    for step_idx in range(4):
+        replay.add(
+            ReplayRecord(
+                domain_id="cartpole",
+                modality_family="state_vector_hjepa",
+                episode_id=3,
+                step_idx=step_idx,
+                obs_raw=step_idx,
+                tokenizer_input=torch.tensor([step_idx], dtype=torch.float32),
+                tokens=torch.randn(4, 8),
+                mask=torch.zeros(4),
+                domain_state={"state_vector": torch.randn(1, 4)},
+                action=torch.tensor([1]),
+                action_logits_or_vec=torch.randn(2),
+                legal_actions_mask=torch.tensor([True, True]),
+                reward=1.0,
+                cost=0.1,
+                done=False,
+                next_obs_raw=step_idx + 1,
+                next_tokens=torch.randn(4, 8),
+                next_mask=torch.zeros(4),
+                next_domain_state={"state_vector": torch.randn(1, 4)},
+                latent_z=torch.randn(8),
+                next_latent_z=torch.randn(8),
+                ctx_tokens=torch.randn(4, 8),
+                search_policy=None,
+                search_value=None,
+                selected_path=None,
+                selected_posture=None,
+            )
+        )
+    windows = replay.sample_windows(batch_size=8, horizon=3, domain_id="cartpole")
+    assert windows
+    for window in windows:
+        assert len(window.records) == 3
+        assert [record.step_idx for record in window.records] in ([0, 1, 2], [1, 2, 3])
+
+
 def _tiny_orchestrator_config(run_dir: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
         seed=7,
@@ -171,7 +231,6 @@ def _tiny_orchestrator_config(run_dir: Path) -> OrchestratorConfig:
                 mask_ratio=0.25,
                 max_episode_steps=4,
                 optimizer_interval=1,
-                retrieval_refresh_episodes=1,
                 sleep_interval_episodes=1,
                 checkpoint_interval_episodes=1,
                 evaluation_episodes=1,
@@ -211,3 +270,52 @@ def test_orchestrator_checkpoint_load_and_smoke_run(tmp_path: Path) -> None:
     assert isinstance(restored_model.world_model, MambaActionConditionedWorldModel)
     assert restored_model.domain_index is not None
     assert restored_model.domain_index.adapter_bank is not None
+
+
+def test_mode2_actor_loss_uses_deliberate_path_not_mode1(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "actor_loss")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    model = orchestrator._build_model(config.domains[0], adapter)
+    observation, info = adapter.reset(seed=123)
+    domain_state = adapter.build_domain_state(observation, info)
+    records: list[ReplayRecord] = []
+    embed_dim = model.actor.embed_dim
+    obs_tensor = torch.tensor(observation, dtype=torch.float32)
+    for step_idx in range(4):
+        records.append(
+            ReplayRecord(
+                domain_id="cartpole",
+                modality_family="state_vector_hjepa",
+                episode_id=1,
+                step_idx=step_idx,
+                obs_raw=obs_tensor,
+                tokenizer_input=obs_tensor,
+                tokens=torch.randn(4, embed_dim),
+                mask=torch.zeros(4),
+                domain_state=domain_state,
+                action=torch.tensor([1]),
+                action_logits_or_vec=torch.randn(model.actor.action_dim),
+                legal_actions_mask=torch.tensor([True, True]),
+                reward=1.0,
+                cost=0.1,
+                done=False,
+                next_obs_raw=obs_tensor,
+                next_tokens=torch.randn(4, embed_dim),
+                next_mask=torch.zeros(4),
+                next_domain_state=domain_state,
+                latent_z=torch.randn(embed_dim),
+                next_latent_z=torch.randn(embed_dim),
+                ctx_tokens=torch.randn(config.num_ctx_tokens, embed_dim),
+                search_policy=None,
+                search_value=None,
+                selected_path=None,
+                selected_posture=None,
+            )
+        )
+    model.zero_grad(set_to_none=True)
+    loss = orchestrator._compute_actor_loss(model, records, action_space_type="discrete")
+    assert loss is not None
+    loss.backward()
+    assert model.actor.mode_1_policy.weight.grad is None
+    assert model.actor.candidate_selection_head[0].weight.grad is not None

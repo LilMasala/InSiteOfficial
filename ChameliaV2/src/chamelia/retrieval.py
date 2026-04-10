@@ -119,6 +119,96 @@ class MemoryRelevanceScorer(nn.Module):
         }
 
 
+class ProceduralRelevanceScorer(nn.Module):
+    """Learn to rerank retrieved procedural skills from a shortlist."""
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        retrieval_dim: int = 512,
+        hidden_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.retrieval_dim = retrieval_dim
+        self.query_proj = nn.Linear(embed_dim, embed_dim)
+        self.query_retrieval_proj = nn.Linear(embed_dim, retrieval_dim)
+        self.skill_proj = nn.Linear(embed_dim, embed_dim)
+        self.retrieval_proj = nn.Linear(retrieval_dim, retrieval_dim)
+        self.feature_head = nn.Sequential(
+            nn.Linear(5, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        query_latent: torch.Tensor,
+        skill_embeddings: torch.Tensor,
+        retrieval_vectors: torch.Tensor,
+        retrieval_similarity: torch.Tensor,
+        confidence: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Score a procedural skill shortlist.
+
+        Args:
+            query_latent: Query latent [B, D].
+            skill_embeddings: Dense skill embeddings [B, K, D].
+            retrieval_vectors: Retrieval vectors [B, K, R].
+            retrieval_similarity: Base retrieval similarity [B, K].
+            confidence: Stored skill confidence [B, K].
+
+        Returns:
+            Dict containing:
+                - ``scores``: learned relevance logits [B, K]
+                - ``weights``: softmax over scores [B, K]
+                - ``features``: explicit scalar features [B, K, 5]
+        """
+        if query_latent.dim() != 2:
+            raise ValueError("query_latent must be [B, D].")
+        if skill_embeddings.dim() != 3 or retrieval_vectors.dim() != 3:
+            raise ValueError("skill_embeddings and retrieval_vectors must be [B, K, *].")
+        if retrieval_similarity.dim() != 2 or confidence.dim() != 2:
+            raise ValueError("retrieval_similarity and confidence must be [B, K].")
+        if skill_embeddings.shape[:2] != retrieval_vectors.shape[:2]:
+            raise ValueError("skill_embeddings and retrieval_vectors must share [B, K].")
+
+        query_dense = self.query_proj(query_latent).unsqueeze(1)
+        skill_dense = self.skill_proj(skill_embeddings)
+        dense_similarity = _safe_cosine_similarity(
+            query_dense.expand_as(skill_dense),
+            skill_dense,
+        )
+
+        query_sparse = self.query_retrieval_proj(query_latent).unsqueeze(1)
+        skill_sparse = self.retrieval_proj(retrieval_vectors)
+        sparse_similarity = _safe_cosine_similarity(
+            query_sparse.expand_as(skill_sparse),
+            skill_sparse,
+        )
+
+        interaction = (
+            query_dense.expand_as(skill_dense) * skill_dense
+        ).sum(dim=-1) / math.sqrt(float(self.embed_dim))
+        explicit_features = torch.stack(
+            [
+                dense_similarity,
+                sparse_similarity,
+                retrieval_similarity,
+                confidence,
+                interaction,
+            ],
+            dim=-1,
+        )
+        scores = self.feature_head(explicit_features).squeeze(-1)
+        weights = torch.softmax(scores, dim=1)
+        return {
+            "scores": scores,
+            "weights": weights,
+            "features": explicit_features,
+        }
+
+
 def compute_retrieval_relevance_loss(
     learned_scores: torch.Tensor,
     retrieved_postures: torch.Tensor,
@@ -177,3 +267,23 @@ def compute_retrieval_relevance_loss(
     regret = F.relu(best_reference_quality - current_quality)
     weight = 0.25 + regret
     return (-(target_distribution * predicted_log_probs).sum(dim=1) * weight).mean()
+
+
+def compute_procedural_reranker_loss(
+    learned_scores: torch.Tensor,
+    target_scores: torch.Tensor,
+    *,
+    temperature: float = 0.25,
+) -> torch.Tensor | None:
+    """Train the procedural reranker from sleep-time shortlist scores."""
+    if learned_scores.dim() != 2 or target_scores.dim() != 2:
+        return None
+    common_width = min(learned_scores.shape[1], target_scores.shape[1])
+    if common_width < 2:
+        return None
+    learned_scores = learned_scores[:, :common_width]
+    target_scores = target_scores[:, :common_width]
+    temperature = max(float(temperature), 1.0e-4)
+    target_distribution = F.softmax(target_scores.detach() / temperature, dim=1)
+    predicted_log_probs = F.log_softmax(learned_scores / temperature, dim=1)
+    return -(target_distribution * predicted_log_probs).sum(dim=1).mean()

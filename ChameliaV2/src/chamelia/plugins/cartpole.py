@@ -148,6 +148,49 @@ class CartPoleDomain(InteractiveDomainAdapter):
         imagined_state["center_preference"] = center_preference
         return imagined_state
 
+    def build_simple_baseline_path(
+        self,
+        domain_state: dict[str, Any],
+        path_length: int,
+        action_dim: int,
+    ) -> torch.Tensor | None:
+        state = domain_state.get("state_vector")
+        if state is None:
+            return None
+        state = state.float()
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if state.shape[-1] < 4 or action_dim < 2:
+            return None
+        steering = state[:, 2] + (0.25 * state[:, 3]) + (0.05 * state[:, 0]) + (0.02 * state[:, 1])
+        preferred_action = (steering >= 0.0).long()
+        logits = torch.full(
+            (state.shape[0], path_length, action_dim),
+            fill_value=-6.0,
+            dtype=state.dtype,
+            device=state.device,
+        )
+        logits.scatter_(
+            dim=-1,
+            index=preferred_action.view(-1, 1, 1).expand(-1, path_length, 1),
+            src=torch.full(
+                (state.shape[0], path_length, 1),
+                fill_value=6.0,
+                dtype=state.dtype,
+                device=state.device,
+            ),
+        )
+        return logits
+
+    def compute_goal_latent(
+        self,
+        domain_state: dict[str, Any],
+        z: torch.Tensor,
+    ) -> torch.Tensor | None:
+        _ = domain_state
+        _ = z
+        return None
+
     def compute_latent_state_decoder_loss(
         self,
         predicted_future_z: torch.Tensor,

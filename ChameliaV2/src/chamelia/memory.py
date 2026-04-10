@@ -321,6 +321,14 @@ class LatentMemory:
             )
         return tuple(sorted(set(widths)))
 
+    def refresh_iob_keys(self) -> None:
+        """Recompute ordered episodic keys after the IOB encoder is updated."""
+        with self._lock:
+            if self.iob_encoder is None or self.ordered_keys is None or self.size == 0:
+                return
+            keys = self.keys[: self.size]
+            self.ordered_keys[: self.size] = self._encode_iob(keys)
+
     def _iob_shortlist_mask(self, query_embedding: torch.Tensor, k: int) -> torch.Tensor:
         if self.ordered_keys is None:
             raise RuntimeError("IOB storage is not initialized.")

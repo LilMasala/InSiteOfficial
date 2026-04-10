@@ -278,6 +278,8 @@ class ProceduralMemory:
         )
         if use_lancedb is None:
             use_lancedb = _import_lancedb() is not None
+        self._use_faiss = bool(use_faiss)
+        self._use_lancedb = bool(use_lancedb)
         if use_lancedb and _import_lancedb() is not None and _import_pyarrow() is not None:
             self.index: TensorSkillIndex | FaissSkillIndex | LanceSkillIndex = LanceSkillIndex(
                 root=self.storage.paths.lancedb_path,
@@ -288,6 +290,16 @@ class ProceduralMemory:
         else:
             self.index = TensorSkillIndex(dim=self.retrieval_dim)
         self._load_existing_skills()
+
+    def _make_index(self) -> TensorSkillIndex | FaissSkillIndex | LanceSkillIndex:
+        if self._use_lancedb and _import_lancedb() is not None and _import_pyarrow() is not None:
+            return LanceSkillIndex(
+                root=self.storage.paths.lancedb_path,
+                dim=self.retrieval_dim,
+            )
+        if self._use_faiss and _import_faiss() is not None:
+            return FaissSkillIndex(dim=self.retrieval_dim)
+        return TensorSkillIndex(dim=self.retrieval_dim)
 
     def _index_vector(self, vector: torch.Tensor) -> torch.Tensor:
         candidate = vector.detach().float()
@@ -455,7 +467,18 @@ class ProceduralMemory:
         min_confidence: float = 0.0,
         trigger_weights: dict[int, float] | None = None,
     ) -> list[RetrievedSkill]:
-        skill_ids, similarities = self.index.search(self._index_vector(query), k)
+        if self.csr_encoder is not None and self.records:
+            query_vector = F.normalize(self._index_vector(query).float(), dim=-1)
+            scored_pairs: list[tuple[int, float]] = []
+            for skill_id, record in self.records.items():
+                retrieval_vector = F.normalize(self._index_vector(record.embedding).float(), dim=-1)
+                similarity = float((query_vector * retrieval_vector).sum().item())
+                scored_pairs.append((skill_id, similarity))
+            scored_pairs.sort(key=lambda item: item[1], reverse=True)
+            skill_ids = [skill_id for skill_id, _ in scored_pairs[:k]]
+            similarities = [score for _, score in scored_pairs[:k]]
+        else:
+            skill_ids, similarities = self.index.search(self._index_vector(query), k)
         retrieved: list[RetrievedSkill] = []
         for skill_id, similarity in zip(skill_ids, similarities, strict=False):
             record = self.records.get(skill_id)
@@ -479,6 +502,45 @@ class ProceduralMemory:
             )
         retrieved.sort(key=lambda item: item.score, reverse=True)
         return retrieved[:k]
+
+    def refresh_representations(self) -> None:
+        """Recompute retrieval/compression views after transfer-module updates."""
+        close_index = getattr(self.index, "close", None)
+        if callable(close_index):
+            try:
+                close_index()
+            except Exception:
+                pass
+        self.retrieval_dim = (
+            int(self.csr_encoder.output_dim) if self.csr_encoder is not None else int(self.skill_dim)
+        )
+        self.index = self._make_index()
+        refreshed: dict[int, SkillRecord] = {}
+        for skill_id in sorted(self.records):
+            record = self.records[skill_id]
+            runtime_embedding, compressed_codes, storage_format = self._compress_embedding(record.embedding)
+            retrieval_vector = self._index_vector(runtime_embedding)
+            updated = SkillRecord(
+                skill_id=record.skill_id,
+                embedding=record.embedding,
+                retrieval_vector=retrieval_vector,
+                action_path=record.action_path,
+                confidence=record.confidence,
+                source_episodes=record.source_episodes,
+                constraints=record.constraints,
+                name=record.name,
+                description=record.description,
+                domain_name=record.domain_name,
+                symbolic_program=record.symbolic_program,
+                trigger_weights=record.trigger_weights,
+                deprecated_by=record.deprecated_by,
+                compressed_codes=compressed_codes,
+                storage_format=storage_format,
+                extras=record.extras,
+            )
+            refreshed[skill_id] = updated
+            self.index.add(skill_id, retrieval_vector)
+        self.records = refreshed
 
     def update_confidence(self, skill_id: int, confidence: float) -> None:
         record = self.records.get(int(skill_id))

@@ -35,7 +35,11 @@ from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
 from src.chamelia.hjepa_adapter import forward_hjepa
 from src.chamelia.memory import LatentMemory
 from src.chamelia.plugins import CartPoleDomain, Connect4Domain, InteractiveDomainAdapter
-from src.chamelia.retrieval import MemoryRelevanceScorer
+from src.chamelia.retrieval import (
+    MemoryRelevanceScorer,
+    ProceduralRelevanceScorer,
+    compute_procedural_reranker_loss,
+)
 from src.chamelia.world_model import ActionConditionedWorldModel
 from src.losses.combined import CombinedLoss
 from src.losses.hjepa_loss import HJEPALoss
@@ -238,6 +242,17 @@ class ReplayRecord:
         )
 
 
+@dataclass(frozen=True)
+class ReplayWindow:
+    """Contiguous replay window sampled from one episode."""
+
+    records: tuple[ReplayRecord, ...]
+
+    @property
+    def horizon(self) -> int:
+        return len(self.records)
+
+
 class TransitionReplayBuffer:
     """Simple replay buffer over canonical orchestrator records."""
 
@@ -277,6 +292,39 @@ class TransitionReplayBuffer:
             for record in self.records
             if domain_id is None or record.domain_id == domain_id
         ]
+
+    def sample_windows(
+        self,
+        batch_size: int,
+        *,
+        horizon: int,
+        domain_id: str | None = None,
+    ) -> list[ReplayWindow]:
+        if horizon < 1:
+            return []
+        by_episode: dict[tuple[str, int], list[ReplayRecord]] = defaultdict(list)
+        for record in self.records:
+            if domain_id is not None and record.domain_id != domain_id:
+                continue
+            if record.latent_z is None or record.next_latent_z is None:
+                continue
+            by_episode[(record.domain_id, record.episode_id)].append(record)
+        candidates: list[ReplayWindow] = []
+        for episode_records in by_episode.values():
+            ordered = sorted(episode_records, key=lambda item: item.step_idx)
+            for start_idx in range(0, len(ordered) - horizon + 1):
+                window = ordered[start_idx : start_idx + horizon]
+                contiguous = all(
+                    window[offset].step_idx == window[0].step_idx + offset
+                    for offset in range(horizon)
+                )
+                if not contiguous:
+                    continue
+                candidates.append(ReplayWindow(records=tuple(window)))
+        if not candidates:
+            return []
+        count = min(int(batch_size), len(candidates))
+        return random.sample(candidates, count)
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -319,7 +367,6 @@ class DomainRunConfig:
     mask_ratio: float = 0.25
     max_episode_steps: int = 256
     optimizer_interval: int = 1
-    retrieval_refresh_episodes: int = 50
     sleep_interval_episodes: int = 250
     checkpoint_interval_episodes: int = 250
     evaluation_episodes: int = 16
@@ -343,7 +390,6 @@ class OrchestratorConfig:
     seed: int = 42
     device: str = "cpu"
     run_dir: str = "checkpoints/orchestrator"
-    embed_dim: int = 128
     num_ctx_tokens: int = 8
     rollout_horizon: int = 3
     reasoning_steps: int = 2
@@ -359,6 +405,10 @@ class OrchestratorConfig:
 def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
     """Load the orchestrator YAML config."""
     raw = yaml.safe_load(Path(path).read_text())
+    if "embed_dim" in raw:
+        raise ValueError(
+            "Top-level orchestrator 'embed_dim' has been removed; set width in family_backbones only."
+        )
     domains: list[DomainRunConfig] = []
     for entry in raw.get("domains", []):
         phases = {
@@ -376,7 +426,6 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 mask_ratio=float(entry.get("mask_ratio", 0.25)),
                 max_episode_steps=int(entry.get("max_episode_steps", 256)),
                 optimizer_interval=int(entry.get("optimizer_interval", 1)),
-                retrieval_refresh_episodes=int(entry.get("retrieval_refresh_episodes", 50)),
                 sleep_interval_episodes=int(entry.get("sleep_interval_episodes", 250)),
                 checkpoint_interval_episodes=int(entry.get("checkpoint_interval_episodes", 250)),
                 evaluation_episodes=int(entry.get("evaluation_episodes", 16)),
@@ -397,7 +446,6 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         seed=int(raw.get("seed", 42)),
         device=str(raw.get("device", "cpu")),
         run_dir=str(raw.get("run_dir", "checkpoints/orchestrator")),
-        embed_dim=int(raw.get("embed_dim", 128)),
         num_ctx_tokens=int(raw.get("num_ctx_tokens", 8)),
         rollout_horizon=int(raw.get("rollout_horizon", 3)),
         reasoning_steps=int(raw.get("reasoning_steps", 2)),
@@ -483,8 +531,10 @@ class UnifiedTrainingOrchestrator:
         random.seed(config.seed)
         torch.manual_seed(config.seed)
         self._loss_window: defaultdict[str, deque[float]] = defaultdict(lambda: deque(maxlen=50))
+        self._transfer_loss_window: defaultdict[str, deque[float]] = defaultdict(lambda: deque(maxlen=50))
         self._optimization_calls = 0
         self._optimizer_steps = 0
+        self._transfer_steps = 0
         self.adapter_builders: dict[str, Any] = {
             "cartpole": CartPoleDomain,
             "connect4": Connect4Domain,
@@ -519,6 +569,35 @@ class UnifiedTrainingOrchestrator:
             grad_norm = float(param.grad.detach().data.norm(2).item())
             total += grad_norm * grad_norm
         return total ** 0.5
+
+    def _build_transfer_optimizer(self, model: Chamelia) -> torch.optim.Optimizer | None:
+        params: list[torch.nn.Parameter] = []
+        for module_name in (
+            "iob_encoder",
+            "csr_encoder",
+            "skill_codec",
+            "latent_action_encoder",
+            "procedural_reranker",
+        ):
+            module = getattr(model, module_name, None)
+            if module is None:
+                continue
+            params.extend(param for param in module.parameters() if param.requires_grad)
+        if not params:
+            return None
+        return torch.optim.AdamW(params, lr=1.0e-4, weight_decay=1.0e-4)
+
+    def _planner_discount_weights(
+        self,
+        horizon: int,
+        gamma: float,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        powers = torch.arange(horizon, device=device, dtype=dtype)
+        weights = torch.pow(torch.full((horizon,), float(gamma), device=device, dtype=dtype), powers)
+        return weights / weights.sum().clamp_min(1.0e-6)
 
     def _summarize_outputs(self, outputs: dict[str, Any]) -> dict[str, float | int | str]:
         summary: dict[str, float | int | str] = {
@@ -759,6 +838,10 @@ class UnifiedTrainingOrchestrator:
             embed_dim=embed_dim,
             posture_dim=actor.posture_dim,
         )
+        procedural_reranker = ProceduralRelevanceScorer(
+            embed_dim=embed_dim,
+            retrieval_dim=procedural.retrieval_dim,
+        )
         high_level_planner = HighLevelPlanner(
             embed_dim=embed_dim,
             skill_dim=embed_dim,
@@ -786,6 +869,11 @@ class UnifiedTrainingOrchestrator:
             world_model=world_model,
             world_model_backend=domain_cfg.world_model_backend,
             retrieval_scorer=retrieval_scorer,
+            procedural_reranker=procedural_reranker,
+            latent_action_encoder=latent_action,
+            iob_encoder=iob,
+            csr_encoder=csr,
+            skill_codec=codec,
             embed_dim=embed_dim,
             action_dim=adapter.get_action_dim(),
             num_ctx_tokens=self.config.num_ctx_tokens,
@@ -817,10 +905,23 @@ class UnifiedTrainingOrchestrator:
         tokenizer = model.get_domain_tokenizer()
         tokenizer_params = list(tokenizer.parameters()) if tokenizer is not None else []
         tracked = {id(param) for param in hjepa_params + tokenizer_params}
+        transfer_modules = [
+            getattr(model, "iob_encoder", None),
+            getattr(model, "csr_encoder", None),
+            getattr(model, "skill_codec", None),
+            getattr(model, "latent_action_encoder", None),
+            getattr(model, "procedural_reranker", None),
+        ]
+        transfer_param_ids = {
+            id(param)
+            for module in transfer_modules
+            if module is not None
+            for param in module.parameters()
+        }
         module_params = [
             param
             for param in model.parameters()
-            if param.requires_grad and id(param) not in tracked
+            if param.requires_grad and id(param) not in tracked and id(param) not in transfer_param_ids
         ]
         groups = []
         if phase_cfg.train_hjepa:
@@ -936,6 +1037,7 @@ class UnifiedTrainingOrchestrator:
         records: list[ReplayRecord],
         action_space_type: str,
     ) -> torch.Tensor | None:
+        _ = action_space_type
         valid = [
             record
             for record in records
@@ -947,21 +1049,48 @@ class UnifiedTrainingOrchestrator:
         ctx_tokens = torch.stack([record.ctx_tokens for record in valid], dim=0)
         states = states.to(self.device)
         ctx_tokens = ctx_tokens.to(self.device)
-        logits = model.actor(states, ctx_tokens, mode="mode1")
-        if action_space_type == "discrete":
-            targets = []
-            for record in valid:
-                if record.search_policy is not None:
-                    targets.append(record.search_policy)
-                else:
-                    target = torch.zeros(logits.shape[-1], dtype=torch.float32)
-                    target[int(record.action_logits_or_vec.argmax().item())] = 1.0
-                    targets.append(target)
-            target_probs = torch.stack(targets, dim=0).to(self.device)
-            log_probs = torch.log_softmax(logits, dim=-1)
-            return -(target_probs * log_probs).sum(dim=-1).mean()
-        target_actions = torch.stack([record.action_logits_or_vec for record in valid], dim=0).to(self.device)
-        return torch.nn.functional.mse_loss(logits, target_actions)
+        domain_state = _move_nested_to_device(
+            _collate_domain_state_batch([record.domain_state for record in valid]),
+            self.device,
+        )
+        simple_baseline_path = model.domain.build_simple_baseline_path(
+            domain_state,
+            model.actor.path_length,
+            model.actor.action_dim,
+        )
+        proposal = model.actor.propose(
+            states,
+            ctx_tokens,
+            simple_baseline_path=simple_baseline_path,
+        )
+        rollout = model.world_model(
+            z=states,
+            actions=proposal["candidate_paths"],
+            ctx_tokens=ctx_tokens,
+            candidate_postures=proposal["candidate_postures"],
+            reasoning_states=proposal["reasoning_states"],
+            horizon=min(model.actor.path_length, model.world_model.max_horizon),
+        )
+        candidate_costs = model.cost.score_candidates(
+            z=states,
+            actions=proposal["candidate_paths"],
+            ctx_tokens=ctx_tokens,
+            domain_state=domain_state,
+            future_z=rollout["terminal_latents"],
+            future_trajectory=rollout["trajectory"],
+            imagined_domain_state_builder=model.domain.build_imagined_domain_state,
+        )
+        selection_logits = proposal["candidate_selection_logits"]
+        target_weights = torch.softmax(
+            (-candidate_costs["total"].detach()) / 0.25,
+            dim=1,
+        )
+        selection_loss = -(target_weights * F.log_softmax(selection_logits, dim=1)).sum(dim=1).mean()
+        diversity_loss = model.actor.compute_posture_diversity_loss(
+            proposal["candidate_postures"],
+            proposal["candidate_paths"],
+        )
+        return selection_loss + (0.02 * diversity_loss)
 
     def _count_actor_valid(self, records: list[ReplayRecord]) -> int:
         return sum(
@@ -970,54 +1099,83 @@ class UnifiedTrainingOrchestrator:
             if record.latent_z is not None and record.ctx_tokens is not None
         )
 
-    def _compute_world_model_loss(self, model: Chamelia, records: list[ReplayRecord]) -> torch.Tensor | None:
+    def _compute_world_model_loss(self, model: Chamelia, windows: list[ReplayWindow]) -> torch.Tensor | None:
         valid = [
-            record
-            for record in records
-            if record.latent_z is not None and record.next_latent_z is not None and record.selected_path is not None and record.ctx_tokens is not None
+            window
+            for window in windows
+            if window.records
+            and window.records[0].latent_z is not None
+            and window.records[0].ctx_tokens is not None
+            and all(record.next_latent_z is not None for record in window.records)
         ]
         if not valid:
             return None
-        z_t = torch.stack([record.latent_z for record in valid], dim=0).to(self.device)
-        z_tH = torch.stack([record.next_latent_z for record in valid], dim=0).to(self.device)
-        ctx_tokens = torch.stack([record.ctx_tokens for record in valid], dim=0).to(self.device)
-        action_paths = torch.stack([record.selected_path for record in valid], dim=0).to(self.device)
-        action_paths = action_paths.unsqueeze(1)
-        selected_postures = None
-        if all(record.selected_posture is not None for record in valid):
-            selected_postures = torch.stack([record.selected_posture for record in valid], dim=0).to(self.device).unsqueeze(1)
-        horizon = min(action_paths.shape[2], model.world_model.max_horizon)
-        outputs = model.world_model(
-            z=z_t,
+        horizon = min(
+            len(valid[0].records),
+            model.world_model.max_horizon,
+        )
+        z_t = torch.stack([window.records[0].latent_z for window in valid], dim=0).to(self.device)
+        ctx_tokens = torch.stack([window.records[0].ctx_tokens for window in valid], dim=0).to(self.device)
+        action_paths = torch.stack(
+            [
+                torch.stack(
+                    [record.action_logits_or_vec for record in window.records[:horizon]],
+                    dim=0,
+                )
+                for window in valid
+            ],
+            dim=0,
+        ).to(self.device).unsqueeze(1)
+        target_trajectory = torch.stack(
+            [
+                torch.stack(
+                    [record.next_latent_z for record in window.records[:horizon]],
+                    dim=0,
+                )
+                for window in valid
+            ],
+            dim=0,
+        ).to(self.device)
+        step_weights = self._planner_discount_weights(
+            horizon,
+            float(model.cost.gamma),
+            dtype=target_trajectory.dtype,
+            device=target_trajectory.device,
+        )
+        world_model_loss, predicted_trajectory = model.world_model.compute_trajectory_loss(
+            z_t=z_t,
             actions=action_paths,
+            target_trajectory=target_trajectory,
             ctx_tokens=ctx_tokens,
-            candidate_postures=selected_postures,
-            horizon=horizon,
+            step_weights=step_weights,
         )
-        predicted = outputs["terminal_latents"]
-        if predicted.dim() == 3 and predicted.shape[1] == 1:
-            predicted = predicted[:, 0, :]
-        world_model_loss = F.smooth_l1_loss(predicted, z_tH.detach())
-        target_domain_state = _move_nested_to_device(
-            _collate_domain_state_batch([record.next_domain_state for record in valid]),
-            self.device,
-        )
-        decoder_loss = model.domain.compute_latent_state_decoder_loss(
-            predicted,
-            target_domain_state,
-        )
-        if decoder_loss is not None:
-            world_model_loss = world_model_loss + (0.25 * decoder_loss)
+        decoder_losses: list[torch.Tensor] = []
+        predicted_steps = predicted_trajectory[:, 0, :, :]
+        for step_idx in range(horizon):
+            target_domain_state = _move_nested_to_device(
+                _collate_domain_state_batch(
+                    [window.records[step_idx].next_domain_state for window in valid]
+                ),
+                self.device,
+            )
+            decoder_loss = model.domain.compute_latent_state_decoder_loss(
+                predicted_steps[:, step_idx, :],
+                target_domain_state,
+            )
+            if decoder_loss is not None:
+                decoder_losses.append(step_weights[step_idx] * decoder_loss)
+        if decoder_losses:
+            world_model_loss = world_model_loss + (0.25 * torch.stack(decoder_losses).sum())
         return world_model_loss
 
-    def _count_world_model_valid(self, records: list[ReplayRecord]) -> int:
+    def _count_world_model_valid(self, windows: list[ReplayWindow]) -> int:
         return sum(
             1
-            for record in records
-            if record.latent_z is not None
-            and record.next_latent_z is not None
-            and record.selected_path is not None
-            and record.ctx_tokens is not None
+            for window in windows
+            if window.records
+            and window.records[0].latent_z is not None
+            and window.records[0].ctx_tokens is not None
+            and all(record.next_latent_z is not None for record in window.records)
         )
 
     def _compute_critic_loss(self, model: Chamelia, records: list[ReplayRecord]) -> torch.Tensor | None:
@@ -1040,6 +1198,234 @@ class UnifiedTrainingOrchestrator:
             for record in records
             if record.next_latent_z is not None and record.ctx_tokens is not None
         )
+
+    def _compute_iob_loss(
+        self,
+        model: Chamelia,
+        *,
+        domain_name: str,
+        batch_size: int = 32,
+        temperature: float = 0.1,
+    ) -> torch.Tensor | None:
+        if model.iob_encoder is None:
+            return None
+        candidates = [
+            record
+            for record in model.memory.records[: model.memory.size]
+            if record.outcome_key is not None and record.domain_name == domain_name
+        ]
+        if len(candidates) < 3:
+            return None
+        sampled = random.sample(candidates, min(batch_size, len(candidates)))
+        keys = torch.stack([record.key for record in sampled], dim=0).to(self.device)
+        outcomes = torch.stack([record.outcome_key for record in sampled if record.outcome_key is not None], dim=0).to(self.device)
+        if outcomes.shape[0] != keys.shape[0]:
+            return None
+        outcome_norm = F.normalize(outcomes, dim=-1)
+        outcome_similarity = outcome_norm @ outcome_norm.T
+        identity = torch.eye(outcome_similarity.shape[0], dtype=torch.bool, device=self.device)
+        positive_mask = (outcome_similarity >= 0.8) & (~identity)
+        negative_mask = (outcome_similarity <= 0.2) & (~identity)
+        if not positive_mask.any() or not negative_mask.any():
+            return None
+        encoded = model.iob_encoder(keys)
+        widths = model.memory._resolve_iob_widths()
+        if not widths:
+            widths = (model.iob_encoder.bottleneck_dim,)
+        losses: list[torch.Tensor] = []
+        for width in widths:
+            truncated = model.iob_encoder.truncate(encoded, width)
+            normalized = F.normalize(truncated, dim=-1)
+            logits = (normalized @ normalized.T) / max(float(temperature), 1.0e-4)
+            logits = logits.masked_fill(identity, float("-inf"))
+            valid_mask = positive_mask | negative_mask
+            masked_logits = logits.masked_fill(~valid_mask, float("-inf"))
+            pos_logsumexp = torch.logsumexp(masked_logits.masked_fill(~positive_mask, float("-inf")), dim=1)
+            denom_logsumexp = torch.logsumexp(masked_logits, dim=1)
+            anchor_mask = positive_mask.any(dim=1) & negative_mask.any(dim=1)
+            if anchor_mask.any():
+                losses.append((-(pos_logsumexp - denom_logsumexp))[anchor_mask].mean())
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
+    def _compute_latent_action_loss(
+        self,
+        model: Chamelia,
+        windows: list[ReplayWindow],
+    ) -> torch.Tensor | None:
+        if model.latent_action_encoder is None:
+            return None
+        valid = [
+            window
+            for window in windows
+            if window.records
+            and window.records[0].latent_z is not None
+            and window.records[-1].next_latent_z is not None
+        ]
+        losses: list[torch.Tensor] = []
+        if valid:
+            action_paths = torch.stack(
+                [
+                    torch.stack([record.action_logits_or_vec for record in window.records], dim=0)
+                    for window in valid
+                ],
+                dim=0,
+            ).to(self.device)
+            target_delta = torch.stack(
+                [
+                    window.records[-1].next_latent_z - window.records[0].latent_z
+                    for window in valid
+                ],
+                dim=0,
+            ).to(self.device)
+            losses.append(
+                model.latent_action_encoder.compute_loss(
+                    action_paths,
+                    target_delta,
+                    path_length=action_paths.shape[1],
+                )
+            )
+        if model.procedural_memory is not None and model.procedural_memory.records:
+            skill_records = [
+                record
+                for record in model.procedural_memory.records.values()
+                if record.extras is not None and record.extras.get("target_delta") is not None
+            ]
+            if skill_records:
+                sampled = random.sample(skill_records, min(16, len(skill_records)))
+                skill_paths = torch.stack([record.action_path for record in sampled], dim=0).to(self.device)
+                target_delta = torch.stack(
+                    [
+                        record.extras["target_delta"]
+                        if torch.is_tensor(record.extras["target_delta"])
+                        else torch.tensor(record.extras["target_delta"], dtype=torch.float32)
+                        for record in sampled
+                    ],
+                    dim=0,
+                ).to(self.device)
+                losses.append(
+                    model.latent_action_encoder.compute_loss(
+                        skill_paths,
+                        target_delta,
+                        path_length=skill_paths.shape[1],
+                    )
+                )
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
+    def _compute_codec_loss(self, model: Chamelia) -> torch.Tensor | None:
+        if model.skill_codec is None or model.procedural_memory is None or not model.procedural_memory.records:
+            return None
+        sampled = random.sample(
+            list(model.procedural_memory.records.values()),
+            min(32, len(model.procedural_memory.records)),
+        )
+        embeddings = torch.stack([record.embedding for record in sampled], dim=0).to(self.device)
+        return model.skill_codec(embeddings)["loss"]
+
+    def _compute_procedural_reranker_loss(self, model: Chamelia) -> torch.Tensor | None:
+        if (
+            model.procedural_reranker is None
+            or model.sleep_coordinator is None
+            or model.procedural_memory is None
+        ):
+            return None
+        examples = model.sleep_coordinator.sample_reranker_examples(batch_size=8)
+        if not examples:
+            return None
+        losses: list[torch.Tensor] = []
+        for example in examples:
+            query_latent = example.query_latent.unsqueeze(0).to(self.device)
+            skill_embeddings = example.skill_embeddings.unsqueeze(0).to(self.device)
+            if model.csr_encoder is not None:
+                retrieval_vectors = model.csr_encoder(skill_embeddings.squeeze(0)).unsqueeze(0)
+            else:
+                retrieval_vectors = skill_embeddings
+            retrieval_similarity = F.cosine_similarity(
+                F.normalize(query_latent.unsqueeze(1).expand_as(skill_embeddings), dim=-1),
+                F.normalize(skill_embeddings, dim=-1),
+                dim=-1,
+            )
+            confidence = example.confidence.unsqueeze(0).to(self.device)
+            scores = model.procedural_reranker(
+                query_latent=query_latent,
+                skill_embeddings=skill_embeddings,
+                retrieval_vectors=retrieval_vectors,
+                retrieval_similarity=retrieval_similarity,
+                confidence=confidence,
+            )
+            loss = compute_procedural_reranker_loss(
+                scores["scores"],
+                example.evaluation_scores.unsqueeze(0).to(self.device),
+            )
+            if loss is not None:
+                losses.append(loss)
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
+    def _optimize_transfer_modules(
+        self,
+        model: Chamelia,
+        *,
+        domain_cfg: DomainRunConfig,
+        phase_name: str,
+        optimizer: torch.optim.Optimizer | None,
+        global_step: int,
+    ) -> None:
+        if optimizer is None or global_step % 16 != 0:
+            return
+        windows = self.replay.sample_windows(
+            batch_size=64,
+            horizon=min(self.config.rollout_horizon, model.world_model.max_horizon),
+            domain_id=domain_cfg.name,
+        )
+        losses = {
+            "iob": self._compute_iob_loss(model, domain_name=domain_cfg.name),
+            "latent_action": self._compute_latent_action_loss(model, windows),
+            "codec": self._compute_codec_loss(model),
+            "procedural_reranker": self._compute_procedural_reranker_loss(model),
+        }
+        active = {key: value for key, value in losses.items() if value is not None}
+        if not active:
+            return
+        optimizer.zero_grad(set_to_none=True)
+        total_loss = torch.stack(list(active.values())).sum()
+        total_loss.backward()
+        optimizer.step()
+        if model.memory.iob_encoder is not None:
+            model.memory.refresh_iob_keys()
+        if model.procedural_memory is not None:
+            model.procedural_memory.refresh_representations()
+        for key, value in active.items():
+            self._transfer_loss_window[key].append(float(value.detach().item()))
+        self._transfer_steps += 1
+        if self._transfer_steps % 10 == 0:
+            summary = " ".join(
+                f"{key}_loss={mean(self._transfer_loss_window[key]):.4f}"
+                for key in sorted(self._transfer_loss_window)
+                if self._transfer_loss_window[key]
+            )
+            print(
+                f"[{domain_cfg.name}] transfer_step={self._transfer_steps} {summary}",
+                flush=True,
+            )
+            self._append_diagnostic_event(
+                domain_name=domain_cfg.name,
+                phase_name=phase_name,
+                kind="transfer_step",
+                payload={
+                    "global_step": global_step,
+                    "transfer_step": self._transfer_steps,
+                    **{
+                        f"{key}_loss": float(mean(self._transfer_loss_window[key]))
+                        for key in self._transfer_loss_window
+                        if self._transfer_loss_window[key]
+                    },
+                },
+            )
 
     def _compute_representation_loss(
         self,
@@ -1072,16 +1458,25 @@ class UnifiedTrainingOrchestrator:
         losses: dict[str, torch.Tensor] = {}
         actor_batch = self.replay.sample(32, domain_id=domain_cfg.name, require_next_latent=False)
         actor_valid = self._count_actor_valid(actor_batch)
-        actor_loss = self._compute_actor_loss(model, actor_batch, action_space_type=model.domain.action_space_type if isinstance(model.domain, InteractiveDomainAdapter) else "discrete")
+        actor_loss = self._compute_actor_loss(
+            model,
+            actor_batch,
+            action_space_type=model.domain.action_space_type if isinstance(model.domain, InteractiveDomainAdapter) else "discrete",
+        )
         if actor_loss is not None:
             losses["actor"] = phase_cfg.actor_loss_weight * actor_loss
-        world_model_batch = self.replay.sample(32, domain_id=domain_cfg.name)
-        world_model_valid = self._count_world_model_valid(world_model_batch)
-        world_model_loss = self._compute_world_model_loss(model, world_model_batch)
+        world_model_windows = self.replay.sample_windows(
+            32,
+            horizon=min(self.config.rollout_horizon, model.world_model.max_horizon),
+            domain_id=domain_cfg.name,
+        )
+        world_model_valid = self._count_world_model_valid(world_model_windows)
+        world_model_loss = self._compute_world_model_loss(model, world_model_windows)
         if world_model_loss is not None:
             losses["world_model"] = phase_cfg.world_model_loss_weight * world_model_loss
-        critic_valid = self._count_critic_valid(world_model_batch)
-        critic_loss = self._compute_critic_loss(model, world_model_batch)
+        critic_batch = self.replay.sample(32, domain_id=domain_cfg.name)
+        critic_valid = self._count_critic_valid(critic_batch)
+        critic_loss = self._compute_critic_loss(model, critic_batch)
         if critic_loss is not None:
             losses["critic"] = phase_cfg.critic_loss_weight * critic_loss
         rep_active = phase_cfg.train_hjepa
@@ -1101,7 +1496,7 @@ class UnifiedTrainingOrchestrator:
                 print(
                     f"[{domain_cfg.name}] opt_call={self._optimization_calls} optimizer_skipped=1 "
                     f"actor_batch={len(actor_batch)} actor_valid={actor_valid} "
-                    f"wm_batch={len(world_model_batch)} wm_valid={world_model_valid} "
+                    f"wm_batch={len(world_model_windows)} wm_valid={world_model_valid} "
                     f"critic_valid={critic_valid} retrieval_active={int(retrieval_active)} "
                     f"rep_active={int(rep_active)} replay={len(self.replay)}",
                     flush=True,
@@ -1238,18 +1633,29 @@ class UnifiedTrainingOrchestrator:
         kind: str,
     ) -> dict[str, float]:
         summaries: list[dict[str, Any]] = []
+        if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+            adapter.set_eval_opponent_depth(4)
         for episode_idx in range(episodes):
             observation, info = adapter.reset(seed=self.config.seed + 10_000 + episode_idx)
             reward_total = 0.0
             winner = 0
-            for _ in range(domain_cfg.max_episode_steps):
+            step_count = 0
+            for step_count in range(1, domain_cfg.max_episode_steps + 1):
                 action = adapter.baseline_action(kind, observation, info)
                 observation, reward, terminated, truncated, info = adapter.step(action)
                 reward_total += float(reward)
                 if terminated or truncated:
                     winner = int(info.get("winner", 0))
                     break
-            summaries.append({"episode_reward": reward_total, "winner": winner})
+            summaries.append(
+                {
+                    "episode_reward": reward_total,
+                    "episode_length": step_count,
+                    "winner": winner,
+                }
+            )
+        if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+            adapter.set_eval_opponent_depth(0)
         metrics = adapter.compute_metrics(summaries)
         metrics["episodes"] = float(episodes)
         return metrics
@@ -1267,6 +1673,8 @@ class UnifiedTrainingOrchestrator:
         with self._ablation_context(model, ablation):
             was_training = model.training
             model.eval()
+            if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+                adapter.set_eval_opponent_depth(4)
             with torch.no_grad():
                 for episode_idx in range(episodes):
                     observation, info = adapter.reset(seed=self.config.seed + 20_000 + episode_idx)
@@ -1301,6 +1709,8 @@ class UnifiedTrainingOrchestrator:
                             "winner": winner,
                         }
                     )
+            if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+                adapter.set_eval_opponent_depth(0)
             model.train(was_training)
         metrics = adapter.compute_metrics(summaries)
         metrics["episodes"] = float(episodes)
@@ -1373,10 +1783,25 @@ class UnifiedTrainingOrchestrator:
         """Maintain stable latest/best checkpoint aliases per phase."""
         checkpoint_dir = checkpoint_path.parent
         latest_path = checkpoint_dir / f"{phase_name}-latest.pt"
-        shutil.copy2(checkpoint_path, latest_path)
+        self._link_or_copy_checkpoint(checkpoint_path, latest_path)
         if is_best:
             best_path = checkpoint_dir / f"{phase_name}-best.pt"
-            shutil.copy2(checkpoint_path, best_path)
+            self._link_or_copy_checkpoint(checkpoint_path, best_path)
+
+    def _link_or_copy_checkpoint(self, source: Path, target: Path) -> None:
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        try:
+            target.hardlink_to(source)
+            return
+        except OSError:
+            pass
+        try:
+            target.symlink_to(source.name)
+            return
+        except OSError:
+            pass
+        shutil.copy2(source, target)
 
     def _phase_passed(self, metrics: dict[str, Any], domain_cfg: DomainRunConfig) -> bool:
         primary = float(metrics["full"].get(domain_cfg.primary_metric, 0.0))
@@ -1401,9 +1826,12 @@ class UnifiedTrainingOrchestrator:
         representation_loss_fn: torch.nn.Module,
     ) -> dict[str, Any]:
         optimizer = torch.optim.AdamW(self._parameter_groups(model, domain_cfg, phase_cfg))
+        transfer_optimizer = self._build_transfer_optimizer(model)
         self._loss_window.clear()
+        self._transfer_loss_window.clear()
         self._optimization_calls = 0
         self._optimizer_steps = 0
+        self._transfer_steps = 0
         best_metric = float("-inf")
         phase_metrics: dict[str, Any] = {}
         episode_rewards: deque[float] = deque(maxlen=100)
@@ -1487,6 +1915,13 @@ class UnifiedTrainingOrchestrator:
                         domain_cfg=domain_cfg,
                         global_step=global_step,
                     )
+                self._optimize_transfer_modules(
+                    model,
+                    domain_cfg=domain_cfg,
+                    phase_name=phase_name,
+                    optimizer=transfer_optimizer,
+                    global_step=global_step,
+                )
                 episode_reward += float(reward)
                 observation = next_observation
                 if terminated or truncated:

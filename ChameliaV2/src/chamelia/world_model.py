@@ -226,3 +226,41 @@ class ActionConditionedWorldModel(nn.Module):
         if predicted.dim() == 3 and predicted.shape[1] == 1:
             predicted = predicted[:, 0, :]
         return F.smooth_l1_loss(predicted, z_tH.detach())
+
+    def compute_trajectory_loss(
+        self,
+        z_t: torch.Tensor,
+        actions: torch.Tensor,
+        target_trajectory: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        *,
+        candidate_postures: torch.Tensor | None = None,
+        reasoning_states: torch.Tensor | None = None,
+        step_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Train the rollout model against a full target latent trajectory."""
+        if target_trajectory.dim() == 3:
+            target_trajectory = target_trajectory.unsqueeze(1)
+        horizon = int(target_trajectory.shape[2])
+        outputs = self(
+            z_t,
+            actions,
+            ctx_tokens,
+            candidate_postures=candidate_postures,
+            reasoning_states=reasoning_states,
+            horizon=horizon,
+        )
+        predicted = outputs["trajectory"]
+        target = target_trajectory.detach().to(predicted)
+        per_step = F.smooth_l1_loss(predicted, target, reduction="none").mean(dim=-1)
+        if step_weights is None:
+            step_weights = torch.full(
+                (horizon,),
+                fill_value=1.0 / max(1, horizon),
+                dtype=per_step.dtype,
+                device=per_step.device,
+            )
+        else:
+            step_weights = step_weights.to(per_step.device, per_step.dtype)
+        loss = (per_step * step_weights.view(1, 1, horizon)).sum(dim=-1).mean()
+        return loss, predicted

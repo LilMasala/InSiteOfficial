@@ -1,7 +1,6 @@
 seed: 42
 device: cuda
 run_dir: checkpoints/orchestrator_foundation
-embed_dim: 128
 num_ctx_tokens: 8
 rollout_horizon: 3
 reasoning_steps: 2
@@ -66,7 +65,6 @@ domains:
     mask_ratio: 0.25
     max_episode_steps: 256
     optimizer_interval: 1
-    retrieval_refresh_episodes: 50
     sleep_interval_episodes: 250
     checkpoint_interval_episodes: 250
     evaluation_episodes: 32
@@ -104,7 +102,6 @@ domains:
     mask_ratio: 0.3
     max_episode_steps: 64
     optimizer_interval: 1
-    retrieval_refresh_episodes: 100
     sleep_interval_episodes: 500
     checkpoint_interval_episodes: 500
     evaluation_episodes: 32

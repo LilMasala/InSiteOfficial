@@ -153,6 +153,37 @@ class AbstractDomain(ABC):
         _ = step_idx
         return current_domain_state
 
+    def build_simple_baseline_path(
+        self,
+        domain_state: dict[str, Any],
+        path_length: int,
+        action_dim: int,
+    ) -> torch.Tensor | None:
+        """Optionally provide a deterministic simple baseline candidate path.
+
+        Args:
+            domain_state: Batched domain-state payload.
+            path_length: Desired candidate path length.
+            action_dim: Actor action dimension.
+
+        Returns:
+            Optional tensor of shape [B, path_length, action_dim].
+        """
+        _ = domain_state
+        _ = path_length
+        _ = action_dim
+        return None
+
+    def compute_goal_latent(
+        self,
+        domain_state: dict[str, Any],
+        z: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Optionally provide an explicit latent goal for high-level planning."""
+        _ = domain_state
+        _ = z
+        return None
+
     def compute_latent_state_decoder_loss(
         self,
         predicted_future_z: torch.Tensor,

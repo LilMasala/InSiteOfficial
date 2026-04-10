@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from src.chamelia.actor import Actor
 from src.chamelia.cognitive.clustering import DomainIndex
+from src.chamelia.cognitive.latent_action import LatentActionEncoder
 from src.chamelia.cognitive.mamba_world_model import MambaActionConditionedWorldModel
 from src.chamelia.cognitive.planning import (
     FrozenReasoningChain,
@@ -21,6 +22,11 @@ from src.chamelia.cognitive.planning import (
 from src.chamelia.cognitive.procedural import (
     ProceduralMemory as CognitiveProceduralMemory,
     RetrievedSkill,
+)
+from src.chamelia.cognitive.representation import (
+    ContrastiveSparseRepresentation,
+    InformationOrderedBottleneck,
+    IsotropicSkillCodec,
 )
 from src.chamelia.cognitive.sleep import SleepCoordinator
 from src.chamelia.configurator import Configurator
@@ -34,6 +40,7 @@ from src.chamelia.memory import (
 from src.chamelia.plugins.base import AbstractDomain
 from src.chamelia.retrieval import (
     MemoryRelevanceScorer,
+    ProceduralRelevanceScorer,
     compute_retrieval_relevance_loss,
 )
 from src.chamelia.world_model import ActionConditionedWorldModel
@@ -69,6 +76,11 @@ class Chamelia(nn.Module):
         world_model: ActionConditionedWorldModel | MambaActionConditionedWorldModel | None = None,
         world_model_backend: str = "mamba",
         retrieval_scorer: MemoryRelevanceScorer | None = None,
+        procedural_reranker: ProceduralRelevanceScorer | None = None,
+        latent_action_encoder: LatentActionEncoder | None = None,
+        iob_encoder: InformationOrderedBottleneck | None = None,
+        csr_encoder: ContrastiveSparseRepresentation | None = None,
+        skill_codec: IsotropicSkillCodec | None = None,
         embed_dim: int = 512,
         action_dim: int = 64,
         num_ctx_tokens: int = 16,
@@ -102,6 +114,10 @@ class Chamelia(nn.Module):
         self.cost = cost
         self.memory = memory
         self.procedural_memory = procedural_memory
+        self.latent_action_encoder = latent_action_encoder
+        self.iob_encoder = iob_encoder
+        self.csr_encoder = csr_encoder
+        self.skill_codec = skill_codec
         self.world_model = (
             world_model
             if world_model is not None
@@ -126,6 +142,22 @@ class Chamelia(nn.Module):
             else MemoryRelevanceScorer(
                 embed_dim=embed_dim,
                 posture_dim=actor.posture_dim,
+            )
+        )
+        self.procedural_reranker = (
+            procedural_reranker
+            if procedural_reranker is not None
+            else (
+                ProceduralRelevanceScorer(
+                    embed_dim=embed_dim,
+                    retrieval_dim=(
+                        int(csr_encoder.output_dim)
+                        if csr_encoder is not None
+                        else embed_dim
+                    ),
+                )
+                if procedural_memory is not None
+                else None
             )
         )
         self.embed_dim = embed_dim
@@ -186,6 +218,7 @@ class Chamelia(nn.Module):
                 pass
         if self.mcts_search is not None:
             self.mcts_search.imagined_domain_state_builder = domain.build_imagined_domain_state
+            self.mcts_search.simple_baseline_builder = domain.build_simple_baseline_path
 
     def get_domain_tokenizer(self) -> nn.Module | None:
         """Return the registered domain tokenizer module if present.
@@ -394,35 +427,62 @@ class Chamelia(nn.Module):
         self,
         z: torch.Tensor,
         domain_state: dict[str, Any],
-    ) -> torch.Tensor:
-        """Resolve goal latents for procedural retrieval and high-level planning."""
-        def _align_to_latent_width(value: torch.Tensor) -> torch.Tensor:
-            if value.dim() == 1:
-                value = value.unsqueeze(0)
-            if value.shape[-1] == z.shape[-1]:
-                return value.to(z)
-            aligned = torch.zeros(value.shape[0], z.shape[-1], dtype=z.dtype, device=z.device)
-            width = min(value.shape[-1], z.shape[-1])
-            aligned[:, :width] = value.to(z.device, dtype=z.dtype)[:, :width]
-            return aligned
-
-        goal_latent = domain_state.get("goal_latent")
-        if torch.is_tensor(goal_latent):
+    ) -> list[torch.Tensor | None]:
+        """Resolve explicit goal latents for high-level planning."""
+        goals: list[torch.Tensor | None] = []
+        for batch_idx in range(z.shape[0]):
+            goal_latent = self.domain.compute_goal_latent(
+                self._slice_domain_state(domain_state, batch_idx),
+                z[batch_idx : batch_idx + 1],
+            )
+            if goal_latent is None:
+                goals.append(None)
+                continue
             if goal_latent.dim() == 1:
-                return _align_to_latent_width(goal_latent).expand(z.shape[0], -1)
-            if goal_latent.dim() == 2:
-                aligned = _align_to_latent_width(goal_latent)
-                if aligned.shape[0] == z.shape[0]:
-                    return aligned
-        regime = self.domain.compute_regime_embedding(domain_state)
-        if torch.is_tensor(regime):
-            if regime.dim() == 1:
-                return _align_to_latent_width(regime).expand(z.shape[0], -1)
-            if regime.dim() == 2:
-                aligned = _align_to_latent_width(regime)
-                if aligned.shape[0] == z.shape[0]:
-                    return aligned
-        return z.detach()
+                goal_latent = goal_latent.unsqueeze(0)
+            goals.append(goal_latent.to(z.device, dtype=z.dtype)[0].detach())
+        return goals
+
+    def _rerank_procedural_skills(
+        self,
+        query_latent: torch.Tensor,
+        retrieved_skills: list[RetrievedSkill],
+    ) -> list[RetrievedSkill]:
+        if (
+            self.procedural_reranker is None
+            or self.sleep_coordinator is None
+            or self.sleep_coordinator.reranker_example_count() < 64
+            or not retrieved_skills
+        ):
+            return retrieved_skills
+        skill_embeddings = torch.stack(
+            [item.record.embedding.to(query_latent.device) for item in retrieved_skills],
+            dim=0,
+        ).unsqueeze(0)
+        retrieval_vectors = torch.stack(
+            [item.record.retrieval_vector.to(query_latent.device) for item in retrieved_skills],
+            dim=0,
+        ).unsqueeze(0)
+        base_similarity = torch.tensor(
+            [float(item.similarity) for item in retrieved_skills],
+            dtype=query_latent.dtype,
+            device=query_latent.device,
+        ).unsqueeze(0)
+        confidence = torch.tensor(
+            [float(item.record.confidence) for item in retrieved_skills],
+            dtype=query_latent.dtype,
+            device=query_latent.device,
+        ).unsqueeze(0)
+        reranked = self.procedural_reranker(
+            query_latent=query_latent.unsqueeze(0),
+            skill_embeddings=skill_embeddings,
+            retrieval_vectors=retrieval_vectors,
+            retrieval_similarity=base_similarity,
+            confidence=confidence,
+        )
+        weights = reranked["weights"][0]
+        order = torch.argsort(weights, descending=True)
+        return [retrieved_skills[int(index.item())] for index in order]
 
     def _pad_candidate_tensor(
         self,
@@ -726,13 +786,17 @@ class Chamelia(nn.Module):
                         self.domain_index.adapter_bank.apply_cluster(route.cluster_id)
                 retrieved_skills = (
                     self.procedural_memory.retrieve(
-                        goal_latents[batch_idx].detach() - z[batch_idx].detach(),
+                        z[batch_idx].detach(),
                         k=self.actor.num_candidates,
                         domain_name=self.domain.domain_name,
                         trigger_weights=trigger_weights,
                     )
                     if self.procedural_memory is not None
                     else []
+                )
+                retrieved_skills = self._rerank_procedural_skills(
+                    z[batch_idx].detach(),
+                    retrieved_skills,
                 )
                 retrieved_postures_i = (
                     retrieved_postures[batch_idx].detach()
@@ -749,7 +813,7 @@ class Chamelia(nn.Module):
                     z=z[batch_idx].detach(),
                     ctx_tokens=ctx_tokens[batch_idx].detach(),
                     domain_state=domain_state_i,
-                    goal_z=goal_latents[batch_idx].detach(),
+                    goal_z=goal_latents[batch_idx],
                     retrieved_skills=retrieved_skills,
                     retrieved_postures=retrieved_postures_i,
                     retrieved_posture_scores=retrieved_posture_scores_i,
@@ -885,6 +949,11 @@ class Chamelia(nn.Module):
                     if retrieved_posture_scores is not None
                     else None
                 ),
+                simple_baseline_path=self.domain.build_simple_baseline_path(
+                    domain_state,
+                    self.actor.path_length,
+                    self.actor.action_dim,
+                ),
             )
             candidate_paths = proposal["candidate_paths"]
             candidate_actions = proposal["candidate_actions"]
@@ -991,6 +1060,11 @@ class Chamelia(nn.Module):
                         if next_retrieved_episode_scores is not None
                         else None
                     ),
+                    simple_baseline_path=self.domain.build_simple_baseline_path(
+                        domain_state,
+                        self.actor.path_length,
+                        self.actor.action_dim,
+                    ),
                 )
                 retrieved_episode_summaries = next_retrieved_episode_summaries
                 retrieved_episode_scores = next_retrieved_episode_scores
@@ -1064,8 +1138,10 @@ class Chamelia(nn.Module):
                     mcts_trace=planner_mcts_traces[batch_idx],
                     skill_trace=planner_skill_traces[batch_idx],
                     goal_key=(
-                        goal_latents.detach()[batch_idx]
-                        if self.planner_backend == "mcts" and self.mcts_search is not None
+                        goal_latents[batch_idx]
+                        if self.planner_backend == "mcts"
+                        and self.mcts_search is not None
+                        and goal_latents[batch_idx] is not None
                         else None
                     ),
                     domain_cluster_id=planner_cluster_ids[batch_idx],

@@ -180,6 +180,11 @@ class Actor(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim // 2, action_dim * path_length),
         )
+        self.candidate_selection_head = nn.Sequential(
+            nn.Linear(embed_dim + posture_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 1),
+        )
         self.mode_1_policy = nn.Linear(embed_dim, action_dim)
 
     def _encode_state(self, z: torch.Tensor) -> torch.Tensor:
@@ -195,21 +200,35 @@ class Actor(nn.Module):
         candidate_postures: torch.Tensor,
         reasoning_states: torch.Tensor,
         state_token: torch.Tensor,
+        simple_baseline_path: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Keep candidate 0 as the simple/null baseline across reasoning rounds.
 
         The baseline uses the raw state encoding (no candidate-specific elaboration)
-        but retains learned action logits so that gradients can flow when it is selected.
+        but can optionally use a domain-provided baseline path.
         """
         baseline_paths = candidate_paths.clone()
         baseline_postures = candidate_postures.clone()
         baseline_reasoning = reasoning_states.clone()
-        
-        baseline_paths[:, 0, :, :] = 0.0
+
+        if simple_baseline_path is not None:
+            if simple_baseline_path.dim() != 3:
+                raise ValueError("simple_baseline_path must be [B, H, A].")
+            baseline_paths[:, 0, :, :] = simple_baseline_path.to(candidate_paths)
+        else:
+            baseline_paths[:, 0, :, :] = 0.0
         baseline_postures[:, 0, :] = 0.0
         baseline_reasoning[:, 0, :] = state_token.squeeze(1)
 
         return baseline_paths, baseline_postures, baseline_reasoning
+
+    def _selection_logits(
+        self,
+        candidate_postures: torch.Tensor,
+        reasoning_states: torch.Tensor,
+    ) -> torch.Tensor:
+        combined = torch.cat([reasoning_states, candidate_postures], dim=-1)
+        return self.candidate_selection_head(combined).squeeze(-1)
 
     def compute_posture_diversity_loss(
         self,
@@ -353,6 +372,7 @@ class Actor(nn.Module):
         ctx_tokens: torch.Tensor,
         retrieved_postures: torch.Tensor | None = None,
         retrieved_posture_scores: torch.Tensor | None = None,
+        simple_baseline_path: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Generate candidate actions and candidate planning states."""
         batch_size = z.shape[0]
@@ -407,6 +427,7 @@ class Actor(nn.Module):
             candidate_postures,
             reasoning_states,
             state,
+            simple_baseline_path=simple_baseline_path,
         )
         candidate_actions = candidate_paths[:, :, 0, :]
         return {
@@ -415,6 +436,10 @@ class Actor(nn.Module):
             "candidate_states": reasoning_states,
             "candidate_paths": candidate_paths,
             "candidate_actions": candidate_actions,
+            "candidate_selection_logits": self._selection_logits(
+                candidate_postures,
+                reasoning_states,
+            ),
         }
 
     def refine(
@@ -430,6 +455,7 @@ class Actor(nn.Module):
         retrieved_posture_scores: torch.Tensor | None = None,
         retrieved_episode_summaries: torch.Tensor | None = None,
         retrieved_episode_scores: torch.Tensor | None = None,
+        simple_baseline_path: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Refine candidate actions after scoring imagined futures."""
         state = self._encode_state(z)
@@ -481,6 +507,7 @@ class Actor(nn.Module):
             candidate_postures,
             refined,
             state,
+            simple_baseline_path=simple_baseline_path,
         )
         return candidate_paths, candidate_postures, refined
 

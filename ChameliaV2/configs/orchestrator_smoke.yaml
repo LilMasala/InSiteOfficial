@@ -1,7 +1,6 @@
 seed: 42
 device: cpu
 run_dir: checkpoints/orchestrator_smoke
-embed_dim: 128
 num_ctx_tokens: 4
 rollout_horizon: 2
 reasoning_steps: 1
@@ -64,7 +63,6 @@ domains:
     mask_ratio: 0.25
     max_episode_steps: 64
     optimizer_interval: 1
-    retrieval_refresh_episodes: 10
     sleep_interval_episodes: 8
     checkpoint_interval_episodes: 8
     evaluation_episodes: 4
@@ -101,7 +99,6 @@ domains:
     mask_ratio: 0.25
     max_episode_steps: 32
     optimizer_interval: 1
-    retrieval_refresh_episodes: 10
     sleep_interval_episodes: 8
     checkpoint_interval_episodes: 8
     evaluation_episodes: 4

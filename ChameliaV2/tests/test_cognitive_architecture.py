@@ -16,7 +16,7 @@ from src.chamelia.cognitive.mamba_world_model import (
     MambaActionConditionedWorldModel,
     benchmark_world_models,
 )
-from src.chamelia.cognitive.planning import HighLevelPlanner, MCTSSearch, Talker
+from src.chamelia.cognitive.planning import HighLevelPlanner, MCTSNode, MCTSSearch, Talker
 from src.chamelia.cognitive.procedural import ProceduralMemory
 from src.chamelia.cognitive.representation import (
     ContrastiveSparseRepresentation,
@@ -257,6 +257,53 @@ def test_domain_index_and_lora_bank_apply_cluster(tmp_path: Path) -> None:
     assert route.spawned_new
     assert 3 in index.get_trigger_weights(route.cluster_id)
     assert not torch.allclose(baseline, adapted)
+
+
+def test_mcts_backpropagates_discounted_costs(tmp_path: Path) -> None:
+    model, _domain, _memory, _procedural = _build_chamelia(tmp_path)
+    assert model.mcts_search is not None
+    root = MCTSNode(latent_state=torch.zeros(32), ctx_tokens=torch.zeros(4, 32), depth=0)
+    child = MCTSNode(latent_state=torch.zeros(32), ctx_tokens=torch.zeros(4, 32), depth=1, immediate_cost=1.5)
+    leaf = MCTSNode(latent_state=torch.zeros(32), ctx_tokens=torch.zeros(4, 32), depth=2, immediate_cost=2.0)
+    model.mcts_search._backpropagate([root, child, leaf], leaf_cost=leaf.immediate_cost)
+
+    gamma = float(model.cost.gamma)
+    assert leaf.total_cost == torch.tensor(2.0).item()
+    assert abs(child.total_cost - (1.5 + (gamma * 2.0))) < 1.0e-6
+    assert abs(root.total_cost - child.total_cost) < 1.0e-6
+
+
+def test_mcts_reuses_selected_subtree_as_new_root(tmp_path: Path) -> None:
+    model, domain, _memory, _procedural = _build_chamelia(tmp_path)
+    assert model.mcts_search is not None
+    observation = torch.randint(0, 5, (1, 16))
+    domain_state = domain.get_domain_state(observation)
+    tokens = observation.long()
+    mask = torch.zeros(tokens.shape[0], tokens.shape[1])
+    outputs = model(
+        tokens=domain.get_tokenizer()(tokens).tokens,
+        mask=mask,
+        domain_state=domain_state,
+        actor_mode="mode2",
+        store_to_memory=False,
+        input_kind="embedded_tokens",
+    )
+    selected_idx = int(outputs["selected_candidate_idx"][0].item())
+    reused_root_latent = outputs["mcts_traces"][0]
+    assert reused_root_latent is not None
+    selected_terminal = outputs["rollout"]["terminal_latents"][0, selected_idx]
+    result = model.mcts_search.search(
+        z=selected_terminal.detach(),
+        ctx_tokens=outputs["ctx_tokens"][0].detach(),
+        domain_state=domain_state,
+        goal_z=None,
+        retrieved_postures=None,
+        retrieved_posture_scores=None,
+        retrieved_skills=[],
+    )
+    assert result.reused_tree
+    assert result.root.depth == 0
+    assert result.root.path_from_parent is None
 
 
 def test_mcts_planner_and_talker_harness(tmp_path: Path) -> None:

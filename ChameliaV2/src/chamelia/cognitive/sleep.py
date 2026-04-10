@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 from dataclasses import dataclass, field
 import math
+import random
 import threading
 import time
 from typing import Any
@@ -62,6 +64,16 @@ class SkillPromotion:
     record: SkillRecord
     evaluation_score: float
     source: str
+
+
+@dataclass(frozen=True)
+class ProceduralRerankerExample:
+    """Sleep-scored shortlist used to warm up the procedural reranker."""
+
+    query_latent: torch.Tensor
+    skill_embeddings: torch.Tensor
+    evaluation_scores: torch.Tensor
+    confidence: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -1296,6 +1308,7 @@ class SleepCoordinator:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self.last_report: SleepCycleReport | None = None
+        self._reranker_examples: deque[ProceduralRerankerExample] = deque(maxlen=512)
 
     def start(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -1331,6 +1344,15 @@ class SleepCoordinator:
 
     def _gather_records(self) -> list[Any]:
         return list(self.episodic_memory.records[: self.episodic_memory.size])
+
+    def reranker_example_count(self) -> int:
+        return len(self._reranker_examples)
+
+    def sample_reranker_examples(self, batch_size: int) -> list[ProceduralRerankerExample]:
+        if not self._reranker_examples:
+            return []
+        count = min(int(batch_size), len(self._reranker_examples))
+        return random.sample(list(self._reranker_examples), count)
 
     def _candidate_from_segment(self, segment: DecomposedSegment) -> LatentSkillCandidate:
         return LatentSkillCandidate(
@@ -1460,6 +1482,31 @@ class SleepCoordinator:
             reference_records=records,
             candidates=scored_candidates,
         )
+        if records and len(evaluated) >= 2:
+            query_latent = torch.stack(
+                [record.key.detach().float().cpu() for record in records[: min(8, len(records))]],
+                dim=0,
+            ).mean(dim=0)
+            skill_embeddings = torch.stack(
+                [
+                    self.latent_action_encoder.encode_candidate(candidate).detach().float().cpu().squeeze(0)
+                    for candidate, _ in evaluated[: min(8, len(evaluated))]
+                ],
+                dim=0,
+            )
+            evaluation_scores = torch.tensor(
+                [float(score) for _, score in evaluated[: skill_embeddings.shape[0]]],
+                dtype=torch.float32,
+            )
+            confidence = torch.sigmoid(evaluation_scores)
+            self._reranker_examples.append(
+                ProceduralRerankerExample(
+                    query_latent=query_latent,
+                    skill_embeddings=skill_embeddings,
+                    evaluation_scores=evaluation_scores,
+                    confidence=confidence,
+                )
+            )
         promotions: list[SkillPromotion] = []
         compiled_signatures: set[tuple[float, ...]] = set()
         for ordinal, (candidate, evaluation_score) in enumerate(evaluated[:8], start=1):
@@ -1479,6 +1526,14 @@ class SleepCoordinator:
                     if candidate.symbolic_codes is not None
                     else None
                 ),
+                extras={
+                    "evaluation_score": float(evaluation_score),
+                    "target_delta": (
+                        candidate.target_delta.detach().float().cpu()
+                        if candidate.target_delta is not None
+                        else None
+                    ),
+                },
             )
             for source_episode in candidate.source_episodes:
                 compiled_signatures.add((float(source_episode),))

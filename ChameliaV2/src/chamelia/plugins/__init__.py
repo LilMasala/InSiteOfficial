@@ -4,6 +4,7 @@ from .base import AbstractDomain, DomainRegistry, InteractiveDomainAdapter
 from .cartpole import CartPoleDomain
 from .connect4 import Connect4Domain
 from .insite_t1d import InSiteBridgeDomain
+from .protein_dti import ProteinDTIDomain
 
 __all__ = [
     "AbstractDomain",
@@ -12,4 +13,5 @@ __all__ = [
     "DomainRegistry",
     "InSiteBridgeDomain",
     "InteractiveDomainAdapter",
+    "ProteinDTIDomain",
 ]

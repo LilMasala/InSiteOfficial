@@ -37,6 +37,7 @@ dependencies = [
     "Pillow>=10.0.0",
     "tqdm>=4.65.0",
     "gymnasium>=0.29.1",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
@@ -64,6 +65,11 @@ interactive = [
     "gymnasium>=0.29.1",
     "pettingzoo>=1.24.0",
     "python-chess>=1.999",
+]
+protein_dti = [
+    "biopython>=1.83",
+    "PyTDC>=0.4.1",
+    "rdkit>=2023.9.0",
 ]
 
 [project.urls]
