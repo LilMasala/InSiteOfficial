@@ -654,6 +654,9 @@ class UnifiedTrainingOrchestrator:
         for ablation in ("full", "no_memory", "no_sleep"):
             value = float(metrics.get(ablation, {}).get(primary_metric, 0.0))
             pieces.append(f"{ablation}_{primary_metric}={value:.4f}")
+        if "full_train_mode" in metrics:
+            value = float(metrics.get("full_train_mode", {}).get(primary_metric, 0.0))
+            pieces.append(f"full_train_mode_{primary_metric}={value:.4f}")
         for baseline, baseline_metrics in metrics.get("baselines", {}).items():
             value = float(baseline_metrics.get(primary_metric, 0.0))
             pieces.append(f"{baseline}_{primary_metric}={value:.4f}")
@@ -1668,11 +1671,15 @@ class UnifiedTrainingOrchestrator:
         *,
         episodes: int,
         ablation: str,
+        use_train_mode: bool = False,
     ) -> dict[str, float]:
         summaries: list[dict[str, Any]] = []
         with self._ablation_context(model, ablation):
             was_training = model.training
-            model.eval()
+            if use_train_mode:
+                model.train()
+            else:
+                model.eval()
             if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
                 adapter.set_eval_opponent_depth(4)
             with torch.no_grad():
@@ -1987,6 +1994,14 @@ class UnifiedTrainingOrchestrator:
                         domain_cfg,
                         episodes=domain_cfg.evaluation_episodes,
                         ablation="no_sleep",
+                    ),
+                    "full_train_mode": self._evaluate_model(
+                        model,
+                        adapter,
+                        domain_cfg,
+                        episodes=domain_cfg.evaluation_episodes,
+                        ablation="full",
+                        use_train_mode=True,
                     ),
                     "baselines": {
                         baseline: self._evaluate_baseline(

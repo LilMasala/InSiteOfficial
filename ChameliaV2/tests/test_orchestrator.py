@@ -264,6 +264,8 @@ def test_orchestrator_checkpoint_load_and_smoke_run(tmp_path: Path) -> None:
         domain_cfg=config.domains[0],
     )
     assert payload["domain_name"] == "cartpole"
+    assert "full_train_mode" in payload["evaluation"]
+    assert "episode_reward_mean" in payload["evaluation"]["full_train_mode"]
     assert len(orchestrator.replay) > 0
     assert restored_model.memory.size >= 0
     assert restored_model.world_model_backend == "mamba"
