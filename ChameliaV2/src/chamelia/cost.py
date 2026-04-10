@@ -22,6 +22,17 @@ def _repeat_domain_state(domain_state: dict[str, Any], repeats: int) -> dict[str
     return repeated
 
 
+def _maybe_build_imagined_domain_state(
+    builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None,
+    domain_state: dict[str, Any],
+    future_z: torch.Tensor,
+    step_idx: int,
+) -> dict[str, Any]:
+    if builder is None:
+        return domain_state
+    return builder(domain_state, future_z, step_idx)
+
+
 def _flatten_path_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
     """Flatten a [B, K, P, ...] tensor into [B*K*P, ...] with shape metadata."""
     batch_size, num_candidates, path_length = tensor.shape[:3]
@@ -263,6 +274,7 @@ class CostModule(nn.Module):
         domain_state: dict,
         future_z: torch.Tensor | None = None,
         horizon: int = 1,
+        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute intrinsic, trainable, and total cost terms.
 
@@ -279,7 +291,14 @@ class CostModule(nn.Module):
                 - "total": [B]
         """
         critic_latent = z if future_z is None else future_z
-        ic = self.intrinsic_cost(z, action, domain_state)
+        ic_domain_state = _maybe_build_imagined_domain_state(
+            imagined_domain_state_builder,
+            domain_state,
+            critic_latent,
+            0,
+        )
+        ic_latent = critic_latent if imagined_domain_state_builder is not None and future_z is not None else z
+        ic = self.intrinsic_cost(ic_latent, action, ic_domain_state)
         tc = self.trainable_critic(critic_latent, ctx_tokens)
         total = ic + ((self.gamma**max(1, int(horizon))) * tc)
         return {"ic": ic, "tc": tc, "total": total}
@@ -292,6 +311,7 @@ class CostModule(nn.Module):
         domain_state: dict[str, Any],
         future_z: torch.Tensor | None = None,
         future_trajectory: torch.Tensor | None = None,
+        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Score a batch of candidate actions.
 
@@ -316,16 +336,27 @@ class CostModule(nn.Module):
                     domain_state=domain_state,
                     future_z=future_z,
                     horizon=1,
+                    imagined_domain_state_builder=imagined_domain_state_builder,
                 ).items()
             }
 
         if actions.dim() == 4:
-            flat_actions, (batch_size, num_candidates, path_length) = _flatten_path_tensor(actions)
+            _, (batch_size, num_candidates, path_length) = _flatten_path_tensor(actions)
             if future_trajectory is None:
                 raise ValueError("future_trajectory is required when scoring action paths.")
-            flat_future, _ = _flatten_path_tensor(future_trajectory)
-            repeated_domain_state = _repeat_domain_state(domain_state, num_candidates * path_length)
-            path_ic = self.intrinsic_cost(flat_future, flat_actions, repeated_domain_state)
+            repeated_domain_state = _repeat_domain_state(domain_state, num_candidates)
+            path_costs = []
+            for step_idx in range(path_length):
+                flat_actions = actions[:, :, step_idx, :].reshape(batch_size * num_candidates, -1)
+                flat_future = future_trajectory[:, :, step_idx, :].reshape(batch_size * num_candidates, -1)
+                step_domain_state = _maybe_build_imagined_domain_state(
+                    imagined_domain_state_builder,
+                    repeated_domain_state,
+                    flat_future,
+                    step_idx,
+                )
+                path_costs.append(self.intrinsic_cost(flat_future, flat_actions, step_domain_state))
+            path_ic = torch.stack(path_costs, dim=-1)
             discounts = torch.pow(
                 torch.full(
                     (path_length,),
@@ -378,6 +409,13 @@ class CostModule(nn.Module):
             raise ValueError("future_z is required when scoring candidate actions [B, K, A].")
         flat_future = future_z.reshape(batch_size * num_candidates, -1)
         repeated_domain_state = _repeat_domain_state(domain_state, num_candidates)
-        ic = self.intrinsic_cost(flat_z, flat_actions, repeated_domain_state).view(batch_size, num_candidates)
+        ic_domain_state = _maybe_build_imagined_domain_state(
+            imagined_domain_state_builder,
+            repeated_domain_state,
+            flat_future,
+            0,
+        )
+        ic_latent = flat_future if imagined_domain_state_builder is not None else flat_z
+        ic = self.intrinsic_cost(ic_latent, flat_actions, ic_domain_state).view(batch_size, num_candidates)
         tc = self.trainable_critic(flat_future, flat_ctx).view(batch_size, num_candidates)
         return {"ic": ic, "tc": tc, "total": ic + (self.gamma * tc)}

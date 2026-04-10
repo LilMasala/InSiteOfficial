@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.nn as nn
 
 from src.chamelia.tokenizers import AbstractTokenizer
 
@@ -109,6 +110,16 @@ class AbstractDomain(ABC):
         _ = domain_state
         return None
 
+    def get_trainable_modules(self) -> dict[str, nn.Module]:
+        """Optionally expose plugin-owned trainable modules to core.
+
+        Returns:
+            Mapping of stable module names to ``nn.Module`` instances.
+
+        Default behavior exposes no additional trainable modules.
+        """
+        return {}
+
     @abstractmethod
     def compute_regime_embedding(self, domain_state: dict) -> torch.Tensor | None:
         """Optionally return a regime embedding.
@@ -119,6 +130,46 @@ class AbstractDomain(ABC):
         Returns:
             Tensor of shape [D] or [B, D], or None if unavailable.
         """
+
+    def build_imagined_domain_state(
+        self,
+        current_domain_state: dict[str, Any],
+        future_z: torch.Tensor,
+        step_idx: int,
+    ) -> dict[str, Any]:
+        """Build domain state for imagined future steps during planning.
+
+        Args:
+            current_domain_state: Current batched domain state payload.
+            future_z: Predicted latent for the imagined future step.
+            step_idx: Zero-based rollout step index.
+
+        Returns:
+            Domain-state payload aligned with ``future_z``.
+
+        Default behavior preserves the current domain state unchanged.
+        """
+        _ = future_z
+        _ = step_idx
+        return current_domain_state
+
+    def compute_latent_state_decoder_loss(
+        self,
+        predicted_future_z: torch.Tensor,
+        target_domain_state: dict[str, Any],
+    ) -> torch.Tensor | None:
+        """Optionally supervise plugin-owned latent-to-state decoders.
+
+        Args:
+            predicted_future_z: Predicted future latent tensor [B, D].
+            target_domain_state: Target future domain-state payload aligned to ``predicted_future_z``.
+
+        Returns:
+            Optional scalar loss tensor, or ``None`` when unsupported.
+        """
+        _ = predicted_future_z
+        _ = target_domain_state
+        return None
 
     def simulate_delayed_outcome(
         self,

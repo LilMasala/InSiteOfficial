@@ -95,6 +95,7 @@ class Chamelia(nn.Module):
             None.
         """
         super().__init__()
+        self.domain_auxiliary_modules = nn.ModuleDict()
         self.hjepa = hjepa
         self.configurator = configurator
         self.actor = actor
@@ -175,6 +176,16 @@ class Chamelia(nn.Module):
                 self.domain_tokenizer = self.domain_tokenizer.to(device)
             except (StopIteration, AttributeError):
                 pass
+        auxiliary_modules = domain.get_trainable_modules()
+        self.domain_auxiliary_modules = nn.ModuleDict(auxiliary_modules)
+        if auxiliary_modules:
+            try:
+                device = next(self.hjepa.parameters()).device
+                self.domain_auxiliary_modules = self.domain_auxiliary_modules.to(device)
+            except (StopIteration, AttributeError):
+                pass
+        if self.mcts_search is not None:
+            self.mcts_search.imagined_domain_state_builder = domain.build_imagined_domain_state
 
     def get_domain_tokenizer(self) -> nn.Module | None:
         """Return the registered domain tokenizer module if present.
@@ -477,6 +488,7 @@ class Chamelia(nn.Module):
             domain_state=domain_state,
             future_z=rollout["terminal_latents"],
             future_trajectory=rollout["trajectory"],
+            imagined_domain_state_builder=self.domain.build_imagined_domain_state,
         )
         reasoning_chain = FrozenReasoningChain(
             steps=(
@@ -900,6 +912,7 @@ class Chamelia(nn.Module):
                     domain_state=domain_state,
                     future_z=rollout["terminal_latents"],
                     future_trajectory=rollout["trajectory"],
+                    imagined_domain_state_builder=self.domain.build_imagined_domain_state,
                 )
                 reasoning_trace.append(
                     {

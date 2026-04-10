@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -250,6 +251,7 @@ class MCTSSearch:
         rollout_horizon: int = 3,
         tree_reuse_similarity: float = 0.98,
         safety_cost_ceiling: float | None = None,
+        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
     ) -> None:
         self.actor = actor
         self.world_model = world_model
@@ -261,6 +263,7 @@ class MCTSSearch:
         self.rollout_horizon = rollout_horizon
         self.tree_reuse_similarity = tree_reuse_similarity
         self.safety_cost_ceiling = safety_cost_ceiling
+        self.imagined_domain_state_builder = imagined_domain_state_builder
         self._previous_root: MCTSNode | None = None
 
     def _maybe_reuse_root(self, z: torch.Tensor, ctx_tokens: torch.Tensor) -> tuple[MCTSNode, bool]:
@@ -368,6 +371,7 @@ class MCTSSearch:
             domain_state=domain_state,
             future_z=rollout["terminal_latents"],
             future_trajectory=rollout["trajectory"],
+            imagined_domain_state_builder=self.imagined_domain_state_builder,
         )
         total_costs = candidate_costs["total"][0]
         node.candidate_paths = candidate_paths[0].detach()

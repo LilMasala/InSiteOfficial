@@ -13,6 +13,7 @@ from statistics import mean
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import yaml
 
 from src.chamelia.actor import Actor
@@ -64,6 +65,31 @@ def _clone_nested_cpu(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_clone_nested_cpu(item) for item in value)
     return value
+
+
+def _collate_domain_state_batch(states: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate a list of plugin domain-state payloads into a batched payload."""
+    if not states:
+        return {}
+    keys = set().union(*(state.keys() for state in states))
+    collated: dict[str, Any] = {}
+    for key in keys:
+        values = [state.get(key) for state in states]
+        first = values[0]
+        if torch.is_tensor(first):
+            tensors = []
+            for value in values:
+                if not torch.is_tensor(value):
+                    break
+                tensor_value = value
+                if tensor_value.dim() == 0:
+                    tensor_value = tensor_value.unsqueeze(0)
+                tensors.append(tensor_value)
+            else:
+                collated[key] = torch.cat(tensors, dim=0)
+                continue
+        collated[key] = values
+    return collated
 
 
 def _infer_encoder_embed_dim(encoder_type: str, configured_embed_dim: int) -> int:
@@ -870,14 +896,28 @@ class UnifiedTrainingOrchestrator:
         if all(record.selected_posture is not None for record in valid):
             selected_postures = torch.stack([record.selected_posture for record in valid], dim=0).to(self.device).unsqueeze(1)
         horizon = min(action_paths.shape[2], model.world_model.max_horizon)
-        return model.world_model.compute_transition_loss(
-            z_t=z_t,
+        outputs = model.world_model(
+            z=z_t,
             actions=action_paths,
-            z_tH=z_tH,
             ctx_tokens=ctx_tokens,
             candidate_postures=selected_postures,
             horizon=horizon,
         )
+        predicted = outputs["terminal_latents"]
+        if predicted.dim() == 3 and predicted.shape[1] == 1:
+            predicted = predicted[:, 0, :]
+        world_model_loss = F.smooth_l1_loss(predicted, z_tH.detach())
+        target_domain_state = _move_nested_to_device(
+            _collate_domain_state_batch([record.next_domain_state for record in valid]),
+            self.device,
+        )
+        decoder_loss = model.domain.compute_latent_state_decoder_loss(
+            predicted,
+            target_domain_state,
+        )
+        if decoder_loss is not None:
+            world_model_loss = world_model_loss + (0.25 * decoder_loss)
+        return world_model_loss
 
     def _count_world_model_valid(self, records: list[ReplayRecord]) -> int:
         return sum(

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from src.chamelia.plugins.base import InteractiveDomainAdapter
 from src.chamelia.tokenizers import StateVectorTokenizer
@@ -79,6 +81,11 @@ class CartPoleDomain(InteractiveDomainAdapter):
             embed_dim=embed_dim,
             domain_name="cartpole",
         )
+        self.state_decoder = nn.Sequential(
+            nn.LazyLinear(64),
+            nn.GELU(),
+            nn.Linear(64, 4),
+        )
         self._env = gym.make("CartPole-v1", max_episode_steps=max_steps) if gym is not None else _ToyCartPoleEnv(max_steps=max_steps)
         self._last_observation: torch.Tensor | None = None
 
@@ -87,6 +94,9 @@ class CartPoleDomain(InteractiveDomainAdapter):
 
     def get_action_dim(self) -> int:
         return 2
+
+    def get_trainable_modules(self) -> dict[str, nn.Module]:
+        return {"state_decoder": self.state_decoder}
 
     def decode_action(self, action_vec: torch.Tensor) -> Any:
         if action_vec.dim() == 1:
@@ -114,6 +124,43 @@ class CartPoleDomain(InteractiveDomainAdapter):
             return centered + velocity + action_bias
 
         return [(stability_cost, 1.0)]
+
+    def decode_state_from_latent(self, z: torch.Tensor) -> torch.Tensor:
+        if z.dim() == 1:
+            z = z.unsqueeze(0)
+        return self.state_decoder(z.float())
+
+    def build_imagined_domain_state(
+        self,
+        current_domain_state: dict[str, Any],
+        future_z: torch.Tensor,
+        step_idx: int,
+    ) -> dict[str, Any]:
+        _ = step_idx
+        approx_state = self.decode_state_from_latent(future_z)
+        center_preference = torch.where(
+            approx_state[:, 0] > 0.0,
+            torch.zeros_like(approx_state[:, 0]),
+            torch.ones_like(approx_state[:, 0]),
+        )
+        imagined_state = dict(current_domain_state)
+        imagined_state["state_vector"] = approx_state
+        imagined_state["center_preference"] = center_preference
+        return imagined_state
+
+    def compute_latent_state_decoder_loss(
+        self,
+        predicted_future_z: torch.Tensor,
+        target_domain_state: dict[str, Any],
+    ) -> torch.Tensor | None:
+        state_value = target_domain_state.get("state_vector")
+        if state_value is None:
+            return None
+        target_state = state_value.float().to(predicted_future_z.device)
+        if target_state.dim() == 1:
+            target_state = target_state.unsqueeze(0)
+        decoded = self.decode_state_from_latent(predicted_future_z)
+        return F.smooth_l1_loss(decoded, target_state.detach())
 
     def build_domain_state(self, observation: Any, info: dict[str, Any] | None = None) -> dict[str, Any]:
         state = self.prepare_bridge_observation(observation).float()

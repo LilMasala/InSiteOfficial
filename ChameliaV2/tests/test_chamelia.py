@@ -190,6 +190,28 @@ class DummyDomain(AbstractDomain):
         return 32
 
 
+class ImaginedStateDomain(DummyDomain):
+    """Domain whose intrinsic cost depends on imagined future state."""
+
+    def get_intrinsic_cost_fns(self):
+        def state_cost(z: torch.Tensor, action: torch.Tensor, domain_state: dict) -> torch.Tensor:
+            _ = z
+            _ = action
+            return domain_state["state_scalar"].float().reshape(-1)
+
+        return [(state_cost, 1.0)]
+
+    def build_imagined_domain_state(
+        self,
+        current_domain_state: dict[str, Any],
+        future_z: torch.Tensor,
+        step_idx: int,
+    ) -> dict[str, Any]:
+        imagined = dict(current_domain_state)
+        imagined["state_scalar"] = future_z[:, 0] + float(step_idx)
+        return imagined
+
+
 def test_chamelia_pipeline_shapes() -> None:
     """Instantiate each Chamelia V2 class and verify pipeline tensor shapes."""
     torch.manual_seed(0)
@@ -951,6 +973,44 @@ def test_path_level_intrinsic_cost_accumulates_over_future_trajectory() -> None:
     )
 
     assert scored["ic"].shape == (1, 2)
+    assert float(scored["ic"][0, 1].item()) > float(scored["ic"][0, 0].item())
+
+
+def test_path_level_intrinsic_cost_can_use_imagined_domain_state() -> None:
+    """Path scoring should be able to rebuild domain state from imagined future latents."""
+    torch.manual_seed(0)
+
+    domain = ImaginedStateDomain(embed_dim=32, action_dim=8)
+    cost_fns, weights = zip(*domain.get_intrinsic_cost_fns(), strict=False)
+    cost_module = CostModule(
+        intrinsic_cost=IntrinsicCost(list(cost_fns), list(weights)),
+        trainable_critic=TrainableCritic(
+            embed_dim=32,
+            num_heads=4,
+            num_layers=2,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            num_ctx_tokens=4,
+        ),
+    )
+    z = torch.zeros(1, 32)
+    ctx = torch.zeros(1, 4, 32)
+    domain_state = {"state_scalar": torch.zeros(1)}
+    candidate_paths = torch.zeros(1, 2, 3, 8)
+    future_trajectory = torch.zeros(1, 2, 3, 32)
+    future_trajectory[0, 0, :, 0] = torch.tensor([0.0, 0.5, 1.0])
+    future_trajectory[0, 1, :, 0] = torch.tensor([1.0, 1.5, 2.0])
+
+    scored = cost_module.score_candidates(
+        z=z,
+        actions=candidate_paths,
+        ctx_tokens=ctx,
+        domain_state=domain_state,
+        future_z=future_trajectory[:, :, -1, :],
+        future_trajectory=future_trajectory,
+        imagined_domain_state_builder=domain.build_imagined_domain_state,
+    )
+
     assert float(scored["ic"][0, 1].item()) > float(scored["ic"][0, 0].item())
 
 
