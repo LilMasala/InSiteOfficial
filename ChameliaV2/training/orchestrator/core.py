@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 import random
 import shutil
@@ -489,6 +490,96 @@ class UnifiedTrainingOrchestrator:
             "connect4": Connect4Domain,
         }
 
+    def _diagnostic_path(self, domain_name: str, phase_name: str) -> Path:
+        directory = self.run_dir / domain_name / "diagnostics"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{phase_name}.jsonl"
+
+    def _append_diagnostic_event(
+        self,
+        *,
+        domain_name: str,
+        phase_name: str,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> None:
+        event = {
+            "kind": kind,
+            "time": time.time(),
+            **payload,
+        }
+        with self._diagnostic_path(domain_name, phase_name).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+    def _gradient_norm(self, model: Chamelia) -> float:
+        total = 0.0
+        for param in model.parameters():
+            if param.grad is None:
+                continue
+            grad_norm = float(param.grad.detach().data.norm(2).item())
+            total += grad_norm * grad_norm
+        return total ** 0.5
+
+    def _summarize_outputs(self, outputs: dict[str, Any]) -> dict[str, float | int | str]:
+        summary: dict[str, float | int | str] = {
+            "planner_backend": str(outputs.get("planner_backend", "unknown")),
+            "world_model_backend": str(outputs.get("world_model_backend", "unknown")),
+        }
+        selected_candidate_idx = outputs.get("selected_candidate_idx")
+        if torch.is_tensor(selected_candidate_idx):
+            summary["selected_candidate_idx"] = int(selected_candidate_idx[0].item())
+        candidate_costs = outputs.get("candidate_costs")
+        if isinstance(candidate_costs, dict):
+            total = candidate_costs.get("total")
+            ic = candidate_costs.get("ic")
+            tc = candidate_costs.get("tc")
+            if torch.is_tensor(total):
+                summary["candidate_count"] = int(total.shape[1]) if total.dim() > 1 else int(total.shape[0])
+                summary["candidate_total_min"] = float(total[0].min().item())
+                summary["candidate_total_mean"] = float(total[0].mean().item())
+                summary["candidate_total_max"] = float(total[0].max().item())
+            if torch.is_tensor(ic):
+                summary["candidate_ic_mean"] = float(ic[0].mean().item())
+            if torch.is_tensor(tc):
+                summary["candidate_tc_mean"] = float(tc[0].mean().item())
+        retrieved_scores = outputs.get("retrieved_episode_scores")
+        if torch.is_tensor(retrieved_scores):
+            summary["memory_hits"] = int(retrieved_scores[0].numel())
+            if retrieved_scores.numel() > 0:
+                summary["memory_score_mean"] = float(retrieved_scores[0].mean().item())
+        skill_traces = outputs.get("skill_traces") or []
+        if skill_traces:
+            summary["procedural_skill_count"] = int(len(skill_traces[0] or ()))
+        candidate_postures = outputs.get("candidate_postures")
+        if torch.is_tensor(candidate_postures):
+            summary["candidate_posture_std"] = float(candidate_postures[0].std().item())
+            summary["selected_posture_norm"] = float(outputs["selected_posture"][0].norm().item())
+        action_vec = outputs.get("action_vec")
+        if torch.is_tensor(action_vec):
+            summary["selected_action_norm"] = float(action_vec[0].norm().item())
+        z = outputs.get("z")
+        if torch.is_tensor(z):
+            summary["latent_norm"] = float(z[0].norm().item())
+        ctx = outputs.get("ctx_tokens")
+        if torch.is_tensor(ctx):
+            summary["ctx_norm"] = float(ctx[0].norm().item())
+        return summary
+
+    def _summarize_metrics(
+        self,
+        metrics: dict[str, Any],
+        *,
+        primary_metric: str,
+    ) -> str:
+        pieces = []
+        for ablation in ("full", "no_memory", "no_sleep"):
+            value = float(metrics.get(ablation, {}).get(primary_metric, 0.0))
+            pieces.append(f"{ablation}_{primary_metric}={value:.4f}")
+        for baseline, baseline_metrics in metrics.get("baselines", {}).items():
+            value = float(baseline_metrics.get(primary_metric, 0.0))
+            pieces.append(f"{baseline}_{primary_metric}={value:.4f}")
+        return " ".join(pieces)
+
     def run(self) -> dict[str, Any]:
         results: dict[str, Any] = {}
         for domain_cfg in self.config.domains:
@@ -970,6 +1061,7 @@ class UnifiedTrainingOrchestrator:
         outputs: dict[str, Any],
         replay_record: ReplayRecord,
         *,
+        phase_name: str,
         phase_cfg: DomainPhaseConfig,
         optimizer: torch.optim.Optimizer,
         representation_loss_fn: torch.nn.Module,
@@ -1018,6 +1110,7 @@ class UnifiedTrainingOrchestrator:
         total = torch.stack(list(losses.values())).sum()
         optimizer.zero_grad(set_to_none=True)
         total.backward()
+        grad_norm = self._gradient_norm(model)
         optimizer.step()
         detached_losses = {key: float(value.detach().item()) for key, value in losses.items()}
         for key, value in detached_losses.items():
@@ -1034,11 +1127,28 @@ class UnifiedTrainingOrchestrator:
                     f"[{domain_cfg.name}] opt_call={self._optimization_calls} opt_step={self._optimizer_steps} "
                     + " ".join(loss_parts)
                     + (
-                        f" replay={len(self.replay)} actor_valid={actor_valid} "
+                        f" grad_norm={grad_norm:.4f} replay={len(self.replay)} actor_valid={actor_valid} "
                         f"wm_valid={world_model_valid} critic_valid={critic_valid}"
                     ),
                     flush=True,
                 )
+        self._append_diagnostic_event(
+            domain_name=domain_cfg.name,
+            phase_name=phase_name,
+            kind="optimizer",
+            payload={
+                "opt_call": self._optimization_calls,
+                "opt_step": self._optimizer_steps,
+                "global_step": global_step,
+                "grad_norm": grad_norm,
+                "replay_size": len(self.replay),
+                "actor_valid": actor_valid,
+                "world_model_valid": world_model_valid,
+                "critic_valid": critic_valid,
+                "retrieval_active": int(retrieval_active),
+                **{f"{key}_loss": value for key, value in detached_losses.items()},
+            },
+        )
         return detached_losses
 
     def _episode_record(
@@ -1296,6 +1406,8 @@ class UnifiedTrainingOrchestrator:
         self._optimizer_steps = 0
         best_metric = float("-inf")
         phase_metrics: dict[str, Any] = {}
+        episode_rewards: deque[float] = deque(maxlen=100)
+        episode_lengths: deque[int] = deque(maxlen=100)
         print(
             f"[{domain_cfg.name}] starting phase={phase_name} "
             f"episodes={phase_cfg.episodes} memory={phase_cfg.use_memory} "
@@ -1368,6 +1480,7 @@ class UnifiedTrainingOrchestrator:
                         model,
                         outputs,
                         record,
+                        phase_name=phase_name,
                         phase_cfg=phase_cfg,
                         optimizer=optimizer,
                         representation_loss_fn=representation_loss_fn,
@@ -1379,12 +1492,37 @@ class UnifiedTrainingOrchestrator:
                 if terminated or truncated:
                     winner = int(info.get("winner", 0))
                     break
+            episode_rewards.append(float(episode_reward))
+            episode_lengths.append(int(step_idx + 1))
             if episode_idx % progress_interval == 0 or episode_idx == 1:
+                output_summary = self._summarize_outputs(outputs)
                 print(
                     f"[{domain_cfg.name}][{phase_name}] episode={episode_idx}/{phase_cfg.episodes} "
                     f"reward={episode_reward:.3f} winner={winner} replay={len(self.replay)} "
-                    f"memory_size={model.memory.size}",
+                    f"memory_size={model.memory.size} "
+                    f"reward_mean100={mean(episode_rewards):.3f} "
+                    f"len_mean100={mean(episode_lengths):.2f} "
+                    f"candidate_total_min={float(output_summary.get('candidate_total_min', 0.0)):.4f} "
+                    f"candidate_total_mean={float(output_summary.get('candidate_total_mean', 0.0)):.4f} "
+                    f"candidate_total_max={float(output_summary.get('candidate_total_max', 0.0)):.4f} "
+                    f"memory_hits={int(output_summary.get('memory_hits', 0))} "
+                    f"skills={int(output_summary.get('procedural_skill_count', 0))}",
                     flush=True,
+                )
+                self._append_diagnostic_event(
+                    domain_name=domain_cfg.name,
+                    phase_name=phase_name,
+                    kind="episode_progress",
+                    payload={
+                        "episode_idx": episode_idx,
+                        "episode_reward": float(episode_reward),
+                        "winner": winner,
+                        "replay_size": len(self.replay),
+                        "memory_size": model.memory.size,
+                        "reward_mean100": mean(episode_rewards),
+                        "episode_length_mean100": mean(episode_lengths),
+                        **output_summary,
+                    },
                 )
             if phase_cfg.use_sleep and episode_idx % max(1, domain_cfg.sleep_interval_episodes) == 0 and model.sleep_coordinator is not None:
                 print(
@@ -1437,10 +1575,21 @@ class UnifiedTrainingOrchestrator:
                 metric_value = float(metrics["full"].get(domain_cfg.primary_metric, 0.0))
                 print(
                     f"[{domain_cfg.name}][{phase_name}] checkpoint episode={episode_idx} "
-                    f"full_{domain_cfg.primary_metric}={metrics['full'].get(domain_cfg.primary_metric, 0.0):.4f} "
-                    f"no_memory_{domain_cfg.primary_metric}={metrics['no_memory'].get(domain_cfg.primary_metric, 0.0):.4f} "
-                    f"no_sleep_{domain_cfg.primary_metric}={metrics['no_sleep'].get(domain_cfg.primary_metric, 0.0):.4f}",
+                    + self._summarize_metrics(metrics, primary_metric=domain_cfg.primary_metric)
+                    + f" checkpoint={checkpoint_path.name}",
                     flush=True,
+                )
+                self._append_diagnostic_event(
+                    domain_name=domain_cfg.name,
+                    phase_name=phase_name,
+                    kind="checkpoint",
+                    payload={
+                        "episode_idx": episode_idx,
+                        "checkpoint_path": str(checkpoint_path),
+                        "primary_metric": domain_cfg.primary_metric,
+                        "phase_pass_candidate": self._phase_passed(metrics, domain_cfg),
+                        "metrics": metrics,
+                    },
                 )
                 if domain_cfg.primary_mode == "min":
                     metric_value = -metric_value
@@ -1462,12 +1611,34 @@ class UnifiedTrainingOrchestrator:
                     f"rsd={report.rsd_candidates} bodegen={report.bodegen_candidates}",
                     flush=True,
                 )
+                self._append_diagnostic_event(
+                    domain_name=domain_cfg.name,
+                    phase_name=phase_name,
+                    kind="sleep_report",
+                    payload={
+                        "promotions": len(report.promotions),
+                        "segments": report.decomposed_segments,
+                        "dream_candidates": report.dream_candidates,
+                        "rsd_candidates": report.rsd_candidates,
+                        "bodegen_candidates": report.bodegen_candidates,
+                    },
+                )
         phase_metrics["phase_passed"] = self._phase_passed(phase_metrics, domain_cfg) if phase_metrics else False
         phase_metrics["best_metric"] = best_metric
         print(
             f"[{domain_cfg.name}] completed phase={phase_name} "
             f"passed={phase_metrics['phase_passed']} best_metric={best_metric:.4f}",
             flush=True,
+        )
+        self._append_diagnostic_event(
+            domain_name=domain_cfg.name,
+            phase_name=phase_name,
+            kind="phase_complete",
+            payload={
+                "phase_passed": phase_metrics["phase_passed"],
+                "best_metric": best_metric,
+                "primary_metric": domain_cfg.primary_metric,
+            },
         )
         return phase_metrics
 
