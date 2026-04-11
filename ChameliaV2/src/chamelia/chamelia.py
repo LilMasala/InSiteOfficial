@@ -628,6 +628,24 @@ class Chamelia(nn.Module):
             retrieved_posture_scores=retrieved_posture_scores,
             retrieved_skills=retrieved_skills,
         )
+        planner_diagnostics = self.domain.analyze_planner_candidates(
+            candidate_paths=result.candidate_paths.detach(),
+            candidate_ic=result.candidate_ic.detach() if result.candidate_ic is not None else None,
+            candidate_tc=result.candidate_tc.detach() if result.candidate_tc is not None else None,
+            candidate_total=result.candidate_costs.detach(),
+            candidate_terminal_latents=(
+                result.candidate_terminal_latents.detach()
+                if result.candidate_terminal_latents is not None
+                else None
+            ),
+            selected_candidate_idx=result.selected_candidate_idx,
+            domain_state=domain_state,
+            gamma=float(self.cost.gamma),
+            planner_trace=result.tree_trace,
+        )
+        tree_trace = dict(result.tree_trace)
+        if planner_diagnostics is not None:
+            tree_trace["counterfactual"] = planner_diagnostics
         zero_rollout = {
             "terminal_latents": result.candidate_terminal_latents.unsqueeze(0)
             if result.candidate_terminal_latents is not None
@@ -687,7 +705,8 @@ class Chamelia(nn.Module):
                 },
             ),
             "planner_source": "mcts",
-            "mcts_trace": result.tree_trace,
+            "mcts_trace": tree_trace,
+            "planner_diagnostics": planner_diagnostics,
             "skill_trace": tuple(item.record.skill_id for item in retrieved_skills[:1]),
         }
 
@@ -764,6 +783,7 @@ class Chamelia(nn.Module):
         planner_cluster_ids: list[int | None] = [None] * z.shape[0]
         planner_skill_traces: list[tuple[int, ...] | None] = [None] * z.shape[0]
         planner_mcts_traces: list[dict[str, Any] | None] = [None] * z.shape[0]
+        planner_diagnostics: list[dict[str, Any] | None] = [None] * z.shape[0]
         thinker_output: ThinkerOutput | None = None
         reasoning_trace: list[dict[str, torch.Tensor]] = []
         if self.planner_backend == "mcts" and self.mcts_search is not None:
@@ -821,6 +841,7 @@ class Chamelia(nn.Module):
                 planner_results.append(result)
                 planner_skill_traces[batch_idx] = result["skill_trace"]
                 planner_mcts_traces[batch_idx] = result["mcts_trace"]
+                planner_diagnostics[batch_idx] = result.get("planner_diagnostics")
 
             candidate_paths = self._pad_candidate_tensor(
                 [result["candidate_paths"].to(z.device) for result in planner_results]
@@ -1198,6 +1219,7 @@ class Chamelia(nn.Module):
             "world_model_backend": self.world_model_backend,
             "planner_cluster_ids": planner_cluster_ids,
             "mcts_traces": planner_mcts_traces,
+            "planner_diagnostics": planner_diagnostics,
             "skill_traces": planner_skill_traces,
         }
 

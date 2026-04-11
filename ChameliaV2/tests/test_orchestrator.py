@@ -10,6 +10,7 @@ from src.chamelia.cognitive.mamba_world_model import MambaActionConditionedWorld
 from src.chamelia.memory import EpisodeRecord, LatentMemory
 from src.chamelia.plugins import CartPoleDomain, Connect4Domain
 from src.chamelia.tokenizers import StateVectorTokenizer
+from training.orchestrator.core import ReplayWindow, _move_nested_to_device
 from training.orchestrator import (
     DomainPhaseConfig,
     DomainRunConfig,
@@ -180,6 +181,166 @@ def test_replay_buffer_samples_contiguous_windows() -> None:
         assert [record.step_idx for record in window.records] in ([0, 1, 2], [1, 2, 3])
 
 
+def test_orchestrator_critic_targets_discounted_future_return(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "critic_targets")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    model = orchestrator._build_model(config.domains[0], adapter)
+    model.cost.gamma = 0.5
+    embed_dim = int(model.actor.embed_dim)
+
+    class CaptureCritic(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.captured_target: torch.Tensor | None = None
+
+        def forward(self, z: torch.Tensor, ctx_tokens: torch.Tensor) -> torch.Tensor:
+            _ = ctx_tokens
+            return torch.zeros(z.shape[0], dtype=z.dtype, device=z.device)
+
+        def compute_critic_loss(
+            self,
+            predicted_value: torch.Tensor,
+            realized_ic: torch.Tensor,
+        ) -> torch.Tensor:
+            self.captured_target = realized_ic.detach().cpu()
+            return predicted_value.sum() * 0.0 + realized_ic.mean()
+
+    capture_critic = CaptureCritic()
+    model.cost.trainable_critic = capture_critic
+
+    def make_record(step_idx: int, cost: float, *, done: bool) -> ReplayRecord:
+        return ReplayRecord(
+            domain_id="cartpole",
+            modality_family="state_vector_hjepa",
+            episode_id=11,
+            step_idx=step_idx,
+            obs_raw={"step": step_idx},
+            tokenizer_input=torch.zeros(4),
+            tokens=torch.zeros(4, embed_dim),
+            mask=torch.zeros(4),
+            domain_state={"state_vector": torch.zeros(1, 4)},
+            action=torch.tensor([1]),
+            action_logits_or_vec=torch.tensor([0.0, 1.0], dtype=torch.float32),
+            legal_actions_mask=torch.tensor([True, True]),
+            reward=1.0,
+            cost=cost,
+            done=done,
+            next_obs_raw={"step": step_idx + 1},
+            next_tokens=torch.zeros(4, embed_dim),
+            next_mask=torch.zeros(4),
+            next_domain_state={"state_vector": torch.zeros(1, 4)},
+            latent_z=torch.full((embed_dim,), float(step_idx), dtype=torch.float32),
+            next_latent_z=torch.full((embed_dim,), float(step_idx + 1), dtype=torch.float32),
+            ctx_tokens=torch.zeros(4, embed_dim),
+            search_policy=None,
+            search_value=None,
+            selected_path=None,
+            selected_posture=None,
+        )
+
+    window = ReplayWindow(
+        records=(
+            make_record(0, 1.0, done=False),
+            make_record(1, 2.0, done=False),
+            make_record(2, 3.0, done=True),
+        )
+    )
+    loss = orchestrator._compute_critic_loss(model, [window])
+
+    assert loss is not None
+    assert capture_critic.captured_target is not None
+    assert torch.isclose(capture_critic.captured_target[0], torch.tensor(3.5), atol=1.0e-6)
+
+
+def test_orchestrator_world_model_uses_imagined_state_calibration_loss(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "world_model_calibration")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    model = orchestrator._build_model(config.domains[0], adapter)
+    model.cost.gamma = 0.5
+    embed_dim = int(model.actor.embed_dim)
+
+    class StubWorldModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.max_horizon = 4
+
+        def compute_trajectory_loss(
+            self,
+            z_t: torch.Tensor,
+            actions: torch.Tensor,
+            target_trajectory: torch.Tensor,
+            ctx_tokens: torch.Tensor,
+            *,
+            candidate_postures: torch.Tensor | None = None,
+            reasoning_states: torch.Tensor | None = None,
+            step_weights: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            _ = z_t
+            _ = actions
+            _ = ctx_tokens
+            _ = candidate_postures
+            _ = reasoning_states
+            _ = step_weights
+            return (
+                torch.zeros((), dtype=target_trajectory.dtype, device=target_trajectory.device),
+                target_trajectory.unsqueeze(1).detach().clone(),
+            )
+
+    model.world_model = StubWorldModel()
+    model.domain.compute_latent_state_decoder_loss = lambda *args, **kwargs: torch.zeros((), device=orchestrator.device)
+    model.domain.compute_imagined_state_calibration_loss = (
+        lambda predicted_future_z, action, target_domain_state, step_idx: torch.tensor(
+            float(step_idx + 1),
+            dtype=predicted_future_z.dtype,
+            device=predicted_future_z.device,
+        )
+    )
+
+    def make_record(step_idx: int) -> ReplayRecord:
+        state = torch.full((1, 4), float(step_idx), dtype=torch.float32)
+        return ReplayRecord(
+            domain_id="cartpole",
+            modality_family="state_vector_hjepa",
+            episode_id=21,
+            step_idx=step_idx,
+            obs_raw={"step": step_idx},
+            tokenizer_input=torch.zeros(4),
+            tokens=torch.zeros(4, embed_dim),
+            mask=torch.zeros(4),
+            domain_state={"state_vector": state},
+            action=torch.tensor([1]),
+            action_logits_or_vec=torch.tensor([0.0, 1.0], dtype=torch.float32),
+            legal_actions_mask=torch.tensor([True, True]),
+            reward=1.0,
+            cost=0.0,
+            done=False,
+            next_obs_raw={"step": step_idx + 1},
+            next_tokens=torch.zeros(4, embed_dim),
+            next_mask=torch.zeros(4),
+            next_domain_state={"state_vector": state + 1.0},
+            latent_z=torch.full((embed_dim,), float(step_idx), dtype=torch.float32),
+            next_latent_z=torch.full((embed_dim,), float(step_idx + 1), dtype=torch.float32),
+            ctx_tokens=torch.zeros(4, embed_dim),
+            search_policy=None,
+            search_value=None,
+            selected_path=None,
+            selected_posture=None,
+        )
+
+    window = ReplayWindow(records=(make_record(0), make_record(1)))
+    loss = orchestrator._compute_world_model_loss(model, [window])
+    expected = 0.5 * ((2.0 / 3.0) * 1.0 + (1.0 / 3.0) * 2.0)
+
+    assert loss is not None
+    assert torch.isclose(
+        loss,
+        torch.tensor(expected, dtype=loss.dtype, device=loss.device),
+        atol=1.0e-6,
+    )
+
+
 def _tiny_orchestrator_config(run_dir: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
         seed=7,
@@ -283,7 +444,11 @@ def test_mode2_actor_loss_uses_deliberate_path_not_mode1(tmp_path: Path) -> None
     domain_state = adapter.build_domain_state(observation, info)
     records: list[ReplayRecord] = []
     embed_dim = model.actor.embed_dim
-    obs_tensor = torch.tensor(observation, dtype=torch.float32)
+    obs_tensor = (
+        observation.detach().clone().float()
+        if torch.is_tensor(observation)
+        else torch.tensor(observation, dtype=torch.float32)
+    )
     for step_idx in range(4):
         records.append(
             ReplayRecord(
@@ -321,3 +486,174 @@ def test_mode2_actor_loss_uses_deliberate_path_not_mode1(tmp_path: Path) -> None
     loss.backward()
     assert model.actor.mode_1_policy.weight.grad is None
     assert model.actor.candidate_selection_head[0].weight.grad is not None
+
+
+def test_mode2_actor_loss_trains_candidate_paths_from_replay_targets(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "actor_path_loss")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    model = orchestrator._build_model(config.domains[0], adapter)
+    model.actor.compute_posture_diversity_loss = (
+        lambda *args, **kwargs: torch.zeros((), device=next(model.parameters()).device)
+    )
+    observation, info = adapter.reset(seed=321)
+    domain_state = adapter.build_domain_state(observation, info)
+    records: list[ReplayRecord] = []
+    embed_dim = model.actor.embed_dim
+    obs_tensor = (
+        observation.detach().clone().float()
+        if torch.is_tensor(observation)
+        else torch.tensor(observation, dtype=torch.float32)
+    )
+    for step_idx in range(4):
+        records.append(
+            ReplayRecord(
+                domain_id="cartpole",
+                modality_family="state_vector_hjepa",
+                episode_id=1,
+                step_idx=step_idx,
+                obs_raw=obs_tensor,
+                tokenizer_input=obs_tensor,
+                tokens=torch.randn(4, embed_dim),
+                mask=torch.zeros(4),
+                domain_state=domain_state,
+                action=torch.tensor([1]),
+                action_logits_or_vec=torch.randn(model.actor.action_dim),
+                legal_actions_mask=torch.tensor([True, True]),
+                reward=1.0,
+                cost=0.1,
+                done=False,
+                next_obs_raw=obs_tensor,
+                next_tokens=torch.randn(4, embed_dim),
+                next_mask=torch.zeros(4),
+                next_domain_state=domain_state,
+                latent_z=torch.randn(embed_dim),
+                next_latent_z=torch.randn(embed_dim),
+                ctx_tokens=torch.randn(config.num_ctx_tokens, embed_dim),
+                search_policy=torch.tensor([0.2, 0.8], dtype=torch.float32),
+                search_value=None,
+                selected_path=torch.randn(model.actor.path_length, model.actor.action_dim),
+                selected_posture=None,
+            )
+        )
+    model.zero_grad(set_to_none=True)
+    loss = orchestrator._compute_actor_loss(model, records, action_space_type="discrete")
+    assert loss is not None
+    loss.backward()
+    action_head_grad = model.actor.action_head[0].weight.grad
+    assert action_head_grad is not None
+    assert float(action_head_grad.abs().sum().item()) > 0.0
+
+
+def test_cartpole_simple_baseline_matches_fallback_dynamics() -> None:
+    cartpole = CartPoleDomain(embed_dim=16)
+    domain_state = {
+        "state_vector": torch.tensor([[0.0, 0.0, 0.15, 0.0]], dtype=torch.float32),
+    }
+    baseline = cartpole.build_simple_baseline_path(domain_state, path_length=3, action_dim=2)
+    assert baseline is not None
+    assert int(baseline[0, 0].argmax().item()) == 0
+
+
+def test_cartpole_planner_diagnostics_flag_selected_branch_that_loses_to_baseline() -> None:
+    cartpole = CartPoleDomain(embed_dim=16)
+    domain_state = {
+        "state_vector": torch.tensor([[0.0, 0.0, 0.15, 0.0]], dtype=torch.float32),
+    }
+    candidate_paths = torch.tensor(
+        [
+            [[6.0, -6.0], [6.0, -6.0], [6.0, -6.0]],
+            [[-6.0, 6.0], [-6.0, 6.0], [-6.0, 6.0]],
+        ],
+        dtype=torch.float32,
+    )
+    diagnostics = cartpole.analyze_planner_candidates(
+        candidate_paths=candidate_paths,
+        candidate_ic=torch.tensor([0.1, 0.05], dtype=torch.float32),
+        candidate_tc=torch.tensor([0.0, 0.0], dtype=torch.float32),
+        candidate_total=torch.tensor([0.1, 0.05], dtype=torch.float32),
+        candidate_terminal_latents=None,
+        selected_candidate_idx=1,
+        domain_state=domain_state,
+        gamma=0.99,
+        planner_trace={"selection_debug": {"reason": "lowest_mean_cost"}},
+    )
+    assert diagnostics is not None
+    assert diagnostics["selected_candidate_idx"] == 1
+    assert diagnostics["baseline_candidate_idx"] == 0
+    assert diagnostics["best_actual_idx"] == 0
+    assert diagnostics["selected_minus_baseline_actual_cost"] > 0.0
+    assert diagnostics["selected_minus_baseline_predicted_ic"] < 0.0
+    assert diagnostics["selected_minus_baseline_predicted_discounted_tc"] == 0.0
+    assert diagnostics["harmful_pick_source"] == "ic_path_only_flip"
+
+
+def test_cartpole_planner_diagnostics_identify_tc_tail_driven_misranking() -> None:
+    cartpole = CartPoleDomain(embed_dim=16)
+    domain_state = {
+        "state_vector": torch.tensor([[0.0, 0.0, 0.15, 0.0]], dtype=torch.float32),
+    }
+    candidate_paths = torch.tensor(
+        [
+            [[6.0, -6.0], [6.0, -6.0], [6.0, -6.0]],
+            [[-6.0, 6.0], [-6.0, 6.0], [-6.0, 6.0]],
+        ],
+        dtype=torch.float32,
+    )
+    gamma = 0.99
+    tail_discount = gamma ** candidate_paths.shape[1]
+    baseline_ic = 0.05
+    selected_ic = 0.10
+    baseline_tc = 0.50
+    selected_tc = 0.0
+    diagnostics = cartpole.analyze_planner_candidates(
+        candidate_paths=candidate_paths,
+        candidate_ic=torch.tensor([baseline_ic, selected_ic], dtype=torch.float32),
+        candidate_tc=torch.tensor([baseline_tc, selected_tc], dtype=torch.float32),
+        candidate_total=torch.tensor(
+            [
+                baseline_ic + (tail_discount * baseline_tc),
+                selected_ic + (tail_discount * selected_tc),
+            ],
+            dtype=torch.float32,
+        ),
+        candidate_terminal_latents=None,
+        selected_candidate_idx=1,
+        domain_state=domain_state,
+        gamma=gamma,
+        planner_trace={"selection_debug": {"reason": "lowest_mean_cost"}},
+    )
+    assert diagnostics is not None
+    assert diagnostics["selected_minus_baseline_actual_cost"] > 0.0
+    assert diagnostics["selected_minus_baseline_predicted_ic"] > 0.0
+    assert diagnostics["selected_minus_baseline_predicted_discounted_tc"] < 0.0
+    assert diagnostics["predicted_advantage_source"] == "tc_tail_only"
+    assert diagnostics["harmful_pick_source"] == "tc_tail_only_flip"
+
+
+def test_cartpole_forward_exposes_planner_diagnostics(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "planner_debug")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    model = orchestrator._build_model(config.domains[0], adapter)
+    observation, info = adapter.reset(seed=17)
+    tokenized = adapter.tokenize_observation(observation)
+    outputs = model(
+        tokens=tokenized.tokens.to(orchestrator.device),
+        mask=torch.zeros(
+            tokenized.tokens.shape[0],
+            tokenized.tokens.shape[1],
+            dtype=torch.float32,
+            device=orchestrator.device,
+        ),
+        domain_state=_move_nested_to_device(
+            adapter.build_domain_state(observation, info),
+            orchestrator.device,
+        ),
+        actor_mode="mode2",
+        store_to_memory=False,
+        input_kind="embedded_tokens",
+    )
+    planner_diagnostics = outputs["planner_diagnostics"]
+    assert planner_diagnostics[0] is not None
+    assert "selected_minus_baseline_actual_cost" in planner_diagnostics[0]

@@ -251,6 +251,8 @@ class MCTSSearch:
         rollout_horizon: int = 3,
         tree_reuse_similarity: float = 0.98,
         safety_cost_ceiling: float | None = None,
+        baseline_cost_margin: float = 0.25,
+        baseline_uncertainty_scale: float = 3.0,
         imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
         simple_baseline_builder: Callable[[dict[str, Any], int, int], torch.Tensor | None] | None = None,
     ) -> None:
@@ -264,6 +266,8 @@ class MCTSSearch:
         self.rollout_horizon = rollout_horizon
         self.tree_reuse_similarity = tree_reuse_similarity
         self.safety_cost_ceiling = safety_cost_ceiling
+        self.baseline_cost_margin = baseline_cost_margin
+        self.baseline_uncertainty_scale = baseline_uncertainty_scale
         self.imagined_domain_state_builder = imagined_domain_state_builder
         self.simple_baseline_builder = simple_baseline_builder
         self._previous_root: MCTSNode | None = None
@@ -449,6 +453,72 @@ class MCTSSearch:
         selection_path[0].visit_count += 1
         selection_path[0].total_cost += cumulative_return
 
+    def _select_root_child(self, root: MCTSNode) -> tuple[int, MCTSNode, dict[str, Any]]:
+        if root.candidate_costs is None or not root.children:
+            raise RuntimeError("MCTS root never expanded.")
+        best_idx, best_child = min(
+            enumerate(root.children),
+            key=lambda item: item[1].mean_cost,
+        )
+        selection_reason = "lowest_mean_cost"
+        predicted_costs = root.candidate_costs.detach().float()
+        mean_costs = torch.tensor(
+            [child.mean_cost for child in root.children],
+            dtype=predicted_costs.dtype,
+            device=predicted_costs.device,
+        )
+        predicted_cost_std = (
+            float(predicted_costs.std(unbiased=False).item())
+            if predicted_costs.numel() > 1
+            else 0.0
+        )
+        mean_cost_std = (
+            float(mean_costs.std(unbiased=False).item())
+            if mean_costs.numel() > 1
+            else 0.0
+        )
+        actual_predicted_improvement: float | None = None
+        required_predicted_improvement: float | None = None
+        baseline_predicted_total: float | None = None
+
+        if self.simple_baseline_builder is not None and root.children:
+            baseline_child = root.children[0]
+            if baseline_child.path_from_parent is not None:
+                baseline_predicted_total = float(predicted_costs[0].item())
+                selected_predicted_total = float(predicted_costs[best_idx].item())
+                actual_predicted_improvement = baseline_predicted_total - selected_predicted_total
+                required_predicted_improvement = max(
+                    float(self.baseline_cost_margin),
+                    float(self.baseline_uncertainty_scale) * predicted_cost_std,
+                )
+                if (
+                    best_idx != 0
+                    and actual_predicted_improvement <= required_predicted_improvement
+                ):
+                    best_idx = 0
+                    best_child = baseline_child
+                    selection_reason = "baseline_uncertainty_guard"
+                elif baseline_child.mean_cost <= (best_child.mean_cost + self.baseline_cost_margin):
+                    best_idx = 0
+                    best_child = baseline_child
+                    selection_reason = "baseline_margin"
+
+        return best_idx, best_child, {
+            "reason": selection_reason,
+            "baseline_cost_margin": float(self.baseline_cost_margin),
+            "baseline_uncertainty_scale": float(self.baseline_uncertainty_scale),
+            "root_candidate_mean_costs": [float(child.mean_cost) for child in root.children],
+            "root_candidate_visit_counts": [int(child.visit_count) for child in root.children],
+            "baseline_mean_cost": float(root.children[0].mean_cost),
+            "selected_mean_cost": float(best_child.mean_cost),
+            "root_mean_cost_std": mean_cost_std,
+            "root_predicted_cost_std": predicted_cost_std,
+            "baseline_predicted_total": baseline_predicted_total,
+            "selected_predicted_total": float(predicted_costs[best_idx].item()),
+            "actual_predicted_improvement": actual_predicted_improvement,
+            "required_predicted_improvement": required_predicted_improvement,
+        }
+
     def search(
         self,
         *,
@@ -486,10 +556,7 @@ class MCTSSearch:
             self._backpropagate(selection_path, node.immediate_cost)
         if root.candidate_paths is None or root.candidate_costs is None or not root.children:
             raise RuntimeError("MCTS root never expanded.")
-        best_idx, best_child = min(
-            enumerate(root.children),
-            key=lambda item: item[1].mean_cost,
-        )
+        best_idx, best_child, selection_debug = self._select_root_child(root)
         selected_path = best_child.path_from_parent
         if selected_path is None:
             raise RuntimeError("Expanded child is missing a selected path.")
@@ -513,6 +580,14 @@ class MCTSSearch:
                 ),
             )
         )
+        tree_trace = export_tree(root)
+        tree_trace["selected_candidate_idx"] = int(best_idx)
+        tree_trace["selection_debug"] = selection_debug
+        tree_trace["root_candidate_costs"] = [float(value) for value in root.candidate_costs.tolist()]
+        if root.candidate_ic is not None:
+            tree_trace["root_candidate_ic"] = [float(value) for value in root.candidate_ic.tolist()]
+        if root.candidate_tc is not None:
+            tree_trace["root_candidate_tc"] = [float(value) for value in root.candidate_tc.tolist()]
         self._previous_root = self._re_root_subtree(best_child, depth=0)
         return MCTSResult(
             selected_path=selected_path.detach(),
@@ -538,6 +613,6 @@ class MCTSSearch:
             selected_candidate_idx=best_idx,
             root=root,
             reasoning_chain=reasoning_chain,
-            tree_trace=export_tree(root),
+            tree_trace=tree_trace,
             reused_tree=reused_tree,
         )

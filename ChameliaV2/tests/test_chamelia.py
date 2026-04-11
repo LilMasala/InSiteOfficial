@@ -13,6 +13,7 @@ from src.chamelia.chamelia import Chamelia
 from src.chamelia.configurator import Configurator
 from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
 from src.chamelia.memory import EpisodeRecord, LatentMemory, RetrievalTraceStep
+from src.chamelia.plugins import CartPoleDomain
 from src.chamelia.plugins.base import AbstractDomain, DomainRegistry
 from src.chamelia.retrieval import MemoryRelevanceScorer
 from src.chamelia.tokenizers import SequenceTokenizer
@@ -364,8 +365,8 @@ def test_chamelia_pipeline_shapes() -> None:
     assert critic_loss.dim() == 0
 
 
-def test_trainable_critic_outputs_nonnegative_future_costs() -> None:
-    """TC should stay in cost space because it predicts future intrinsic cost."""
+def test_trainable_critic_supports_signed_future_costs() -> None:
+    """TC should represent signed cost-to-go, including good futures with negative cost."""
     torch.manual_seed(0)
 
     critic = TrainableCritic(
@@ -380,10 +381,45 @@ def test_trainable_critic_outputs_nonnegative_future_costs() -> None:
     z = torch.randn(6, 32)
     ctx = torch.randn(6, 4, 32)
 
+    with torch.no_grad():
+        for param in critic.parameters():
+            param.zero_()
+        critic.value_head[2].bias.fill_(-0.75)
+
     predicted = critic(z, ctx)
+    target = torch.full((6,), -1.25)
+    loss = critic.compute_critic_loss(predicted, target)
 
     assert predicted.shape == (6,)
-    assert torch.all(predicted >= 0)
+    assert torch.allclose(predicted, torch.full((6,), -0.75), atol=1.0e-6)
+    assert torch.isclose(loss, torch.tensor(0.125), atol=1.0e-6)
+
+
+def test_cartpole_imagined_state_calibration_penalizes_safety_miscalibration() -> None:
+    cartpole = CartPoleDomain(embed_dim=4)
+    cartpole.state_decoder = nn.Identity()
+    action = torch.tensor([[0.0, 1.0]], dtype=torch.float32)
+    target_state = torch.tensor([[0.0, 0.0, 0.05, 0.0]], dtype=torch.float32)
+    target_domain_state = cartpole.build_domain_state(target_state, None)
+
+    matched_loss = cartpole.compute_imagined_state_calibration_loss(
+        target_state,
+        action,
+        target_domain_state,
+        step_idx=0,
+    )
+    risky_prediction = torch.tensor([[0.0, 0.0, 0.4, 0.0]], dtype=torch.float32)
+    risky_loss = cartpole.compute_imagined_state_calibration_loss(
+        risky_prediction,
+        action,
+        target_domain_state,
+        step_idx=0,
+    )
+
+    assert matched_loss is not None
+    assert risky_loss is not None
+    assert torch.isclose(matched_loss, torch.tensor(0.0), atol=1.0e-7)
+    assert float(risky_loss.item()) > 1.0
 
 
 def test_cost_module_requires_future_latents_for_candidate_scoring() -> None:

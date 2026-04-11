@@ -273,6 +273,51 @@ def test_mcts_backpropagates_discounted_costs(tmp_path: Path) -> None:
     assert abs(root.total_cost - child.total_cost) < 1.0e-6
 
 
+def test_mcts_baseline_guard_rejects_tiny_predicted_edge(tmp_path: Path) -> None:
+    model, _domain, _memory, _procedural = _build_chamelia(tmp_path)
+    assert model.mcts_search is not None
+    root = MCTSNode(latent_state=torch.zeros(32), ctx_tokens=torch.zeros(4, 32), depth=0)
+    root.candidate_paths = torch.randn(3, 3, 8)
+    root.candidate_costs = torch.tensor([0.50, 0.45, 0.47], dtype=torch.float32)
+    root.children = [
+        MCTSNode(
+            latent_state=torch.zeros(32),
+            ctx_tokens=torch.zeros(4, 32),
+            depth=1,
+            path_from_parent=root.candidate_paths[0],
+            visit_count=4,
+            total_cost=4.0,
+        ),
+        MCTSNode(
+            latent_state=torch.zeros(32),
+            ctx_tokens=torch.zeros(4, 32),
+            depth=1,
+            path_from_parent=root.candidate_paths[1],
+            visit_count=4,
+            total_cost=1.8,
+        ),
+        MCTSNode(
+            latent_state=torch.zeros(32),
+            ctx_tokens=torch.zeros(4, 32),
+            depth=1,
+            path_from_parent=root.candidate_paths[2],
+            visit_count=4,
+            total_cost=2.4,
+        ),
+    ]
+
+    best_idx, _best_child, selection_debug = model.mcts_search._select_root_child(root)
+
+    assert best_idx == 0
+    assert selection_debug["reason"] == "baseline_uncertainty_guard"
+    assert selection_debug["actual_predicted_improvement"] is not None
+    assert selection_debug["required_predicted_improvement"] is not None
+    assert (
+        float(selection_debug["actual_predicted_improvement"])
+        <= float(selection_debug["required_predicted_improvement"])
+    )
+
+
 def test_mcts_reuses_selected_subtree_as_new_root(tmp_path: Path) -> None:
     model, domain, _memory, _procedural = _build_chamelia(tmp_path)
     assert model.mcts_search is not None
@@ -289,8 +334,12 @@ def test_mcts_reuses_selected_subtree_as_new_root(tmp_path: Path) -> None:
         input_kind="embedded_tokens",
     )
     selected_idx = int(outputs["selected_candidate_idx"][0].item())
-    reused_root_latent = outputs["mcts_traces"][0]
-    assert reused_root_latent is not None
+    root_trace = outputs["mcts_traces"][0]
+    assert root_trace is not None
+    assert root_trace["children"][selected_idx]["visit_count"] > 0
+    assert root_trace["selection_debug"]["selected_mean_cost"] <= max(
+        root_trace["selection_debug"]["root_candidate_mean_costs"]
+    )
     selected_terminal = outputs["rollout"]["terminal_latents"][0, selected_idx]
     result = model.mcts_search.search(
         z=selected_terminal.detach(),

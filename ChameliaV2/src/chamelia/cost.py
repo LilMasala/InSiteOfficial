@@ -146,7 +146,7 @@ class IntrinsicCost(nn.Module):
 
 
 class TrainableCritic(nn.Module):
-    """Context-conditioned learned future cost estimator."""
+    """Context-conditioned learned future cost-to-go estimator."""
 
     def __init__(
         self,
@@ -197,7 +197,7 @@ class TrainableCritic(nn.Module):
         )
         self.norm_ctx = nn.LayerNorm(embed_dim)
         self.norm_out = nn.LayerNorm(embed_dim)
-        self.output_activation = nn.Softplus()
+        self.output_activation = nn.Identity()
         self.value_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.GELU(),
@@ -205,7 +205,7 @@ class TrainableCritic(nn.Module):
         )
 
     def forward(self, z: torch.Tensor, ctx_tokens: torch.Tensor) -> torch.Tensor:
-        """Predict future intrinsic cost.
+        """Predict future signed cost-to-go.
 
         Args:
             z: Current latent state tensor of shape [B, D].
@@ -221,7 +221,7 @@ class TrainableCritic(nn.Module):
         x = x + self.cross_attn_to_ctx(query=x, key=ctx, value=ctx)[0]
         x = self.norm_out(x).squeeze(1)
         raw_value = self.value_head(x).squeeze(-1)
-        # TC is defined as predicted future intrinsic cost, so keep it in cost space.
+        # TC is a signed value-to-go, so let the head represent both good and bad futures.
         return self.output_activation(raw_value)
 
     def compute_critic_loss(
@@ -233,13 +233,34 @@ class TrainableCritic(nn.Module):
 
         Args:
             predicted_value: Predicted critic value tensor of shape [B].
-            realized_ic: Realized intrinsic cost target tensor of shape [B].
+            realized_ic: Realized signed cost-to-go target tensor of shape [B].
 
         Returns:
             Scalar tensor [] containing smooth L1 loss.
         """
-        target = realized_ic.detach().clamp_min(0.0)
-        return F.smooth_l1_loss(predicted_value, target)
+        target = realized_ic.detach()
+        base_loss = F.smooth_l1_loss(predicted_value, target)
+        if predicted_value.numel() < 2:
+            return base_loss
+
+        pair_mask = torch.triu(
+            torch.ones(
+                predicted_value.numel(),
+                predicted_value.numel(),
+                dtype=torch.bool,
+                device=predicted_value.device,
+            ),
+            diagonal=1,
+        )
+        pred_diff = predicted_value.unsqueeze(1) - predicted_value.unsqueeze(0)
+        target_diff = target.unsqueeze(1) - target.unsqueeze(0)
+        pairwise_loss = F.smooth_l1_loss(pred_diff[pair_mask], target_diff[pair_mask])
+
+        pred_std = predicted_value.std(unbiased=False).unsqueeze(0)
+        target_std = target.std(unbiased=False).unsqueeze(0)
+        spread_loss = F.smooth_l1_loss(pred_std, target_std)
+
+        return base_loss + (0.25 * pairwise_loss) + (0.10 * spread_loss)
 
 
 class CostModule(nn.Module):

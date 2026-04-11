@@ -202,6 +202,59 @@ class AbstractDomain(ABC):
         _ = target_domain_state
         return None
 
+    def compute_imagined_state_calibration_loss(
+        self,
+        predicted_future_z: torch.Tensor,
+        action: torch.Tensor,
+        target_domain_state: dict[str, Any],
+        step_idx: int,
+    ) -> torch.Tensor | None:
+        """Optionally supervise planner-facing imagined-state geometry.
+
+        Args:
+            predicted_future_z: Predicted future latent tensor [B, D].
+            action: Executed action tensor aligned with ``predicted_future_z``.
+            target_domain_state: Target future domain-state payload.
+            step_idx: Zero-based rollout step index.
+
+        Returns:
+            Optional scalar loss tensor, or ``None`` when unsupported.
+        """
+        _ = predicted_future_z
+        _ = action
+        _ = target_domain_state
+        _ = step_idx
+        return None
+
+    def analyze_planner_candidates(
+        self,
+        *,
+        candidate_paths: torch.Tensor,
+        candidate_ic: torch.Tensor | None,
+        candidate_tc: torch.Tensor | None,
+        candidate_total: torch.Tensor | None,
+        candidate_terminal_latents: torch.Tensor | None,
+        selected_candidate_idx: int | None,
+        domain_state: dict[str, Any],
+        gamma: float,
+        planner_trace: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Optionally explain planner preferences with domain-specific diagnostics.
+
+        Implementations may compare predicted candidate scores against exact or
+        counterfactual domain rollouts from the same state.
+        """
+        _ = candidate_paths
+        _ = candidate_ic
+        _ = candidate_tc
+        _ = candidate_total
+        _ = candidate_terminal_latents
+        _ = selected_candidate_idx
+        _ = domain_state
+        _ = gamma
+        _ = planner_trace
+        return None
+
     def simulate_delayed_outcome(
         self,
         action_vec: torch.Tensor,

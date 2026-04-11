@@ -599,8 +599,32 @@ class UnifiedTrainingOrchestrator:
         weights = torch.pow(torch.full((horizon,), float(gamma), device=device, dtype=dtype), powers)
         return weights / weights.sum().clamp_min(1.0e-6)
 
-    def _summarize_outputs(self, outputs: dict[str, Any]) -> dict[str, float | int | str]:
-        summary: dict[str, float | int | str] = {
+    def _extract_planner_diagnostics(
+        self,
+        outputs: dict[str, Any],
+        *,
+        batch_idx: int = 0,
+    ) -> dict[str, Any] | None:
+        planner_diagnostics = outputs.get("planner_diagnostics") or []
+        if (
+            isinstance(planner_diagnostics, list)
+            and batch_idx < len(planner_diagnostics)
+            and isinstance(planner_diagnostics[batch_idx], dict)
+        ):
+            return planner_diagnostics[batch_idx]
+        mcts_traces = outputs.get("mcts_traces") or []
+        if (
+            isinstance(mcts_traces, list)
+            and batch_idx < len(mcts_traces)
+            and isinstance(mcts_traces[batch_idx], dict)
+        ):
+            counterfactual = mcts_traces[batch_idx].get("counterfactual")
+            if isinstance(counterfactual, dict):
+                return counterfactual
+        return None
+
+    def _summarize_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {
             "planner_backend": str(outputs.get("planner_backend", "unknown")),
             "world_model_backend": str(outputs.get("world_model_backend", "unknown")),
         }
@@ -642,6 +666,61 @@ class UnifiedTrainingOrchestrator:
         ctx = outputs.get("ctx_tokens")
         if torch.is_tensor(ctx):
             summary["ctx_norm"] = float(ctx[0].norm().item())
+        planner_debug = self._extract_planner_diagnostics(outputs, batch_idx=0)
+        if planner_debug is not None:
+            summary["planner_selection_reason"] = str(planner_debug.get("selection_reason", "unknown"))
+            if planner_debug.get("best_actual_idx") is not None:
+                summary["planner_best_actual_idx"] = int(planner_debug["best_actual_idx"])
+            if planner_debug.get("selected_candidate_idx") is not None:
+                summary["planner_selected_idx"] = int(planner_debug["selected_candidate_idx"])
+            if planner_debug.get("selected_minus_baseline_predicted") is not None:
+                summary["selected_vs_baseline_predicted"] = float(
+                    planner_debug["selected_minus_baseline_predicted"]
+                )
+            if planner_debug.get("selected_minus_baseline_predicted_ic") is not None:
+                summary["selected_vs_baseline_predicted_ic"] = float(
+                    planner_debug["selected_minus_baseline_predicted_ic"]
+                )
+            if planner_debug.get("selected_minus_baseline_predicted_discounted_tc") is not None:
+                summary["selected_vs_baseline_predicted_discounted_tc"] = float(
+                    planner_debug["selected_minus_baseline_predicted_discounted_tc"]
+                )
+            if planner_debug.get("selected_minus_baseline_actual_cost") is not None:
+                summary["selected_vs_baseline_actual_cost"] = float(
+                    planner_debug["selected_minus_baseline_actual_cost"]
+                )
+            if planner_debug.get("selected_minus_baseline_actual_reward") is not None:
+                summary["selected_vs_baseline_actual_reward"] = float(
+                    planner_debug["selected_minus_baseline_actual_reward"]
+                )
+            if planner_debug.get("selected_terminal_state_mae") is not None:
+                summary["selected_terminal_state_mae"] = float(
+                    planner_debug["selected_terminal_state_mae"]
+                )
+            if planner_debug.get("required_predicted_improvement") is not None:
+                summary["required_predicted_improvement"] = float(
+                    planner_debug["required_predicted_improvement"]
+                )
+            if planner_debug.get("root_predicted_cost_std") is not None:
+                summary["root_predicted_cost_std"] = float(
+                    planner_debug["root_predicted_cost_std"]
+                )
+            if planner_debug.get("predicted_advantage_source") is not None:
+                summary["predicted_advantage_source"] = str(
+                    planner_debug["predicted_advantage_source"]
+                )
+            if planner_debug.get("harmful_pick_source") is not None:
+                summary["harmful_pick_source"] = str(
+                    planner_debug["harmful_pick_source"]
+                )
+            if (
+                planner_debug.get("best_actual_idx") is not None
+                and planner_debug.get("selected_candidate_idx") is not None
+            ):
+                summary["planner_counterfactual_miss"] = int(
+                    int(planner_debug["best_actual_idx"])
+                    != int(planner_debug["selected_candidate_idx"])
+                )
         return summary
 
     def _summarize_metrics(
@@ -1083,17 +1162,97 @@ class UnifiedTrainingOrchestrator:
             future_trajectory=rollout["trajectory"],
             imagined_domain_state_builder=model.domain.build_imagined_domain_state,
         )
+        candidate_paths = proposal["candidate_paths"]
         selection_logits = proposal["candidate_selection_logits"]
-        target_weights = torch.softmax(
-            (-candidate_costs["total"].detach()) / 0.25,
-            dim=1,
-        )
+        target_weights: torch.Tensor | None = None
+        path_loss: torch.Tensor | None = None
+        target_paths: list[torch.Tensor] = []
+        have_target_paths = True
+        for record in valid:
+            selected_path = record.selected_path
+            if selected_path is None:
+                have_target_paths = False
+                break
+            target_path = selected_path.float().to(self.device)
+            if target_path.dim() == 1:
+                target_path = target_path.unsqueeze(0)
+            if target_path.shape[-1] != candidate_paths.shape[-1]:
+                action_delta = int(candidate_paths.shape[-1]) - int(target_path.shape[-1])
+                if action_delta < 0:
+                    target_path = target_path[:, : candidate_paths.shape[-1]]
+                else:
+                    target_path = F.pad(target_path, (0, action_delta))
+            if target_path.shape[0] != candidate_paths.shape[2]:
+                if target_path.shape[0] > candidate_paths.shape[2]:
+                    target_path = target_path[: candidate_paths.shape[2], :]
+                else:
+                    pad_steps = int(candidate_paths.shape[2]) - int(target_path.shape[0])
+                    pad_value = (
+                        target_path[-1:, :]
+                        if target_path.shape[0] > 0
+                        else torch.zeros(
+                            1,
+                            candidate_paths.shape[-1],
+                            device=self.device,
+                            dtype=candidate_paths.dtype,
+                        )
+                    )
+                    target_path = torch.cat(
+                        [target_path, pad_value.expand(pad_steps, -1)],
+                        dim=0,
+                    )
+            target_paths.append(target_path.to(candidate_paths.dtype))
+        if have_target_paths and target_paths:
+            target_path_tensor = torch.stack(target_paths, dim=0)
+            expanded_targets = target_path_tensor.unsqueeze(1).expand(
+                -1,
+                candidate_paths.shape[1],
+                -1,
+                -1,
+            )
+            if action_space_type == "discrete":
+                target_actions = target_path_tensor.argmax(dim=-1)
+                flat_logits = candidate_paths.reshape(
+                    candidate_paths.shape[0] * candidate_paths.shape[1] * candidate_paths.shape[2],
+                    candidate_paths.shape[3],
+                )
+                flat_targets = target_actions.unsqueeze(1).expand(
+                    -1,
+                    candidate_paths.shape[1],
+                    -1,
+                ).reshape(-1)
+                per_step_errors = F.cross_entropy(
+                    flat_logits,
+                    flat_targets,
+                    reduction="none",
+                ).view(
+                    candidate_paths.shape[0],
+                    candidate_paths.shape[1],
+                    candidate_paths.shape[2],
+                )
+                path_errors = per_step_errors.mean(dim=-1)
+            else:
+                path_errors = F.smooth_l1_loss(
+                    candidate_paths,
+                    expanded_targets,
+                    reduction="none",
+                ).mean(dim=(-1, -2))
+            path_loss = path_errors.min(dim=1).values.mean()
+            target_weights = torch.softmax((-path_errors.detach()) / 0.25, dim=1)
+        if target_weights is None:
+            target_weights = torch.softmax(
+                (-candidate_costs["total"].detach()) / 0.25,
+                dim=1,
+            )
         selection_loss = -(target_weights * F.log_softmax(selection_logits, dim=1)).sum(dim=1).mean()
         diversity_loss = model.actor.compute_posture_diversity_loss(
             proposal["candidate_postures"],
-            proposal["candidate_paths"],
+            candidate_paths,
         )
-        return selection_loss + (0.02 * diversity_loss)
+        total_loss = selection_loss + (0.02 * diversity_loss)
+        if path_loss is not None:
+            total_loss = total_loss + path_loss
+        return total_loss
 
     def _count_actor_valid(self, records: list[ReplayRecord]) -> int:
         return sum(
@@ -1153,7 +1312,13 @@ class UnifiedTrainingOrchestrator:
             step_weights=step_weights,
         )
         decoder_losses: list[torch.Tensor] = []
+        calibration_losses: list[torch.Tensor] = []
         predicted_steps = predicted_trajectory[:, 0, :, :]
+        terminal_transition_loss = F.smooth_l1_loss(
+            predicted_steps[:, -1, :],
+            target_trajectory[:, -1, :].detach(),
+        )
+        world_model_loss = world_model_loss + (0.5 * terminal_transition_loss)
         for step_idx in range(horizon):
             target_domain_state = _move_nested_to_device(
                 _collate_domain_state_batch(
@@ -1167,8 +1332,18 @@ class UnifiedTrainingOrchestrator:
             )
             if decoder_loss is not None:
                 decoder_losses.append(step_weights[step_idx] * decoder_loss)
+            calibration_loss = model.domain.compute_imagined_state_calibration_loss(
+                predicted_steps[:, step_idx, :],
+                action_paths[:, 0, step_idx, :],
+                target_domain_state,
+                step_idx,
+            )
+            if calibration_loss is not None:
+                calibration_losses.append(step_weights[step_idx] * calibration_loss)
         if decoder_losses:
             world_model_loss = world_model_loss + (0.25 * torch.stack(decoder_losses).sum())
+        if calibration_losses:
+            world_model_loss = world_model_loss + (0.5 * torch.stack(calibration_losses).sum())
         return world_model_loss
 
     def _count_world_model_valid(self, windows: list[ReplayWindow]) -> int:
@@ -1181,24 +1356,100 @@ class UnifiedTrainingOrchestrator:
             and all(record.next_latent_z is not None for record in window.records)
         )
 
-    def _compute_critic_loss(self, model: Chamelia, records: list[ReplayRecord]) -> torch.Tensor | None:
-        valid = [
+    def _compute_critic_loss(
+        self,
+        model: Chamelia,
+        windows: list[ReplayWindow],
+        *,
+        fallback_records: list[ReplayRecord] | None = None,
+    ) -> torch.Tensor | None:
+        valid_windows = [
+            window
+            for window in windows
+            if len(window.records) >= 2
+            and window.records[0].next_latent_z is not None
+            and window.records[0].ctx_tokens is not None
+        ]
+        if valid_windows:
+            gamma = float(model.cost.gamma)
+            keys = torch.stack(
+                [window.records[0].next_latent_z for window in valid_windows],
+                dim=0,
+            ).to(self.device)
+            ctx_tokens = torch.stack(
+                [window.records[0].ctx_tokens for window in valid_windows],
+                dim=0,
+            ).to(self.device)
+            targets = torch.zeros(len(valid_windows), dtype=torch.float32, device=self.device)
+            bootstrap_indices: list[int] = []
+            bootstrap_latents: list[torch.Tensor] = []
+            bootstrap_ctx_tokens: list[torch.Tensor] = []
+            bootstrap_scales: list[float] = []
+
+            for window_idx, window in enumerate(valid_windows):
+                future_records = window.records[1:]
+                discounted_future = 0.0
+                for step_offset, record in enumerate(future_records):
+                    discounted_future += (gamma ** step_offset) * float(record.cost)
+                targets[window_idx] = discounted_future
+                last_record = window.records[-1]
+                if (
+                    not last_record.done
+                    and last_record.next_latent_z is not None
+                    and last_record.ctx_tokens is not None
+                ):
+                    bootstrap_indices.append(window_idx)
+                    bootstrap_latents.append(last_record.next_latent_z)
+                    bootstrap_ctx_tokens.append(last_record.ctx_tokens)
+                    bootstrap_scales.append(gamma ** len(future_records))
+
+            if bootstrap_indices:
+                bootstrap_values = model.cost.trainable_critic(
+                    torch.stack(bootstrap_latents, dim=0).to(self.device),
+                    torch.stack(bootstrap_ctx_tokens, dim=0).to(self.device),
+                ).detach()
+                for target_idx, scale, bootstrap_value in zip(
+                    bootstrap_indices,
+                    bootstrap_scales,
+                    bootstrap_values,
+                    strict=False,
+                ):
+                    targets[target_idx] += float(scale) * float(bootstrap_value.item())
+
+            predicted = model.cost.trainable_critic(keys, ctx_tokens)
+            return model.cost.trainable_critic.compute_critic_loss(predicted, targets)
+
+        valid_records = [
             record
-            for record in records
+            for record in (fallback_records or [])
             if record.next_latent_z is not None and record.ctx_tokens is not None
         ]
-        if not valid:
+        if not valid_records:
             return None
-        keys = torch.stack([record.next_latent_z for record in valid], dim=0).to(self.device)
-        ctx_tokens = torch.stack([record.ctx_tokens for record in valid], dim=0).to(self.device)
-        costs = torch.tensor([record.cost for record in valid], dtype=torch.float32, device=self.device)
+        keys = torch.stack([record.next_latent_z for record in valid_records], dim=0).to(self.device)
+        ctx_tokens = torch.stack([record.ctx_tokens for record in valid_records], dim=0).to(self.device)
+        costs = torch.tensor([record.cost for record in valid_records], dtype=torch.float32, device=self.device)
         predicted = model.cost.trainable_critic(keys, ctx_tokens)
         return model.cost.trainable_critic.compute_critic_loss(predicted, costs)
 
-    def _count_critic_valid(self, records: list[ReplayRecord]) -> int:
+    def _count_critic_valid(
+        self,
+        windows: list[ReplayWindow],
+        *,
+        fallback_records: list[ReplayRecord] | None = None,
+    ) -> int:
+        valid_window_count = sum(
+            1
+            for window in windows
+            if len(window.records) >= 2
+            and window.records[0].next_latent_z is not None
+            and window.records[0].ctx_tokens is not None
+        )
+        if valid_window_count > 0:
+            return valid_window_count
         return sum(
             1
-            for record in records
+            for record in (fallback_records or [])
             if record.next_latent_z is not None and record.ctx_tokens is not None
         )
 
@@ -1478,8 +1729,31 @@ class UnifiedTrainingOrchestrator:
         if world_model_loss is not None:
             losses["world_model"] = phase_cfg.world_model_loss_weight * world_model_loss
         critic_batch = self.replay.sample(32, domain_id=domain_cfg.name)
-        critic_valid = self._count_critic_valid(critic_batch)
-        critic_loss = self._compute_critic_loss(model, critic_batch)
+        critic_windows: list[ReplayWindow] = []
+        max_critic_horizon = max(
+            2,
+            min(
+                self.config.rollout_horizon + 1,
+                model.world_model.max_horizon + 1,
+            ),
+        )
+        for critic_horizon in range(max_critic_horizon, 1, -1):
+            critic_windows = self.replay.sample_windows(
+                32,
+                horizon=critic_horizon,
+                domain_id=domain_cfg.name,
+            )
+            if critic_windows:
+                break
+        critic_valid = self._count_critic_valid(
+            critic_windows,
+            fallback_records=critic_batch,
+        )
+        critic_loss = self._compute_critic_loss(
+            model,
+            critic_windows,
+            fallback_records=critic_batch,
+        )
         if critic_loss is not None:
             losses["critic"] = phase_cfg.critic_loss_weight * critic_loss
         rep_active = phase_cfg.train_hjepa
@@ -1938,6 +2212,7 @@ class UnifiedTrainingOrchestrator:
             episode_lengths.append(int(step_idx + 1))
             if episode_idx % progress_interval == 0 or episode_idx == 1:
                 output_summary = self._summarize_outputs(outputs)
+                planner_debug = self._extract_planner_diagnostics(outputs, batch_idx=0)
                 print(
                     f"[{domain_cfg.name}][{phase_name}] episode={episode_idx}/{phase_cfg.episodes} "
                     f"reward={episode_reward:.3f} winner={winner} replay={len(self.replay)} "
@@ -1948,7 +2223,21 @@ class UnifiedTrainingOrchestrator:
                     f"candidate_total_mean={float(output_summary.get('candidate_total_mean', 0.0)):.4f} "
                     f"candidate_total_max={float(output_summary.get('candidate_total_max', 0.0)):.4f} "
                     f"memory_hits={int(output_summary.get('memory_hits', 0))} "
-                    f"skills={int(output_summary.get('procedural_skill_count', 0))}",
+                    f"skills={int(output_summary.get('procedural_skill_count', 0))}"
+                    + (
+                        f" mcts_reason={output_summary.get('planner_selection_reason', 'n/a')}"
+                        f" sel_vs_base_pred={float(output_summary.get('selected_vs_baseline_predicted', 0.0)):.4f}"
+                        f" pred_ic={float(output_summary.get('selected_vs_baseline_predicted_ic', 0.0)):.4f}"
+                        f" pred_tc_tail={float(output_summary.get('selected_vs_baseline_predicted_discounted_tc', 0.0)):.4f}"
+                        f" sel_vs_base_actual={float(output_summary.get('selected_vs_baseline_actual_cost', 0.0)):.4f}"
+                        f" sel_term_mae={float(output_summary.get('selected_terminal_state_mae', 0.0)):.4f}"
+                        f" rank_src={str(output_summary.get('predicted_advantage_source', 'n/a'))}"
+                        f" harmful_src={str(output_summary.get('harmful_pick_source', 'n/a'))}"
+                        f" pred_guard={float(output_summary.get('required_predicted_improvement', 0.0)):.4f}"
+                        f" pred_std={float(output_summary.get('root_predicted_cost_std', 0.0)):.4f}"
+                        if planner_debug is not None
+                        else ""
+                    ),
                     flush=True,
                 )
                 self._append_diagnostic_event(
@@ -1963,6 +2252,7 @@ class UnifiedTrainingOrchestrator:
                         "memory_size": model.memory.size,
                         "reward_mean100": mean(episode_rewards),
                         "episode_length_mean100": mean(episode_lengths),
+                        "planner_debug": planner_debug,
                         **output_summary,
                     },
                 )
