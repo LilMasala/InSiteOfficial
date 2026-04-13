@@ -409,6 +409,108 @@ class Chamelia(nn.Module):
             ),
         )
 
+    def store_decision_records(
+        self,
+        outputs: dict[str, Any],
+        *,
+        metadata: list[dict[str, Any] | None] | None = None,
+        action_vec_override: torch.Tensor | None = None,
+        selected_path_override: torch.Tensor | None = None,
+        selected_posture_override: torch.Tensor | None = None,
+        selected_candidate_idx_override: list[int | None] | None = None,
+        step_override: int | None = None,
+    ) -> None:
+        """Persist pending decision records, optionally overriding executed actions."""
+        z = outputs["z"]
+        ctx_tokens = outputs["ctx_tokens"]
+        candidate_postures = outputs["candidate_postures"]
+        reasoning_states = outputs["reasoning_states"]
+        candidate_paths = outputs["candidate_paths"]
+        candidate_actions = outputs["candidate_actions"]
+        candidate_costs = outputs["candidate_costs"]
+        rollout = outputs["rollout"]
+        planner_cluster_ids = outputs.get("planner_cluster_ids") or [None] * z.shape[0]
+        planner_mcts_traces = outputs.get("mcts_traces") or [None] * z.shape[0]
+        planner_skill_traces = outputs.get("skill_traces") or [()] * z.shape[0]
+        goal_latents = outputs.get("_goal_latents") or [None] * z.shape[0]
+        retrieval_trace_rounds = outputs.get("_retrieval_trace_rounds") or []
+
+        action_vec = action_vec_override if action_vec_override is not None else outputs["action_vec"]
+        selected_path = (
+            selected_path_override if selected_path_override is not None else outputs["selected_path"]
+        )
+        selected_posture = (
+            selected_posture_override
+            if selected_posture_override is not None
+            else outputs["selected_posture"]
+        )
+        if selected_candidate_idx_override is None:
+            selected_idx_tensor = outputs["selected_candidate_idx"]
+            selected_candidate_idx_override = [
+                int(selected_idx_tensor[batch_idx].item())
+                for batch_idx in range(selected_idx_tensor.shape[0])
+            ]
+
+        self._pending_record_indices = []
+        step_value = self._step_counter if step_override is None else int(step_override)
+        for batch_idx in range(z.shape[0]):
+            metadata_item = None
+            if metadata is not None and batch_idx < len(metadata):
+                metadata_item = metadata[batch_idx]
+            record = EpisodeRecord(
+                key=z.detach()[batch_idx],
+                action=action_vec.detach()[batch_idx],
+                ctx_tokens=ctx_tokens.detach()[batch_idx],
+                ic_at_decision=float(outputs["cost"]["ic"][batch_idx].item()),
+                ic_realized=None,
+                tc_predicted=float(outputs["cost"]["tc"][batch_idx].item()),
+                outcome_key=None,
+                step=step_value,
+                domain_name=self.domain.domain_name,
+                model_version=self.model_version,
+                candidate_postures=candidate_postures.detach()[batch_idx],
+                selected_posture=selected_posture.detach()[batch_idx],
+                candidate_reasoning_states=reasoning_states.detach()[batch_idx],
+                candidate_paths=candidate_paths.detach()[batch_idx],
+                selected_path=selected_path.detach()[batch_idx],
+                candidate_actions=candidate_actions.detach()[batch_idx],
+                candidate_ic=candidate_costs["ic"].detach()[batch_idx],
+                candidate_tc=candidate_costs["tc"].detach()[batch_idx],
+                candidate_total=candidate_costs["total"].detach()[batch_idx],
+                candidate_terminal_latents=(
+                    rollout["terminal_latents"].detach()[batch_idx]
+                    if isinstance(rollout.get("terminal_latents"), torch.Tensor)
+                    else None
+                ),
+                selected_candidate_idx=selected_candidate_idx_override[batch_idx],
+                retrieval_trace=tuple(
+                    trace_step
+                    for trace_step in (
+                        self._build_retrieval_trace_step(
+                            batch_idx=batch_idx,
+                            query_key=trace_round["query_key"],
+                            query_posture=trace_round["query_posture"],
+                            retrieved_keys=trace_round["retrieved_keys"],
+                            retrieval_bundle=trace_round["bundle"],
+                        )
+                        for trace_round in retrieval_trace_rounds
+                    )
+                    if trace_step is not None
+                ),
+                mcts_trace=planner_mcts_traces[batch_idx],
+                skill_trace=planner_skill_traces[batch_idx],
+                goal_key=(
+                    goal_latents[batch_idx]
+                    if self.planner_backend == "mcts"
+                    and self.mcts_search is not None
+                    and goal_latents[batch_idx] is not None
+                    else None
+                ),
+                domain_cluster_id=planner_cluster_ids[batch_idx],
+                metadata=None if metadata_item is None else dict(metadata_item),
+            )
+            self._pending_record_indices.append(self.memory.store(record))
+
     def _slice_domain_state(
         self,
         domain_state: dict[str, Any],
@@ -718,6 +820,7 @@ class Chamelia(nn.Module):
         actor_mode: str = "mode2",
         store_to_memory: bool = True,
         input_kind: str = "auto",
+        advance_step: bool = True,
     ) -> dict[str, Any]:
         """Run the full Chamelia pipeline.
 
@@ -729,6 +832,7 @@ class Chamelia(nn.Module):
             actor_mode: Actor mode string, "mode1" or "mode2".
             store_to_memory: Whether to store the current episode in latent memory.
             input_kind: ``image``, ``embedded_tokens``, or ``auto``.
+            advance_step: Whether to advance the model-side decision step counter.
 
         Returns:
             Dict containing:
@@ -1113,68 +1217,8 @@ class Chamelia(nn.Module):
                 "total": _select_candidate_tensor(candidate_costs["total"], selected_candidate_idx),
             }
 
-        if store_to_memory:
-            self._pending_record_indices = []
-            for batch_idx in range(z.shape[0]):
-                record = EpisodeRecord(
-                    key=z.detach()[batch_idx],
-                    action=action_vec.detach()[batch_idx],
-                    ctx_tokens=ctx_tokens.detach()[batch_idx],
-                    ic_at_decision=float(cost_out["ic"][batch_idx].item()),
-                    ic_realized=None,
-                    tc_predicted=float(cost_out["tc"][batch_idx].item()),
-                    outcome_key=None,
-                    step=self._step_counter,
-                    domain_name=self.domain.domain_name,
-                    model_version=self.model_version,
-                    candidate_postures=candidate_postures.detach()[batch_idx],
-                    selected_posture=selected_posture.detach()[batch_idx],
-                    candidate_reasoning_states=reasoning_states.detach()[batch_idx],
-                    candidate_paths=candidate_paths.detach()[batch_idx],
-                    selected_path=selected_path.detach()[batch_idx],
-                    candidate_actions=candidate_actions.detach()[batch_idx],
-                    candidate_ic=candidate_costs["ic"].detach()[batch_idx],
-                    candidate_tc=candidate_costs["tc"].detach()[batch_idx],
-                    candidate_total=candidate_costs["total"].detach()[batch_idx],
-                    candidate_terminal_latents=(
-                        rollout["terminal_latents"].detach()[batch_idx]
-                        if isinstance(rollout.get("terminal_latents"), torch.Tensor)
-                        else None
-                    ),
-                    selected_candidate_idx=int(selected_candidate_idx[batch_idx].item()),
-                    retrieval_trace=tuple(
-                        trace_step
-                        for trace_step in (
-                            self._build_retrieval_trace_step(
-                                batch_idx=batch_idx,
-                                query_key=trace_round["query_key"],
-                                query_posture=trace_round["query_posture"],
-                                retrieved_keys=trace_round["retrieved_keys"],
-                                retrieval_bundle=trace_round["bundle"],
-                            )
-                            for trace_round in retrieval_trace_rounds
-                        )
-                        if trace_step is not None
-                    ),
-                    mcts_trace=planner_mcts_traces[batch_idx],
-                    skill_trace=planner_skill_traces[batch_idx],
-                    goal_key=(
-                        goal_latents[batch_idx]
-                        if self.planner_backend == "mcts"
-                        and self.mcts_search is not None
-                        and goal_latents[batch_idx] is not None
-                        else None
-                    ),
-                    domain_cluster_id=planner_cluster_ids[batch_idx],
-                )
-                self._pending_record_indices.append(self.memory.store(record))
-        else:
-            self._pending_record_indices = []
-
-        self._step_counter += 1
-        if self.sleep_coordinator is not None:
-            self.sleep_coordinator.maybe_trigger(self._step_counter)
-        return {
+        decision_step = self._step_counter
+        outputs = {
             "action": action,
             "action_vec": action_vec,
             "ctx_tokens": ctx_tokens,
@@ -1221,7 +1265,20 @@ class Chamelia(nn.Module):
             "mcts_traces": planner_mcts_traces,
             "planner_diagnostics": planner_diagnostics,
             "skill_traces": planner_skill_traces,
+            "_retrieval_trace_rounds": retrieval_trace_rounds,
+            "_goal_latents": goal_latents,
+            "decision_step": decision_step,
         }
+        if store_to_memory:
+            self.store_decision_records(outputs, step_override=decision_step)
+        else:
+            self._pending_record_indices = []
+
+        if advance_step:
+            self._step_counter += 1
+            if self.sleep_coordinator is not None:
+                self.sleep_coordinator.maybe_trigger(self._step_counter)
+        return outputs
 
     def fill_outcome(
         self,

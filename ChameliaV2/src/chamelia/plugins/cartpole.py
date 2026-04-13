@@ -344,6 +344,23 @@ class CartPoleDomain(InteractiveDomainAdapter):
         _ = info
         return torch.ones(2, dtype=torch.bool)
 
+    def baseline_action(
+        self,
+        kind: str,
+        observation: Any,
+        info: dict[str, Any] | None = None,
+    ) -> Any:
+        if kind == "simple":
+            domain_state = self.build_domain_state(observation, info)
+            baseline_path = self.build_simple_baseline_path(
+                domain_state,
+                path_length=1,
+                action_dim=self.get_action_dim(),
+            )
+            if baseline_path is not None:
+                return baseline_path[:, 0, :].argmax(dim=-1)
+        return super().baseline_action(kind, observation, info)
+
     def compute_realized_cost(
         self,
         observation: Any,

@@ -116,6 +116,21 @@ def _build_zero_mask(tokens: torch.Tensor) -> torch.Tensor:
     return torch.zeros(tokens.shape[0], tokens.shape[1], dtype=torch.float32, device=tokens.device)
 
 
+def _coerce_discrete_action_index(action: Any) -> int:
+    if torch.is_tensor(action):
+        if action.numel() == 0:
+            return 0
+        return int(action.reshape(-1)[0].item())
+    return int(action)
+
+
+def _discrete_action_vec(action: Any, action_dim: int, *, device: torch.device | str) -> torch.Tensor:
+    index = max(0, min(action_dim - 1, _coerce_discrete_action_index(action)))
+    action_vec = torch.zeros(action_dim, dtype=torch.float32, device=device)
+    action_vec[index] = 1.0
+    return action_vec
+
+
 def _build_random_mask(
     batch_size: int,
     seq_len: int,
@@ -173,6 +188,10 @@ class ReplayRecord:
     memory_hits: int = 0
     procedural_skill_ids: tuple[int, ...] = ()
     reasoning_trace_id: str | None = None
+    execution_source: str = "model"
+    effective_epsilon: float = 0.0
+    candidate_total_std: float | None = None
+    exploration_taken: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -205,6 +224,10 @@ class ReplayRecord:
             "memory_hits": int(self.memory_hits),
             "procedural_skill_ids": tuple(int(value) for value in self.procedural_skill_ids),
             "reasoning_trace_id": self.reasoning_trace_id,
+            "execution_source": self.execution_source,
+            "effective_epsilon": float(self.effective_epsilon),
+            "candidate_total_std": self.candidate_total_std,
+            "exploration_taken": bool(self.exploration_taken),
         }
 
     @classmethod
@@ -239,6 +262,10 @@ class ReplayRecord:
             memory_hits=int(payload.get("memory_hits", 0)),
             procedural_skill_ids=tuple(int(value) for value in payload.get("procedural_skill_ids", ())),
             reasoning_trace_id=payload.get("reasoning_trace_id"),
+            execution_source=str(payload.get("execution_source", "model")),
+            effective_epsilon=float(payload.get("effective_epsilon", 0.0)),
+            candidate_total_std=payload.get("candidate_total_std"),
+            exploration_taken=bool(payload.get("exploration_taken", False)),
         )
 
 
@@ -251,6 +278,24 @@ class ReplayWindow:
     @property
     def horizon(self) -> int:
         return len(self.records)
+
+
+@dataclass(frozen=True)
+class BootstrapTransition:
+    """Collected transition used for observational warmup and replay seeding."""
+
+    domain_id: str
+    episode_id: int
+    step_idx: int
+    source: str
+    observation: Any
+    info: dict[str, Any]
+    action: Any
+    next_observation: Any
+    next_info: dict[str, Any]
+    reward: float
+    cost: float
+    done: bool
 
 
 class TransitionReplayBuffer:
@@ -352,6 +397,10 @@ class DomainPhaseConfig:
     world_model_loss_weight: float = 1.0
     retrieval_loss_weight: float = 0.05
     representation_loss_weight: float = 0.2
+    exploration_epsilon_start: float = 0.20
+    exploration_epsilon_end: float = 0.02
+    exploration_uncertainty_bonus: float = 0.10
+    exploration_uncertainty_std_threshold: float = 0.05
 
 
 @dataclass
@@ -362,7 +411,9 @@ class DomainRunConfig:
     family: str
     adapter_kwargs: dict[str, Any] = field(default_factory=dict)
     bootstrap_random_episodes: int = 16
+    bootstrap_simple_episodes: int = 8
     bootstrap_pretrain_steps: int = 64
+    bootstrap_replay_warmup_steps: int = 64
     bootstrap_batch_size: int = 16
     mask_ratio: float = 0.25
     max_episode_steps: int = 256
@@ -421,7 +472,9 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 family=str(entry["family"]),
                 adapter_kwargs=dict(entry.get("adapter_kwargs", {})),
                 bootstrap_random_episodes=int(entry.get("bootstrap_random_episodes", 16)),
+                bootstrap_simple_episodes=int(entry.get("bootstrap_simple_episodes", 8)),
                 bootstrap_pretrain_steps=int(entry.get("bootstrap_pretrain_steps", 64)),
+                bootstrap_replay_warmup_steps=int(entry.get("bootstrap_replay_warmup_steps", 64)),
                 bootstrap_batch_size=int(entry.get("bootstrap_batch_size", 16)),
                 mask_ratio=float(entry.get("mask_ratio", 0.25)),
                 max_episode_steps=int(entry.get("max_episode_steps", 256)),
@@ -641,6 +694,7 @@ class UnifiedTrainingOrchestrator:
                 summary["candidate_total_min"] = float(total[0].min().item())
                 summary["candidate_total_mean"] = float(total[0].mean().item())
                 summary["candidate_total_max"] = float(total[0].max().item())
+                summary["candidate_total_std"] = float(total[0].std(unbiased=False).item())
             if torch.is_tensor(ic):
                 summary["candidate_ic_mean"] = float(ic[0].mean().item())
             if torch.is_tensor(tc):
@@ -1101,17 +1155,200 @@ class UnifiedTrainingOrchestrator:
             return None
         return target / target.sum()
 
-    def _collect_random_bootstrap(self, adapter: InteractiveDomainAdapter, domain_cfg: DomainRunConfig) -> list[Any]:
-        observations: list[Any] = []
-        for episode_idx in range(domain_cfg.bootstrap_random_episodes):
-            observation, info = adapter.reset(seed=self.config.seed + episode_idx)
-            for _ in range(domain_cfg.max_episode_steps):
-                observations.append(_clone_nested_cpu(observation))
-                action = adapter.baseline_action("random", observation, info)
-                observation, _reward, terminated, truncated, info = adapter.step(action)
-                if terminated or truncated:
-                    break
-        return observations
+    def _collect_bootstrap_trajectories(
+        self,
+        adapter: InteractiveDomainAdapter,
+        domain_cfg: DomainRunConfig,
+    ) -> list[BootstrapTransition]:
+        transitions: list[BootstrapTransition] = []
+        episode_specs = (
+            ("random", int(domain_cfg.bootstrap_random_episodes)),
+            ("simple", int(domain_cfg.bootstrap_simple_episodes)),
+        )
+        bootstrap_episode_id = 0
+        for source_name, episode_count in episode_specs:
+            if episode_count <= 0:
+                continue
+            for local_episode_idx in range(episode_count):
+                bootstrap_episode_id += 1
+                seed_offset = 10_000 if source_name == "simple" else 0
+                observation, info = adapter.reset(
+                    seed=self.config.seed + seed_offset + local_episode_idx
+                )
+                for step_idx in range(domain_cfg.max_episode_steps):
+                    action = adapter.baseline_action(source_name, observation, info)
+                    next_observation, reward, terminated, truncated, next_info = adapter.step(action)
+                    realized_cost = adapter.compute_realized_cost(
+                        next_observation,
+                        reward,
+                        terminated,
+                        truncated,
+                        next_info,
+                    )
+                    transitions.append(
+                        BootstrapTransition(
+                            domain_id=domain_cfg.name,
+                            episode_id=bootstrap_episode_id,
+                            step_idx=step_idx,
+                            source=f"bootstrap_{source_name}",
+                            observation=_clone_nested_cpu(observation),
+                            info=dict(info),
+                            action=_clone_nested_cpu(action),
+                            next_observation=_clone_nested_cpu(next_observation),
+                            next_info=dict(next_info),
+                            reward=float(reward),
+                            cost=float(realized_cost),
+                            done=bool(terminated or truncated),
+                        )
+                    )
+                    observation, info = next_observation, next_info
+                    if terminated or truncated:
+                        break
+        return transitions
+
+    def _bootstrap_observations(self, transitions: list[BootstrapTransition]) -> list[Any]:
+        return [_clone_nested_cpu(transition.observation) for transition in transitions]
+
+    def _seed_replay_from_bootstrap(
+        self,
+        model: Chamelia,
+        adapter: InteractiveDomainAdapter,
+        domain_cfg: DomainRunConfig,
+        transitions: list[BootstrapTransition],
+    ) -> None:
+        if not transitions:
+            return
+        original_step_counter = int(getattr(model, "_step_counter", 0))
+        for transition in transitions:
+            tokenized = adapter.tokenize_observation(transition.observation)
+            tokens = tokenized.tokens.to(self.device)
+            with torch.no_grad():
+                outputs = model(
+                    tokens=tokens,
+                    mask=_build_zero_mask(tokens),
+                    domain_state=_move_nested_to_device(
+                        adapter.build_domain_state(transition.observation, transition.info),
+                        self.device,
+                    ),
+                    actor_mode="mode2",
+                    store_to_memory=False,
+                    input_kind="embedded_tokens",
+                    advance_step=False,
+                )
+            action_vec = _discrete_action_vec(
+                transition.action,
+                model.actor.action_dim,
+                device=self.device,
+            )
+            selected_path = action_vec.unsqueeze(0)
+            next_tokens, next_z = self._encode_latent(model, adapter, transition.next_observation)
+            record = ReplayRecord(
+                domain_id=transition.domain_id,
+                modality_family=domain_cfg.family,
+                episode_id=transition.episode_id,
+                step_idx=transition.step_idx,
+                obs_raw=_clone_nested_cpu(transition.observation),
+                tokenizer_input=_clone_nested_cpu(
+                    adapter.build_domain_state(transition.observation, transition.info)
+                ),
+                tokens=tokenized.tokens.detach().cpu().squeeze(0),
+                mask=_build_zero_mask(tokenized.tokens).detach().cpu().squeeze(0),
+                domain_state=_clone_nested_cpu(
+                    adapter.build_domain_state(transition.observation, transition.info)
+                ),
+                action=_clone_nested_cpu(transition.action),
+                action_logits_or_vec=action_vec.detach().cpu(),
+                legal_actions_mask=(
+                    None
+                    if adapter.legal_action_mask(transition.observation, transition.info) is None
+                    else adapter.legal_action_mask(transition.observation, transition.info).detach().cpu().reshape(-1)
+                ),
+                reward=float(transition.reward),
+                cost=float(transition.cost),
+                done=bool(transition.done),
+                next_obs_raw=_clone_nested_cpu(transition.next_observation),
+                next_tokens=next_tokens.detach().cpu().squeeze(0),
+                next_mask=torch.zeros(next_tokens.shape[1], dtype=torch.float32),
+                next_domain_state=_clone_nested_cpu(
+                    adapter.build_domain_state(transition.next_observation, transition.next_info)
+                ),
+                latent_z=outputs["z"].detach().cpu()[0],
+                next_latent_z=next_z.detach().cpu(),
+                ctx_tokens=outputs["ctx_tokens"].detach().cpu()[0],
+                search_policy=action_vec.detach().cpu(),
+                search_value=float(-transition.cost),
+                selected_path=selected_path.detach().cpu(),
+                selected_posture=torch.zeros(model.actor.posture_dim, dtype=torch.float32),
+                memory_hits=0,
+                procedural_skill_ids=(),
+                reasoning_trace_id=(
+                    f"{transition.domain_id}:{transition.episode_id}:{transition.step_idx}:"
+                    f"{transition.source}"
+                ),
+                execution_source=transition.source,
+                effective_epsilon=0.0,
+                candidate_total_std=(
+                    float(outputs["candidate_costs"]["total"][0].std(unbiased=False).item())
+                    if torch.is_tensor(outputs["candidate_costs"]["total"])
+                    else None
+                ),
+                exploration_taken=False,
+            )
+            self.replay.add(record)
+        model._step_counter = original_step_counter
+
+    def _bootstrap_replay_warmup(
+        self,
+        model: Chamelia,
+        *,
+        domain_cfg: DomainRunConfig,
+        steps: int,
+    ) -> None:
+        if steps <= 0:
+            return
+        warmup_phase = DomainPhaseConfig(
+            episodes=0,
+            use_memory=False,
+            use_sleep=False,
+            train_hjepa=False,
+        )
+        optimizer = torch.optim.AdamW(self._parameter_groups(model, domain_cfg, warmup_phase))
+        representation_loss_fn = self._build_representation_loss(domain_cfg.family)
+        for warmup_step in range(steps):
+            replay_record_batch = self.replay.sample(1, domain_id=domain_cfg.name, require_next_latent=False)
+            if not replay_record_batch:
+                break
+            self._optimize_from_replay(
+                model,
+                {},
+                replay_record_batch[0],
+                phase_name="bootstrap_replay_warmup",
+                phase_cfg=warmup_phase,
+                optimizer=optimizer,
+                representation_loss_fn=representation_loss_fn,
+                domain_cfg=domain_cfg,
+                global_step=warmup_step,
+            )
+
+    def _effective_exploration_epsilon(
+        self,
+        *,
+        phase_cfg: DomainPhaseConfig,
+        episode_idx: int,
+        total_episodes: int,
+        candidate_total_std: float,
+    ) -> float:
+        if total_episodes <= 1:
+            decay_fraction = 0.0
+        else:
+            decay_fraction = float(episode_idx - 1) / float(total_episodes - 1)
+        base_epsilon = float(phase_cfg.exploration_epsilon_start) + (
+            decay_fraction
+            * (float(phase_cfg.exploration_epsilon_end) - float(phase_cfg.exploration_epsilon_start))
+        )
+        if candidate_total_std < float(phase_cfg.exploration_uncertainty_std_threshold):
+            base_epsilon += float(phase_cfg.exploration_uncertainty_bonus)
+        return max(0.0, min(1.0, base_epsilon))
 
     def _compute_actor_loss(
         self,
@@ -1840,7 +2077,23 @@ class UnifiedTrainingOrchestrator:
         cost: float,
         done: bool,
         legal_actions_mask: torch.Tensor | None,
+        executed_action: Any | None = None,
+        executed_action_vec: torch.Tensor | None = None,
+        executed_selected_path: torch.Tensor | None = None,
+        execution_source: str = "model",
+        effective_epsilon: float = 0.0,
+        candidate_total_std: float | None = None,
+        exploration_taken: bool = False,
     ) -> ReplayRecord:
+        stored_action = outputs["action"] if executed_action is None else executed_action
+        if torch.is_tensor(stored_action):
+            stored_action = stored_action[0] if stored_action.dim() > 0 else stored_action
+        stored_action_vec = outputs["action_vec"][0] if executed_action_vec is None else executed_action_vec
+        stored_selected_path = (
+            outputs["selected_path"][0]
+            if executed_selected_path is None
+            else executed_selected_path
+        )
         return ReplayRecord(
             domain_id=domain_cfg.name,
             modality_family=domain_cfg.family,
@@ -1851,8 +2104,8 @@ class UnifiedTrainingOrchestrator:
             tokens=tokenized.tokens.detach().cpu().squeeze(0),
             mask=_build_zero_mask(tokenized.tokens).detach().cpu().squeeze(0),
             domain_state=_clone_nested_cpu(domain_state),
-            action=_clone_nested_cpu(outputs["action"][0] if torch.is_tensor(outputs["action"]) else outputs["action"]),
-            action_logits_or_vec=outputs["action_vec"].detach().cpu()[0],
+            action=_clone_nested_cpu(stored_action),
+            action_logits_or_vec=stored_action_vec.detach().cpu(),
             legal_actions_mask=None if legal_actions_mask is None else legal_actions_mask.detach().cpu().reshape(-1),
             reward=float(reward),
             cost=float(cost),
@@ -1870,11 +2123,15 @@ class UnifiedTrainingOrchestrator:
                 action_dim=outputs["action_vec"].shape[-1],
             ),
             search_value=float(-outputs["cost"]["total"][0].detach().item()),
-            selected_path=outputs["selected_path"].detach().cpu()[0],
+            selected_path=stored_selected_path.detach().cpu(),
             selected_posture=outputs["selected_posture"].detach().cpu()[0],
             memory_hits=0 if outputs["retrieved_episode_scores"] is None else int(outputs["retrieved_episode_scores"][0].numel()),
             procedural_skill_ids=tuple(outputs.get("skill_traces", [()])[0] or ()),
             reasoning_trace_id=f"{domain_cfg.name}:{episode_id}:{step_idx}",
+            execution_source=execution_source,
+            effective_epsilon=float(effective_epsilon),
+            candidate_total_std=candidate_total_std,
+            exploration_taken=bool(exploration_taken),
         )
 
     @contextmanager
@@ -2137,20 +2394,78 @@ class UnifiedTrainingOrchestrator:
             observation, info = adapter.reset(seed=self.config.seed + episode_idx)
             episode_reward = 0.0
             winner = 0
+            last_execution_metadata = {
+                "execution_source": "model",
+                "effective_epsilon": 0.0,
+                "candidate_total_std": None,
+                "exploration_taken": False,
+            }
             for step_idx in range(domain_cfg.max_episode_steps):
+                current_info = dict(info)
                 tokenized = adapter.tokenize_observation(observation)
                 tokens = tokenized.tokens.to(self.device)
-                domain_state = adapter.build_domain_state(observation, info)
+                domain_state = adapter.build_domain_state(observation, current_info)
                 outputs = model(
                     tokens=tokens,
                     mask=_build_zero_mask(tokens),
                     domain_state=_move_nested_to_device(domain_state, self.device),
                     actor_mode="mode2",
-                    store_to_memory=phase_cfg.use_memory,
+                    store_to_memory=False,
                     input_kind="embedded_tokens",
                 )
-                action = outputs["action"]
-                chosen_action = action[0] if torch.is_tensor(action) else action
+                candidate_total_std = float(
+                    outputs["candidate_costs"]["total"][0].std(unbiased=False).item()
+                )
+                effective_epsilon = self._effective_exploration_epsilon(
+                    phase_cfg=phase_cfg,
+                    episode_idx=episode_idx,
+                    total_episodes=phase_cfg.episodes,
+                    candidate_total_std=candidate_total_std,
+                )
+                exploration_taken = random.random() < effective_epsilon
+                execution_source = "model"
+                executed_action = outputs["action"]
+                executed_action_vec = outputs["action_vec"][0].detach()
+                executed_selected_path = outputs["selected_path"][0].detach()
+                executed_selected_posture_override = None
+                executed_selected_candidate_idx: list[int | None] | None = None
+                if exploration_taken:
+                    execution_source = "epsilon_random"
+                    executed_action = adapter.baseline_action("random", observation, current_info)
+                    executed_action_vec = _discrete_action_vec(
+                        executed_action,
+                        outputs["action_vec"].shape[-1],
+                        device=self.device,
+                    )
+                    executed_selected_path = executed_action_vec.unsqueeze(0)
+                    executed_selected_posture_override = torch.zeros(
+                        1,
+                        model.actor.posture_dim,
+                        dtype=outputs["selected_posture"].dtype,
+                        device=self.device,
+                    )
+                    executed_selected_candidate_idx = [None]
+                if phase_cfg.use_memory:
+                    metadata = [
+                        {
+                            "execution_source": execution_source,
+                            "effective_epsilon": float(effective_epsilon),
+                            "candidate_total_std": float(candidate_total_std),
+                            "exploration_taken": bool(exploration_taken),
+                        }
+                    ]
+                    model.store_decision_records(
+                        outputs,
+                        metadata=metadata,
+                        action_vec_override=executed_action_vec.unsqueeze(0),
+                        selected_path_override=executed_selected_path.unsqueeze(0),
+                        selected_posture_override=executed_selected_posture_override,
+                        selected_candidate_idx_override=executed_selected_candidate_idx,
+                        step_override=int(outputs.get("decision_step", model._step_counter)),
+                    )
+                chosen_action = (
+                    executed_action[0] if torch.is_tensor(executed_action) else executed_action
+                )
                 next_observation, reward, terminated, truncated, info = adapter.step(chosen_action)
                 next_tokens, next_z = self._encode_latent(model, adapter, next_observation)
                 realized_cost = adapter.compute_realized_cost(
@@ -2179,10 +2494,23 @@ class UnifiedTrainingOrchestrator:
                     reward=reward,
                     cost=realized_cost,
                     done=bool(terminated or truncated),
-                    legal_actions_mask=adapter.legal_action_mask(observation, info),
+                    legal_actions_mask=adapter.legal_action_mask(observation, current_info),
+                    executed_action=executed_action,
+                    executed_action_vec=executed_action_vec,
+                    executed_selected_path=executed_selected_path,
+                    execution_source=execution_source,
+                    effective_epsilon=effective_epsilon,
+                    candidate_total_std=candidate_total_std,
+                    exploration_taken=exploration_taken,
                 )
                 record.next_domain_state = _clone_nested_cpu(adapter.build_domain_state(next_observation, info))
                 self.replay.add(record)
+                last_execution_metadata = {
+                    "execution_source": execution_source,
+                    "effective_epsilon": float(effective_epsilon),
+                    "candidate_total_std": float(candidate_total_std),
+                    "exploration_taken": bool(exploration_taken),
+                }
                 global_step += 1
                 if global_step % max(1, domain_cfg.optimizer_interval) == 0:
                     self._optimize_from_replay(
@@ -2222,8 +2550,12 @@ class UnifiedTrainingOrchestrator:
                     f"candidate_total_min={float(output_summary.get('candidate_total_min', 0.0)):.4f} "
                     f"candidate_total_mean={float(output_summary.get('candidate_total_mean', 0.0)):.4f} "
                     f"candidate_total_max={float(output_summary.get('candidate_total_max', 0.0)):.4f} "
+                    f"candidate_total_std={float(output_summary.get('candidate_total_std', 0.0)):.4f} "
                     f"memory_hits={int(output_summary.get('memory_hits', 0))} "
                     f"skills={int(output_summary.get('procedural_skill_count', 0))}"
+                    f" exec_src={last_execution_metadata['execution_source']}"
+                    f" eps={float(last_execution_metadata['effective_epsilon']):.4f}"
+                    f" explored={int(last_execution_metadata['exploration_taken'])}"
                     + (
                         f" mcts_reason={output_summary.get('planner_selection_reason', 'n/a')}"
                         f" sel_vs_base_pred={float(output_summary.get('selected_vs_baseline_predicted', 0.0)):.4f}"
@@ -2253,6 +2585,7 @@ class UnifiedTrainingOrchestrator:
                         "reward_mean100": mean(episode_rewards),
                         "episode_length_mean100": mean(episode_lengths),
                         "planner_debug": planner_debug,
+                        **last_execution_metadata,
                         **output_summary,
                     },
                 )
@@ -2388,10 +2721,13 @@ class UnifiedTrainingOrchestrator:
         try:
             print(
                 f"[{domain_cfg.name}] bootstrap_random_episodes={domain_cfg.bootstrap_random_episodes} "
-                f"bootstrap_pretrain_steps={domain_cfg.bootstrap_pretrain_steps}",
+                f"bootstrap_simple_episodes={domain_cfg.bootstrap_simple_episodes} "
+                f"bootstrap_pretrain_steps={domain_cfg.bootstrap_pretrain_steps} "
+                f"bootstrap_replay_warmup_steps={domain_cfg.bootstrap_replay_warmup_steps}",
                 flush=True,
             )
-            bootstrap_observations = self._collect_random_bootstrap(adapter, domain_cfg)
+            bootstrap_transitions = self._collect_bootstrap_trajectories(adapter, domain_cfg)
+            bootstrap_observations = self._bootstrap_observations(bootstrap_transitions)
             self._pretrain_hjepa(
                 domain_cfg.family,
                 adapter,
@@ -2402,6 +2738,12 @@ class UnifiedTrainingOrchestrator:
                 lr=1.0e-4,
             )
             model = self._build_model(domain_cfg, adapter)
+            self._seed_replay_from_bootstrap(model, adapter, domain_cfg, bootstrap_transitions)
+            self._bootstrap_replay_warmup(
+                model,
+                domain_cfg=domain_cfg,
+                steps=domain_cfg.bootstrap_replay_warmup_steps,
+            )
             representation_loss_fn = self._build_representation_loss(domain_cfg.family)
             domain_results: dict[str, Any] = {}
             ordered_phases = ("core_control", "episodic_memory", "sleep")

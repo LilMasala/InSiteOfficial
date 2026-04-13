@@ -525,7 +525,7 @@ class Connect4Domain(InteractiveDomainAdapter):
         observation: Any,
         info: dict[str, Any] | None = None,
     ) -> Any:
-        if kind == "greedy":
+        if kind in {"greedy", "simple"}:
             domain_state = self.build_domain_state(observation, info)
             for tensor_key in ("winning_actions", "blocking_actions"):
                 tensor = domain_state[tensor_key].reshape(-1)

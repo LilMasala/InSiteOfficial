@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from src.chamelia.cognitive.mamba_world_model import MambaActionConditionedWorldModel
@@ -387,7 +389,9 @@ def _tiny_orchestrator_config(run_dir: Path) -> OrchestratorConfig:
                 name="cartpole",
                 family="state_vector_hjepa",
                 bootstrap_random_episodes=1,
+                bootstrap_simple_episodes=1,
                 bootstrap_pretrain_steps=1,
+                bootstrap_replay_warmup_steps=1,
                 bootstrap_batch_size=1,
                 mask_ratio=0.25,
                 max_episode_steps=4,
@@ -433,6 +437,155 @@ def test_orchestrator_checkpoint_load_and_smoke_run(tmp_path: Path) -> None:
     assert isinstance(restored_model.world_model, MambaActionConditionedWorldModel)
     assert restored_model.domain_index is not None
     assert restored_model.domain_index.adapter_bank is not None
+    diagnostic_path = Path(config.run_dir) / "cartpole" / "diagnostics" / "sleep.jsonl"
+    progress_events = [
+        json.loads(line)
+        for line in diagnostic_path.read_text().splitlines()
+        if json.loads(line).get("kind") == "episode_progress"
+    ]
+    assert progress_events
+    assert "execution_source" in progress_events[-1]
+    assert "effective_epsilon" in progress_events[-1]
+    assert "candidate_total_std" in progress_events[-1]
+
+
+def test_bootstrap_trajectories_seed_replay_with_random_and_simple_sources(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "bootstrap_seed")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    domain_cfg = config.domains[0]
+    adapter = orchestrator._build_adapter(domain_cfg)
+    transitions = orchestrator._collect_bootstrap_trajectories(adapter, domain_cfg)
+
+    assert {transition.source for transition in transitions} == {
+        "bootstrap_random",
+        "bootstrap_simple",
+    }
+
+    model = orchestrator._build_model(domain_cfg, adapter)
+    orchestrator._seed_replay_from_bootstrap(model, adapter, domain_cfg, transitions)
+
+    replay_sources = {record.execution_source for record in orchestrator.replay.records}
+    assert replay_sources == {"bootstrap_random", "bootstrap_simple"}
+    assert all(record.selected_path is not None for record in orchestrator.replay.records)
+    assert model._step_counter == 0
+
+
+def test_bootstrap_seeded_replay_supports_replay_warmup_batches(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "bootstrap_warmup")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    domain_cfg = config.domains[0]
+    adapter = orchestrator._build_adapter(domain_cfg)
+    transitions = orchestrator._collect_bootstrap_trajectories(adapter, domain_cfg)
+    model = orchestrator._build_model(domain_cfg, adapter)
+    orchestrator._seed_replay_from_bootstrap(model, adapter, domain_cfg, transitions)
+
+    actor_batch = orchestrator.replay.sample(32, domain_id=domain_cfg.name, require_next_latent=False)
+    world_model_windows = orchestrator.replay.sample_windows(
+        32,
+        horizon=min(config.rollout_horizon, model.world_model.max_horizon),
+        domain_id=domain_cfg.name,
+    )
+    critic_windows = orchestrator.replay.sample_windows(32, horizon=2, domain_id=domain_cfg.name)
+
+    assert orchestrator._count_actor_valid(actor_batch) > 0
+    assert orchestrator._count_world_model_valid(world_model_windows) > 0
+    assert orchestrator._count_critic_valid(critic_windows, fallback_records=actor_batch) > 0
+
+    orchestrator._bootstrap_replay_warmup(
+        model,
+        domain_cfg=domain_cfg,
+        steps=1,
+    )
+
+
+def test_evaluate_model_never_uses_training_exploration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "eval_no_explore")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    domain_cfg = config.domains[0]
+    adapter = orchestrator._build_adapter(domain_cfg)
+    model = orchestrator._build_model(domain_cfg, adapter)
+    random_calls = 0
+    original_baseline_action = adapter.baseline_action
+
+    def tracked_baseline_action(kind: str, observation: object, info: dict[str, object] | None = None) -> object:
+        nonlocal random_calls
+        if kind == "random":
+            random_calls += 1
+        return original_baseline_action(kind, observation, info)
+
+    monkeypatch.setattr(adapter, "baseline_action", tracked_baseline_action)
+    metrics = orchestrator._evaluate_model(model, adapter, domain_cfg, episodes=1, ablation="full")
+
+    assert metrics["episodes"] == 1.0
+    assert random_calls == 0
+
+
+def test_training_exploration_override_records_executed_random_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "epsilon_override")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    domain_cfg = config.domains[0]
+    phase_cfg = DomainPhaseConfig(
+        episodes=1,
+        use_memory=True,
+        exploration_epsilon_start=1.0,
+        exploration_epsilon_end=1.0,
+        exploration_uncertainty_bonus=0.0,
+        exploration_uncertainty_std_threshold=0.0,
+    )
+    adapter = orchestrator._build_adapter(domain_cfg)
+    model = orchestrator._build_model(domain_cfg, adapter)
+    representation_loss_fn = orchestrator._build_representation_loss(domain_cfg.family)
+    original_baseline_action = adapter.baseline_action
+    original_forward = model.forward
+
+    def fixed_baseline_action(kind: str, observation: object, info: dict[str, object] | None = None) -> object:
+        if kind == "random":
+            return torch.tensor([1], dtype=torch.long)
+        return original_baseline_action(kind, observation, info)
+
+    def forced_forward(*args: object, **kwargs: object) -> dict[str, object]:
+        outputs = original_forward(*args, **kwargs)
+        device = outputs["action_vec"].device
+        dtype = outputs["action_vec"].dtype
+        outputs["action"] = torch.tensor([0], dtype=torch.long, device=device)
+        outputs["action_vec"] = torch.tensor([[1.0, 0.0]], dtype=dtype, device=device)
+        outputs["selected_path"] = torch.tensor([[[1.0, 0.0]]], dtype=dtype, device=device)
+        return outputs
+
+    monkeypatch.setattr(adapter, "baseline_action", fixed_baseline_action)
+    monkeypatch.setattr(model, "forward", forced_forward)
+
+    phase_metrics = orchestrator._run_phase(
+        phase_name="core_control",
+        phase_cfg=phase_cfg,
+        domain_cfg=domain_cfg,
+        adapter=adapter,
+        model=model,
+        representation_loss_fn=representation_loss_fn,
+    )
+
+    assert phase_metrics["phase_passed"] in {True, False}
+    replay_record = orchestrator.replay.records[-1]
+    assert replay_record.execution_source == "epsilon_random"
+    assert replay_record.exploration_taken
+    assert int(torch.as_tensor(replay_record.action).reshape(-1)[0].item()) == 1
+    assert int(replay_record.action_logits_or_vec.argmax().item()) == 1
+    assert replay_record.selected_path is not None
+    assert replay_record.selected_path.shape[0] == 1
+    assert int(replay_record.selected_path[0].argmax().item()) == 1
+
+    memory_record = model.memory.records[0]
+    assert memory_record.metadata is not None
+    assert memory_record.metadata["execution_source"] == "epsilon_random"
+    assert memory_record.metadata["exploration_taken"] is True
+    assert int(memory_record.action.argmax().item()) == 1
+    assert memory_record.selected_path is not None
+    assert memory_record.selected_path.shape[0] == 1
+    assert int(memory_record.selected_path[0].argmax().item()) == 1
+    assert memory_record.ic_realized is not None
 
 
 def test_mode2_actor_loss_uses_deliberate_path_not_mode1(tmp_path: Path) -> None:
@@ -553,6 +706,25 @@ def test_cartpole_simple_baseline_matches_fallback_dynamics() -> None:
     baseline = cartpole.build_simple_baseline_path(domain_state, path_length=3, action_dim=2)
     assert baseline is not None
     assert int(baseline[0, 0].argmax().item()) == 0
+
+
+def test_cartpole_simple_baseline_action_matches_path_heuristic() -> None:
+    cartpole = CartPoleDomain(embed_dim=16)
+    observation = torch.tensor([0.0, 0.0, 0.15, 0.0], dtype=torch.float32)
+
+    simple_action = cartpole.baseline_action("simple", observation, None)
+
+    assert int(simple_action.reshape(-1)[0].item()) == 0
+
+
+def test_connect4_simple_baseline_aliases_greedy() -> None:
+    connect4 = Connect4Domain(embed_dim=16)
+    observation, info = connect4.reset(seed=13)
+
+    simple_action = connect4.baseline_action("simple", observation, info)
+    greedy_action = connect4.baseline_action("greedy", observation, info)
+
+    assert int(simple_action.reshape(-1)[0].item()) == int(greedy_action.reshape(-1)[0].item())
 
 
 def test_cartpole_planner_diagnostics_flag_selected_branch_that_loses_to_baseline() -> None:
