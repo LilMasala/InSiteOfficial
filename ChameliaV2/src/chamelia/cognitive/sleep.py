@@ -186,10 +186,20 @@ class LOVEDecomposer:
         num_traces: int,
     ) -> float:
         avg_quality = stats.total_quality / max(stats.count, 1)
-        frequency_surrogate = math.log1p(stats.count) + math.log((len(stats.episode_ids) + 1.0) / (num_traces + 1.0))
+        avg_utility = stats.total_utility / max(stats.count, 1)
+        cross_episode_coverage = len(stats.episode_ids) / max(1.0, float(num_traces))
+        frequency_surrogate = math.log1p(stats.count)
         compression_gain = max(0.0, float(len(fragment) - 1))
         description_length = float(len(fragment))
-        return frequency_surrogate + compression_gain + (0.1 * avg_quality) - (self.beta * description_length)
+        predictive_usefulness = max(avg_quality, avg_utility)
+        return (
+            (0.40 * avg_quality)
+            + (0.25 * predictive_usefulness)
+            + (0.20 * cross_episode_coverage)
+            + (0.10 * frequency_surrogate)
+            + (0.05 * compression_gain)
+            - (self.beta * description_length)
+        )
 
     def _partition_trace(
         self,
@@ -1290,6 +1300,8 @@ class SleepCoordinator:
         domain_index: DomainIndex | None = None,
         sleep_interval_steps: int = 32,
         autodoc_worker: GemmaAutoDocWorker | None = None,
+        fasttrack_return_threshold: float = 0.5,
+        fasttrack_surprise_threshold: float = 0.35,
     ) -> None:
         self.episodic_memory = episodic_memory
         self.procedural_memory = procedural_memory
@@ -1304,6 +1316,8 @@ class SleepCoordinator:
         self.choreographer = ChoreographerEvaluator()
         self.rsd = RSDAdversary()
         self.autodoc = LILOAutoDoc(worker=autodoc_worker)
+        self.fasttrack_return_threshold = float(fasttrack_return_threshold)
+        self.fasttrack_surprise_threshold = float(fasttrack_surprise_threshold)
         self._pending = threading.Event()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
@@ -1361,6 +1375,80 @@ class SleepCoordinator:
             target_delta=None,
             source_weight=float(segment.score),
             source_episodes=segment.source_episodes,
+        )
+
+    def maybe_fasttrack_record(
+        self,
+        record: Any,
+        *,
+        utility_score: float,
+        surprise_score: float,
+    ) -> SkillPromotion | None:
+        selected_path = getattr(record, "selected_path", None)
+        if selected_path is None:
+            return None
+        should_promote = (
+            float(utility_score) >= self.fasttrack_return_threshold
+            or (
+                float(surprise_score) >= self.fasttrack_surprise_threshold
+                and float(utility_score) > 0.0
+            )
+        )
+        if not should_promote:
+            return None
+        candidate = LatentSkillCandidate(
+            action_path=selected_path.detach().float().cpu(),
+            symbolic_codes=None,
+            target_delta=(
+                getattr(record, "outcome_key", None).detach().float().cpu() - record.key.detach().float().cpu()
+                if getattr(record, "outcome_key", None) is not None
+                else None
+            ),
+            source_weight=max(float(utility_score), float(surprise_score)),
+            source_episodes=(int(getattr(record, "record_id", 0)),),
+        )
+        embedding = self.latent_action_encoder.encode_candidate(candidate).detach().float().cpu().squeeze(0)
+        retrieved = self.procedural_memory.retrieve(
+            embedding,
+            k=1,
+            domain_name=getattr(record, "domain_name", None),
+        )
+        extras = {
+            "promotion_source": "online_fasttrack",
+            "utility_score": float(utility_score),
+            "surprise_score": float(surprise_score),
+        }
+        if retrieved and float(retrieved[0].similarity) >= 0.985:
+            matched = self.procedural_memory.get_skill(retrieved[0].record.skill_id)
+            if matched is None:
+                return None
+            updated_confidence = max(float(matched.confidence), 0.35 + (0.1 * min(1.0, float(utility_score))))
+            self.procedural_memory.update_confidence(matched.skill_id, updated_confidence)
+            self.procedural_memory.update_extras(matched.skill_id, extras)
+            refreshed = self.procedural_memory.get_skill(matched.skill_id)
+            if refreshed is None:
+                return None
+            return SkillPromotion(
+                record=refreshed,
+                evaluation_score=max(float(utility_score), float(surprise_score)),
+                source="online_fasttrack",
+            )
+        name, description = self.autodoc.describe(candidate, ordinal=1)
+        promoted_record = self.procedural_memory.add_skill(
+            embedding=embedding,
+            action_path=selected_path.detach().float().cpu(),
+            source_episodes=(int(getattr(record, "record_id", 0)),),
+            constraints={"utility_score": float(utility_score)},
+            confidence=0.35 + (0.1 * min(1.0, float(utility_score))),
+            name=name,
+            description=description,
+            domain_name=getattr(record, "domain_name", None),
+            extras=extras,
+        )
+        return SkillPromotion(
+            record=promoted_record,
+            evaluation_score=max(float(utility_score), float(surprise_score)),
+            source="online_fasttrack",
         )
 
     def _bodegen_candidates(
@@ -1512,6 +1600,11 @@ class SleepCoordinator:
         for ordinal, (candidate, evaluation_score) in enumerate(evaluated[:8], start=1):
             embedding = self.latent_action_encoder.encode_candidate(candidate).squeeze(0)
             name, description = self.autodoc.describe(candidate, ordinal)
+            prior_match = self.procedural_memory.retrieve(
+                embedding.detach().float().cpu(),
+                k=1,
+                domain_name=records[0].domain_name if records else None,
+            )
             record = self.procedural_memory.add_skill(
                 embedding=embedding,
                 action_path=candidate.action_path,
@@ -1535,6 +1628,15 @@ class SleepCoordinator:
                     ),
                 },
             )
+            if prior_match:
+                matched = self.procedural_memory.get_skill(prior_match[0].record.skill_id)
+                if (
+                    matched is not None
+                    and matched.skill_id != record.skill_id
+                    and str(matched.extras.get("promotion_source", "")) == "online_fasttrack"
+                    and float(prior_match[0].similarity) >= 0.985
+                ):
+                    self.procedural_memory.deprecate(matched.skill_id, record.skill_id)
             for source_episode in candidate.source_episodes:
                 compiled_signatures.add((float(source_episode),))
             if self.domain_index is not None and records:

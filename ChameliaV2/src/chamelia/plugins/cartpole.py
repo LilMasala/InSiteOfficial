@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -70,6 +71,32 @@ class _ToyCartPoleEnv:
         return self._state.as_tensor(), reward, terminated, truncated, {}
 
 
+class _CartPoleTeacherMLP(nn.Module):
+    """Small exported expert policy head for CartPole teacher rollouts."""
+
+    def __init__(
+        self,
+        *,
+        hidden_dims: tuple[int, ...] = (64, 64),
+        input_dim: int = 4,
+        output_dim: int = 2,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        width = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(width, int(hidden_dim)))
+            layers.append(nn.Tanh())
+            width = int(hidden_dim)
+        layers.append(nn.Linear(width, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        if observation.dim() == 1:
+            observation = observation.unsqueeze(0)
+        return self.net(observation.float())
+
+
 class CartPoleDomain(InteractiveDomainAdapter):
     """Discrete CartPole adapter backed by Gymnasium when available."""
 
@@ -79,7 +106,14 @@ class CartPoleDomain(InteractiveDomainAdapter):
     _TRUE_THETA_THRESHOLD = 12 * 2 * math.pi / 360
     _TOY_THETA_THRESHOLD = 0.35
 
-    def __init__(self, *, embed_dim: int = 128, max_steps: int = 500) -> None:
+    def __init__(
+        self,
+        *,
+        embed_dim: int = 128,
+        max_steps: int = 500,
+        teacher_policy_path: str | None = None,
+        teacher_hidden_dims: tuple[int, ...] = (64, 64),
+    ) -> None:
         self.max_steps = max_steps
         self._tokenizer = StateVectorTokenizer(
             num_features=4,
@@ -94,6 +128,13 @@ class CartPoleDomain(InteractiveDomainAdapter):
         self._env = gym.make("CartPole-v1", max_episode_steps=max_steps) if gym is not None else _ToyCartPoleEnv(max_steps=max_steps)
         self._last_observation: torch.Tensor | None = None
         self._episode_steps = 0
+        self._teacher_policy_path = teacher_policy_path
+        self._teacher_hidden_dims = tuple(int(value) for value in teacher_hidden_dims)
+        self._teacher_policy: nn.Module | None = None
+        self._teacher_policy_loaded = False
+        self._teacher_linear_weight = torch.tensor([0.75, 1.35, 12.0, 2.25], dtype=torch.float32)
+        self._teacher_linear_bias = torch.tensor(0.0, dtype=torch.float32)
+        self.configure_teacher_policy(teacher_policy_path)
 
     def get_tokenizer(self) -> StateVectorTokenizer:
         return self._tokenizer
@@ -160,6 +201,13 @@ class CartPoleDomain(InteractiveDomainAdapter):
         margin_penalty = 0.25 * F.relu(0.05 - stability_margin).pow(2)
         return centered + velocity + action_bias + risk_buffer_penalty + terminal_risk_penalty + margin_penalty
 
+    def _compute_step_reward_from_state(self, state: torch.Tensor) -> torch.Tensor:
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        features = self._derive_state_features(state.float())
+        termination_ratio = features["termination_ratio"]
+        return (termination_ratio < 1.0).to(state.dtype)
+
     def decode_action(self, action_vec: torch.Tensor) -> Any:
         if action_vec.dim() == 1:
             action_vec = action_vec.unsqueeze(0)
@@ -174,7 +222,14 @@ class CartPoleDomain(InteractiveDomainAdapter):
                 state = state_value.float().to(action.device)
                 if state.dim() == 1:
                     state = state.unsqueeze(0)
-            return self._compute_stability_cost_from_state(state, action)
+            reward_value = domain_state.get("step_reward")
+            if reward_value is None:
+                reward = self._compute_step_reward_from_state(state).to(action.device)
+            else:
+                reward = reward_value.float().to(action.device)
+                if reward.dim() == 0:
+                    reward = reward.unsqueeze(0)
+            return self._compute_stability_cost_from_state(state, action) - reward
 
         return [(stability_cost, 1.0)]
 
@@ -193,6 +248,7 @@ class CartPoleDomain(InteractiveDomainAdapter):
         approx_state = self.decode_state_from_latent(future_z)
         imagined_state = dict(current_domain_state)
         imagined_state["state_vector"] = approx_state
+        imagined_state["step_reward"] = self._compute_step_reward_from_state(approx_state)
         imagined_state.update(self._derive_state_features(approx_state))
         return imagined_state
 
@@ -306,6 +362,7 @@ class CartPoleDomain(InteractiveDomainAdapter):
             state = state.unsqueeze(0)
         payload = {
             "state_vector": state,
+            "step_reward": self._compute_step_reward_from_state(state),
         }
         payload.update(self._derive_state_features(state))
         if info:
@@ -325,6 +382,85 @@ class CartPoleDomain(InteractiveDomainAdapter):
         if state.dim() == 2:
             return state.mean(dim=0)
         return state
+
+    def configure_teacher_policy(self, path: str | None) -> None:
+        self._teacher_policy = None
+        self._teacher_policy_path = path
+        self._teacher_policy_loaded = False
+        if path is None:
+            return
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        if isinstance(payload, dict) and "linear_weight" in payload:
+            self._teacher_linear_weight = torch.as_tensor(
+                payload["linear_weight"],
+                dtype=torch.float32,
+            ).reshape(-1)[:4]
+            if "linear_bias" in payload:
+                self._teacher_linear_bias = torch.as_tensor(
+                    payload["linear_bias"],
+                    dtype=torch.float32,
+                ).reshape(()).float()
+            self._teacher_policy_loaded = True
+            return
+        hidden_dims = tuple(
+            int(value)
+            for value in (
+                payload.get("hidden_dims", self._teacher_hidden_dims)
+                if isinstance(payload, dict)
+                else self._teacher_hidden_dims
+            )
+        )
+        state_dict = None
+        if isinstance(payload, dict):
+            state_dict = (
+                payload.get("teacher_policy_state_dict")
+                or payload.get("model_state_dict")
+                or payload.get("state_dict")
+            )
+        elif isinstance(payload, nn.Module):
+            self._teacher_policy = payload.eval()
+            self._teacher_policy_loaded = True
+            return
+        if state_dict is None:
+            raise ValueError(
+                f"Unsupported CartPole teacher checkpoint format at '{path}'."
+            )
+        model = _CartPoleTeacherMLP(hidden_dims=hidden_dims)
+        model.load_state_dict(state_dict)
+        model.eval()
+        self._teacher_policy = model
+        self._teacher_policy_loaded = True
+
+    def has_teacher_policy(self) -> bool:
+        return True
+
+    def bootstrap_summary_thresholds(self) -> tuple[float, ...]:
+        return (20.0, 50.0, 100.0, 195.0)
+
+    def teacher_action(
+        self,
+        observation: Any,
+        info: dict[str, Any] | None = None,
+    ) -> Any:
+        _ = info
+        state = self.prepare_bridge_observation(observation).float()
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        with torch.no_grad():
+            if self._teacher_policy is not None:
+                logits = self._teacher_policy(state)
+                return logits.argmax(dim=-1)
+            if not self._teacher_policy_loaded:
+                domain_state = self.build_domain_state(observation, info)
+                baseline_path = self.build_simple_baseline_path(
+                    domain_state,
+                    path_length=1,
+                    action_dim=self.get_action_dim(),
+                )
+                if baseline_path is not None:
+                    return baseline_path[:, 0, :].argmax(dim=-1)
+            score = (state * self._teacher_linear_weight.view(1, -1)).sum(dim=-1) + self._teacher_linear_bias
+            return (score < 0.0).long()
 
     def reset(self, seed: int | None = None) -> tuple[Any, dict[str, Any]]:
         observation, info = self._env.reset(seed=seed)
@@ -359,6 +495,8 @@ class CartPoleDomain(InteractiveDomainAdapter):
             )
             if baseline_path is not None:
                 return baseline_path[:, 0, :].argmax(dim=-1)
+        if kind == "teacher":
+            return self.teacher_action(observation, info)
         return super().baseline_action(kind, observation, info)
 
     def compute_realized_cost(

@@ -242,20 +242,24 @@ def test_domain_index_and_lora_bank_apply_cluster(tmp_path: Path) -> None:
     model = TinyModel()
     bank = LoRAAdapterBank(model, rank=2)
     index = DomainIndex(tmp_path / "domains", adapter_bank=bank)
-    route = index.route(torch.randn(8), "dummy")
+    seed_latent = torch.randn(8)
+    route = index.route(seed_latent, "dummy")
     index.record_skill_trigger(route.cluster_id, skill_id=3, weight=1.25)
     bank.ensure_cluster(route.cluster_id)
     for adapter in bank.adapters[route.cluster_id].values():
         adapter.out_proj_b.fill_(0.05)
         adapter.out_proj_a.fill_(0.05)
+    second_route = index.route(seed_latent * 0.99, "dummy")
 
     inputs = torch.randn(1, 4, 8)
     baseline = model.attn(inputs, inputs, inputs)[0]
-    bank.apply_cluster(route.cluster_id)
+    bank.apply_mixture(second_route.mixture_cluster_ids, second_route.mixture_weights)
     adapted = model.attn(inputs, inputs, inputs)[0]
 
     assert route.spawned_new
     assert 3 in index.get_trigger_weights(route.cluster_id)
+    assert second_route.primary_cluster_id == route.cluster_id
+    assert abs(sum(second_route.mixture_weights) - 1.0) < 1.0e-6
     assert not torch.allclose(baseline, adapted)
 
 
@@ -355,6 +359,68 @@ def test_mcts_reuses_selected_subtree_as_new_root(tmp_path: Path) -> None:
     assert result.root.path_from_parent is None
 
 
+def test_mcts_budget_multiplier_scales_simulation_budget(tmp_path: Path) -> None:
+    model, _domain, _memory, _procedural = _build_chamelia(tmp_path)
+    assert model.mcts_search is not None
+
+    class ExpandCounter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(
+            self,
+            node: MCTSNode,
+            *,
+            domain_state: dict[str, torch.Tensor],
+            retrieved_postures: torch.Tensor | None = None,
+            retrieved_posture_scores: torch.Tensor | None = None,
+            skill_seed_path: torch.Tensor | None = None,
+        ) -> None:
+            _ = domain_state
+            _ = retrieved_postures
+            _ = retrieved_posture_scores
+            _ = skill_seed_path
+            self.calls += 1
+            if node.expanded:
+                return
+            node.candidate_paths = torch.zeros(2, 3, model.actor.action_dim)
+            node.candidate_costs = torch.tensor([0.5, 0.25], dtype=torch.float32)
+            node.candidate_ic = torch.zeros(2, dtype=torch.float32)
+            node.candidate_tc = torch.zeros(2, dtype=torch.float32)
+            node.candidate_postures = torch.zeros(2, model.actor.posture_dim)
+            node.candidate_reasoning_states = torch.zeros(2, model.actor.embed_dim)
+            node.candidate_terminal_latents = torch.zeros(2, model.actor.embed_dim)
+            node.candidate_trajectories = torch.zeros(2, 3, model.actor.embed_dim)
+            node.expanded = True
+            node.children = [
+                MCTSNode(
+                    latent_state=torch.zeros(model.actor.embed_dim),
+                    ctx_tokens=torch.zeros(4, model.actor.embed_dim),
+                    depth=node.depth + 1,
+                    path_from_parent=node.candidate_paths[idx],
+                    immediate_cost=float(node.candidate_costs[idx].item()),
+                )
+                for idx in range(2)
+            ]
+
+    counter = ExpandCounter()
+    model.mcts_search._expand_node = counter  # type: ignore[assignment]
+    result = model.mcts_search.search(
+        z=torch.zeros(model.actor.embed_dim),
+        ctx_tokens=torch.zeros(4, model.actor.embed_dim),
+        domain_state={},
+        goal_z=None,
+        retrieved_postures=None,
+        retrieved_posture_scores=None,
+        retrieved_skills=[],
+        budget_multiplier=1.75,
+    )
+
+    assert result.tree_trace["simulation_budget"] == 7
+    assert result.tree_trace["budget_multiplier"] == 1.75
+    assert counter.calls >= 1
+
+
 def test_mcts_planner_and_talker_harness(tmp_path: Path) -> None:
     torch.manual_seed(0)
     model, _domain, _memory, procedural = _build_chamelia(tmp_path)
@@ -420,6 +486,70 @@ def test_sleep_cycle_promotes_skills_from_toy_memory(tmp_path: Path) -> None:
     assert len(report.promotions) >= 1
     assert len(procedural.records) >= 1
     assert memory.size <= 3
+
+
+def test_sleep_fasttrack_promotes_without_waiting_for_sleep_cycle(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model, _domain, memory, procedural = _build_chamelia(tmp_path)
+    encoder = LatentActionEncoder(action_dim=8, skill_dim=32, num_heads=4, num_layers=1, max_path_length=4)
+    sleep = SleepCoordinator(
+        episodic_memory=memory,
+        procedural_memory=procedural,
+        latent_action_encoder=encoder,
+        world_model=model.world_model,
+        cost_module=model.cost,
+        sleep_interval_steps=999,
+        fasttrack_return_threshold=0.5,
+        fasttrack_surprise_threshold=0.1,
+    )
+    record = EpisodeRecord(
+        key=torch.randn(32),
+        action=torch.tensor([0.0, 1.0] + [0.0] * 6),
+        ctx_tokens=torch.randn(4, 32),
+        ic_at_decision=0.1,
+        ic_realized=-1.5,
+        tc_predicted=0.0,
+        outcome_key=torch.randn(32),
+        step=0,
+        domain_name="toy",
+        selected_posture=torch.randn(8),
+        selected_path=torch.randn(3, 8),
+        record_id=7,
+    )
+    memory.store(record)
+
+    promotion = sleep.maybe_fasttrack_record(record, utility_score=1.0, surprise_score=0.5)
+
+    assert promotion is not None
+    assert promotion.source == "online_fasttrack"
+    assert len(procedural.records) == 1
+    promoted_record = next(iter(procedural.records.values()))
+    assert promoted_record.extras["promotion_source"] == "online_fasttrack"
+
+
+def test_love_decomposer_prefers_rare_high_quality_fragment() -> None:
+    decomposer = LOVEDecomposer(min_frequency=1, max_segment_length=2)
+    library: dict[tuple[int, ...], LOVEDecomposer._FragmentStats] = {
+        (1, 1): LOVEDecomposer._FragmentStats(
+            count=4,
+            total_quality=0.4,
+            total_utility=0.4,
+            episode_ids={1, 2, 3, 4},
+            paths=[torch.zeros(2, 2) for _ in range(4)],
+        ),
+        (9, 9): LOVEDecomposer._FragmentStats(
+            count=1,
+            total_quality=5.0,
+            total_utility=5.0,
+            episode_ids={8},
+            paths=[torch.ones(2, 2)],
+        ),
+    }
+
+    common_score = decomposer._segment_utility((1, 1), library[(1, 1)], num_traces=5)
+    rare_high_value_score = decomposer._segment_utility((9, 9), library[(9, 9)], num_traces=5)
+
+    assert rare_high_value_score > common_score
 
 
 def test_phase6_scaffolds_smoke(tmp_path: Path) -> None:

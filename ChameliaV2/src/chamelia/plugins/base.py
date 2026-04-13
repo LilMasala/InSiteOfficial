@@ -226,6 +226,22 @@ class AbstractDomain(ABC):
         _ = step_idx
         return None
 
+    def score_transition_utility(
+        self,
+        observation: Any,
+        reward: float,
+        cost: float,
+        terminated: bool,
+        truncated: bool,
+        info: dict[str, Any] | None = None,
+    ) -> float:
+        """Score one executed transition for utility-led promotion decisions."""
+        _ = observation
+        _ = terminated
+        _ = truncated
+        _ = info
+        return float(reward) - float(cost)
+
     def analyze_planner_candidates(
         self,
         *,
@@ -445,6 +461,28 @@ class InteractiveDomainAdapter(AbstractDomain):
         rewards = [float(record.get("episode_reward", 0.0)) for record in episode_records]
         return {"episode_reward_mean": sum(rewards) / len(rewards)}
 
+    def configure_teacher_policy(self, path: str | None) -> None:
+        """Optionally load or configure a teacher policy for observational rollouts."""
+        _ = path
+
+    def has_teacher_policy(self) -> bool:
+        """Return whether the adapter can provide teacher actions."""
+        return False
+
+    def teacher_action(
+        self,
+        observation: Any,
+        info: dict[str, Any] | None = None,
+    ) -> Any:
+        """Return one teacher action when the domain exposes an expert policy."""
+        _ = observation
+        _ = info
+        raise ValueError(f"Domain '{self.domain_name}' does not expose a teacher policy.")
+
+    def bootstrap_summary_thresholds(self) -> tuple[float, ...]:
+        """Return reward/length thresholds worth reporting during bootstrap."""
+        return ()
+
     def baseline_action(
         self,
         kind: str,
@@ -457,6 +495,8 @@ class InteractiveDomainAdapter(AbstractDomain):
         """
         _ = observation
         legal_mask = self.legal_action_mask(observation, info)
+        if kind == "teacher":
+            return self.teacher_action(observation, info)
         if kind != "random":
             raise ValueError(f"Unsupported baseline '{kind}' for domain '{self.domain_name}'.")
         if self.action_space_type != "discrete":

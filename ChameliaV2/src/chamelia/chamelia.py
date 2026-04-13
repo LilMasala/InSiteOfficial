@@ -708,6 +708,7 @@ class Chamelia(nn.Module):
         retrieved_skills: list[RetrievedSkill],
         retrieved_postures: torch.Tensor | None = None,
         retrieved_posture_scores: torch.Tensor | None = None,
+        budget_multiplier: float = 1.0,
     ) -> dict[str, Any]:
         """Run either direct-skill execution or MCTS for one sample."""
         system1 = self._run_system1_skill(
@@ -729,6 +730,7 @@ class Chamelia(nn.Module):
             retrieved_postures=retrieved_postures,
             retrieved_posture_scores=retrieved_posture_scores,
             retrieved_skills=retrieved_skills,
+            budget_multiplier=budget_multiplier,
         )
         planner_diagnostics = self.domain.analyze_planner_candidates(
             candidate_paths=result.candidate_paths.detach(),
@@ -749,6 +751,9 @@ class Chamelia(nn.Module):
         if planner_diagnostics is not None:
             tree_trace["counterfactual"] = planner_diagnostics
         zero_rollout = {
+            "trajectory": result.candidate_trajectories.unsqueeze(0)
+            if result.candidate_trajectories is not None
+            else None,
             "terminal_latents": result.candidate_terminal_latents.unsqueeze(0)
             if result.candidate_terminal_latents is not None
             else None,
@@ -901,13 +906,16 @@ class Chamelia(nn.Module):
                         z[batch_idx].detach(),
                         self.domain.domain_name,
                     )
-                    planner_cluster_ids[batch_idx] = route.cluster_id
-                    trigger_weights = self.domain_index.get_trigger_weights(route.cluster_id)
+                    planner_cluster_ids[batch_idx] = route.primary_cluster_id
+                    trigger_weights = self.domain_index.get_route_trigger_weights(route)
                     if (
                         self.domain_index.adapter_bank is not None
                         and z.shape[0] == 1
                     ):
-                        self.domain_index.adapter_bank.apply_cluster(route.cluster_id)
+                        self.domain_index.adapter_bank.apply_mixture(
+                            route.mixture_cluster_ids,
+                            route.mixture_weights,
+                        )
                 retrieved_skills = (
                     self.procedural_memory.retrieve(
                         z[batch_idx].detach(),
@@ -941,6 +949,7 @@ class Chamelia(nn.Module):
                     retrieved_skills=retrieved_skills,
                     retrieved_postures=retrieved_postures_i,
                     retrieved_posture_scores=retrieved_posture_scores_i,
+                    budget_multiplier=float(domain_state_i.get("_planner_budget_multiplier", 1.0)),
                 )
                 planner_results.append(result)
                 planner_skill_traces[batch_idx] = result["skill_trace"]

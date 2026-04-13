@@ -187,6 +187,7 @@ class MCTSNode:
     candidate_postures: torch.Tensor | None = None
     candidate_reasoning_states: torch.Tensor | None = None
     candidate_terminal_latents: torch.Tensor | None = None
+    candidate_trajectories: torch.Tensor | None = None
     children: list["MCTSNode"] = field(default_factory=list)
 
     @property
@@ -216,6 +217,7 @@ class MCTSResult:
     candidate_postures: torch.Tensor | None
     candidate_reasoning_states: torch.Tensor | None
     candidate_terminal_latents: torch.Tensor | None
+    candidate_trajectories: torch.Tensor | None
     selected_candidate_idx: int
     root: MCTSNode
     reasoning_chain: FrozenReasoningChain
@@ -407,6 +409,7 @@ class MCTSSearch:
         node.candidate_postures = candidate_postures[0].detach()
         node.candidate_reasoning_states = reasoning_states[0].detach()
         node.candidate_terminal_latents = rollout["terminal_latents"][0].detach()
+        node.candidate_trajectories = rollout["trajectory"][0].detach()
         node.expanded = True
         node.children = []
         for idx in range(candidate_paths.shape[1]):
@@ -529,14 +532,17 @@ class MCTSSearch:
         retrieved_postures: torch.Tensor | None = None,
         retrieved_posture_scores: torch.Tensor | None = None,
         retrieved_skills: list[RetrievedSkill] | None = None,
+        budget_multiplier: float = 1.0,
     ) -> MCTSResult:
         root, reused_tree = self._maybe_reuse_root(z.detach(), ctx_tokens.detach())
+        bounded_multiplier = max(0.5, min(4.0, float(budget_multiplier)))
+        simulation_budget = max(1, int(round(float(self.simulations) * bounded_multiplier)))
         skill_seed_path = self._make_skill_seed(
             z=z.detach(),
             goal_z=goal_z.detach() if goal_z is not None else None,
             retrieved_skills=retrieved_skills,
         )
-        for _ in range(self.simulations):
+        for _ in range(simulation_budget):
             node = root
             selection_path = [root]
             while node.expanded and node.children and node.depth < self.max_depth:
@@ -583,6 +589,8 @@ class MCTSSearch:
         tree_trace = export_tree(root)
         tree_trace["selected_candidate_idx"] = int(best_idx)
         tree_trace["selection_debug"] = selection_debug
+        tree_trace["budget_multiplier"] = bounded_multiplier
+        tree_trace["simulation_budget"] = simulation_budget
         tree_trace["root_candidate_costs"] = [float(value) for value in root.candidate_costs.tolist()]
         if root.candidate_ic is not None:
             tree_trace["root_candidate_ic"] = [float(value) for value in root.candidate_ic.tolist()]
@@ -608,6 +616,11 @@ class MCTSSearch:
             candidate_terminal_latents=(
                 root.candidate_terminal_latents.detach()
                 if root.candidate_terminal_latents is not None
+                else None
+            ),
+            candidate_trajectories=(
+                root.candidate_trajectories.detach()
+                if root.candidate_trajectories is not None
                 else None
             ),
             selected_candidate_idx=best_idx,

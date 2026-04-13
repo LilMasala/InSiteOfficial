@@ -48,9 +48,15 @@ class DomainCluster:
 class DomainRoute:
     """Routing decision for a latent state."""
 
-    cluster_id: int
+    primary_cluster_id: int
+    mixture_cluster_ids: tuple[int, ...]
+    mixture_weights: tuple[float, ...]
     confidence: float
     spawned_new: bool
+
+    @property
+    def cluster_id(self) -> int:
+        return self.primary_cluster_id
 
 
 class LoRAAdapterBank:
@@ -71,6 +77,7 @@ class LoRAAdapterBank:
         }
         self.adapters: dict[int, dict[str, AttentionLoRAAdapter]] = {}
         self.active_cluster_id: int | None = None
+        self.active_mixture: tuple[tuple[int, float], ...] = ()
 
     def ensure_cluster(self, cluster_id: int) -> None:
         if cluster_id in self.adapters:
@@ -119,16 +126,21 @@ class LoRAAdapterBank:
             adapter.out_proj_a = out_vh[:rank, :]
 
     def clear_active(self) -> None:
-        if self.active_cluster_id is None:
+        if self.active_cluster_id is None and not self.active_mixture:
             return
-        adapters = self.adapters.get(self.active_cluster_id, {})
         for name, module in self.attention_modules.items():
-            adapter = adapters.get(name)
-            if adapter is None:
-                continue
-            module.in_proj_weight.data.sub_(adapter.delta_in_proj().to(module.in_proj_weight))
-            module.out_proj.weight.data.sub_(adapter.delta_out_proj().to(module.out_proj.weight))
+            in_delta = torch.zeros_like(module.in_proj_weight.data)
+            out_delta = torch.zeros_like(module.out_proj.weight.data)
+            for cluster_id, weight in self.active_mixture:
+                adapter = self.adapters.get(int(cluster_id), {}).get(name)
+                if adapter is None:
+                    continue
+                in_delta.add_(float(weight) * adapter.delta_in_proj().to(in_delta))
+                out_delta.add_(float(weight) * adapter.delta_out_proj().to(out_delta))
+            module.in_proj_weight.data.sub_(in_delta)
+            module.out_proj.weight.data.sub_(out_delta)
         self.active_cluster_id = None
+        self.active_mixture = ()
 
     def apply_cluster(self, cluster_id: int) -> None:
         cluster_id = int(cluster_id)
@@ -141,6 +153,36 @@ class LoRAAdapterBank:
             module.in_proj_weight.data.add_(adapter.delta_in_proj().to(module.in_proj_weight))
             module.out_proj.weight.data.add_(adapter.delta_out_proj().to(module.out_proj.weight))
         self.active_cluster_id = cluster_id
+        self.active_mixture = ((cluster_id, 1.0),)
+
+    def apply_mixture(
+        self,
+        cluster_ids: tuple[int, ...],
+        weights: tuple[float, ...],
+    ) -> None:
+        if not cluster_ids:
+            self.clear_active()
+            return
+        if len(cluster_ids) == 1:
+            self.apply_cluster(cluster_ids[0])
+            return
+        self.clear_active()
+        for cluster_id in cluster_ids:
+            self.ensure_cluster(int(cluster_id))
+        for name, module in self.attention_modules.items():
+            in_delta = torch.zeros_like(module.in_proj_weight.data)
+            out_delta = torch.zeros_like(module.out_proj.weight.data)
+            for cluster_id, weight in zip(cluster_ids, weights, strict=False):
+                adapter = self.adapters[int(cluster_id)][name]
+                in_delta.add_(float(weight) * adapter.delta_in_proj().to(in_delta))
+                out_delta.add_(float(weight) * adapter.delta_out_proj().to(out_delta))
+            module.in_proj_weight.data.add_(in_delta)
+            module.out_proj.weight.data.add_(out_delta)
+        self.active_cluster_id = int(cluster_ids[0])
+        self.active_mixture = tuple(
+            (int(cluster_id), float(weight))
+            for cluster_id, weight in zip(cluster_ids, weights, strict=False)
+        )
 
     def serialize_cluster(self, cluster_id: int) -> bytes:
         self.ensure_cluster(cluster_id)
@@ -179,12 +221,14 @@ class DomainIndex:
         similarity_scale: float = 6.0,
         spawn_threshold: float = 0.45,
         adapter_bank: LoRAAdapterBank | None = None,
+        top_k: int = 2,
     ) -> None:
         self.storage = CognitiveStorage(storage_root)
         self.concentration = concentration
         self.similarity_scale = similarity_scale
         self.spawn_threshold = spawn_threshold
         self.adapter_bank = adapter_bank
+        self.top_k = max(1, int(top_k))
         self.clusters: dict[int, DomainCluster] = {}
         self._load()
 
@@ -230,7 +274,13 @@ class DomainIndex:
         new_cluster_score = torch.tensor(float(self.concentration), dtype=torch.float32).log()
         if scores.numel() == 0:
             cluster_id = self._spawn_cluster(z, domain_name)
-            return DomainRoute(cluster_id=cluster_id, confidence=1.0, spawned_new=True)
+            return DomainRoute(
+                primary_cluster_id=cluster_id,
+                mixture_cluster_ids=(cluster_id,),
+                mixture_weights=(1.0,),
+                confidence=1.0,
+                spawned_new=True,
+            )
         best_score, best_idx = scores.max(dim=0)
         best_cluster_id = candidate_ids[int(best_idx.item())]
         best_cluster = self.clusters[best_cluster_id]
@@ -241,10 +291,24 @@ class DomainIndex:
         )
         if float(best_similarity.item()) < self.spawn_threshold and float(new_cluster_score.item()) >= float(best_score.item() - 1.0):
             cluster_id = self._spawn_cluster(z, domain_name)
-            return DomainRoute(cluster_id=cluster_id, confidence=1.0, spawned_new=True)
-        self._update_cluster(best_cluster_id, z)
+            return DomainRoute(
+                primary_cluster_id=cluster_id,
+                mixture_cluster_ids=(cluster_id,),
+                mixture_weights=(1.0,),
+                confidence=1.0,
+                spawned_new=True,
+            )
+        top_k = min(self.top_k, len(candidate_ids))
+        top_scores, top_indices = torch.topk(scores, k=top_k)
+        mixture_cluster_ids = tuple(int(candidate_ids[int(index.item())]) for index in top_indices)
+        mixture_weights_tensor = torch.softmax(top_scores, dim=0)
+        mixture_weights = tuple(float(weight.item()) for weight in mixture_weights_tensor)
+        for cluster_id, weight in zip(mixture_cluster_ids, mixture_weights, strict=False):
+            self._update_cluster(cluster_id, z, weight=weight)
         return DomainRoute(
-            cluster_id=best_cluster_id,
+            primary_cluster_id=best_cluster_id,
+            mixture_cluster_ids=mixture_cluster_ids,
+            mixture_weights=mixture_weights,
             confidence=float(best_similarity.item()),
             spawned_new=False,
         )
@@ -279,10 +343,11 @@ class DomainIndex:
             self.adapter_bank.ensure_cluster(cluster_id)
         return cluster_id
 
-    def _update_cluster(self, cluster_id: int, z: torch.Tensor) -> None:
+    def _update_cluster(self, cluster_id: int, z: torch.Tensor, *, weight: float = 1.0) -> None:
         cluster = self.clusters[int(cluster_id)]
+        effective_weight = max(0.0, float(weight))
         updated_count = cluster.count + 1
-        updated_centroid = ((cluster.centroid * cluster.count) + z) / updated_count
+        updated_centroid = ((cluster.centroid * cluster.count) + (z * effective_weight)) / max(updated_count, 1.0)
         cluster.count = updated_count
         cluster.centroid = updated_centroid
         adapter_payload = None
@@ -321,3 +386,10 @@ class DomainIndex:
     def get_trigger_weights(self, cluster_id: int) -> dict[int, float]:
         cluster = self.clusters[int(cluster_id)]
         return {int(key): float(value) for key, value in cluster.trigger_weights.items()}
+
+    def get_route_trigger_weights(self, route: DomainRoute) -> dict[int, float]:
+        aggregated: dict[int, float] = {}
+        for cluster_id, weight in zip(route.mixture_cluster_ids, route.mixture_weights, strict=False):
+            for skill_id, trigger_weight in self.get_trigger_weights(cluster_id).items():
+                aggregated[skill_id] = aggregated.get(skill_id, 0.0) + (float(weight) * float(trigger_weight))
+        return aggregated

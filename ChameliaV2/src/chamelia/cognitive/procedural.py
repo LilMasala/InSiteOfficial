@@ -567,6 +567,33 @@ class ProceduralMemory:
         self.records[int(skill_id)] = updated
         self.storage.update_skill(int(skill_id), confidence=float(confidence))
 
+    def update_extras(self, skill_id: int, extras: dict[str, Any]) -> None:
+        record = self.records.get(int(skill_id))
+        if record is None:
+            raise KeyError(f"Unknown skill_id={skill_id}")
+        merged_extras = dict(record.extras)
+        merged_extras.update(extras)
+        updated = SkillRecord(
+            skill_id=record.skill_id,
+            embedding=record.embedding,
+            retrieval_vector=record.retrieval_vector,
+            action_path=record.action_path,
+            confidence=record.confidence,
+            source_episodes=record.source_episodes,
+            constraints=record.constraints,
+            name=record.name,
+            description=record.description,
+            domain_name=record.domain_name,
+            symbolic_program=record.symbolic_program,
+            trigger_weights=record.trigger_weights,
+            deprecated_by=record.deprecated_by,
+            compressed_codes=record.compressed_codes,
+            storage_format=record.storage_format,
+            extras=merged_extras,
+        )
+        self.records[int(skill_id)] = updated
+        self.storage.update_skill(int(skill_id), extras=merged_extras)
+
     def deprecate(self, skill_id: int, replacement_id: int) -> None:
         record = self.records.get(int(skill_id))
         if record is None:

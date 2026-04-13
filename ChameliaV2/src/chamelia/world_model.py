@@ -237,7 +237,7 @@ class ActionConditionedWorldModel(nn.Module):
         candidate_postures: torch.Tensor | None = None,
         reasoning_states: torch.Tensor | None = None,
         step_weights: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Train the rollout model against a full target latent trajectory."""
         if target_trajectory.dim() == 3:
             target_trajectory = target_trajectory.unsqueeze(1)
@@ -263,4 +263,7 @@ class ActionConditionedWorldModel(nn.Module):
         else:
             step_weights = step_weights.to(per_step.device, per_step.dtype)
         loss = (per_step * step_weights.view(1, 1, horizon)).sum(dim=-1).mean()
-        return loss, predicted
+        per_transition_l2 = torch.sqrt(
+            torch.mean((predicted - target).pow(2), dim=-1).clamp_min(1.0e-12)
+        )
+        return loss, predicted, per_transition_l2

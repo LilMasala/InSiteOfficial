@@ -1,0 +1,100 @@
+seed: 42
+device: cpu
+run_dir: checkpoints/orchestrator_cartpole_benchmark
+num_ctx_tokens: 4
+rollout_horizon: 3
+reasoning_steps: 1
+replay_capacity: 10000
+surprise_bonus_weight: 0.10
+surprise_replay_alpha: 1.0
+fasttrack_return_threshold: 0.5
+fasttrack_surprise_threshold: 0.35
+router_top_k: 2
+
+family_backbones:
+  state_vector_hjepa:
+    encoder_type: vit_tiny_patch16_224
+    embed_dim: 192
+    predictor_depth: 2
+    predictor_num_heads: 3
+    predictor_mlp_ratio: 2.0
+    num_hierarchies: 2
+    sequence_mode: true
+    use_vq: false
+
+memory:
+  max_episodes: 8192
+  retrieval_k: 4
+  device: cpu
+  use_iob: true
+  iob_dim: 96
+  iob_widths: [24, 48, 96]
+  retrieval_train_interval: 4
+
+procedural:
+  use_faiss: false
+  use_lancedb: true
+  use_csr: true
+  csr_dim: 256
+  csr_active_dims: 32
+  use_isotropic_storage: true
+  num_tokens: 8
+  codebook_size: 64
+  lora_rank: 8
+
+sleep:
+  interval_steps: 16
+
+logging:
+  representation_loss: hjepa
+  num_candidates: 6
+  path_length: 3
+
+domains:
+  - name: cartpole
+    family: state_vector_hjepa
+    bootstrap_random_episodes: 7
+    bootstrap_teacher_episodes: 49
+    bootstrap_simple_episodes: 14
+    bootstrap_pretrain_steps: 64
+    bootstrap_replay_warmup_steps: 96
+    bootstrap_batch_size: 16
+    mask_ratio: 0.25
+    max_episode_steps: 256
+    optimizer_interval: 1
+    sleep_interval_episodes: 50
+    checkpoint_interval_episodes: 25
+    evaluation_episodes: 100
+    planner_backend: mcts
+    world_model_backend: mamba
+    baselines: [random, simple, teacher]
+    mcts_simulations: 16
+    mcts_depth: 3
+    mcts_rollout_horizon: 3
+    primary_metric: episode_reward_mean
+    primary_mode: max
+    phases:
+      core_control:
+        episodes: 100
+        use_memory: false
+        use_sleep: false
+        train_hjepa: false
+        behavior_cloning_weight: 0.5
+        exploration_epsilon_start: 0.25
+        exploration_epsilon_end: 0.05
+      episodic_memory:
+        episodes: 100
+        use_memory: true
+        use_sleep: false
+        train_hjepa: false
+        behavior_cloning_weight: 0.35
+        exploration_epsilon_start: 0.20
+        exploration_epsilon_end: 0.03
+      sleep:
+        episodes: 100
+        use_memory: true
+        use_sleep: true
+        train_hjepa: false
+        behavior_cloning_weight: 0.25
+        exploration_epsilon_start: 0.15
+        exploration_epsilon_end: 0.02
