@@ -151,6 +151,14 @@ class CartPoleDomain(InteractiveDomainAdapter):
         )
         return self._X_THRESHOLD, theta_threshold
 
+    def _positive_steering_action(self) -> int:
+        """Return the action index that should be taken for positive steering.
+
+        The local toy fallback preserves the observation contract but not the same
+        left/right semantics as Gymnasium's CartPole-v1.
+        """
+        return 1 if gym is not None else 0
+
     def _derive_state_features(self, state: torch.Tensor) -> dict[str, torch.Tensor]:
         if state.dim() == 1:
             state = state.unsqueeze(0)
@@ -267,7 +275,13 @@ class CartPoleDomain(InteractiveDomainAdapter):
         if state.shape[-1] < 4 or action_dim < 2:
             return None
         steering = state[:, 2] + (0.25 * state[:, 3]) + (0.05 * state[:, 0]) + (0.02 * state[:, 1])
-        preferred_action = (steering < 0.0).long()
+        positive_action = self._positive_steering_action()
+        negative_action = 1 - positive_action
+        preferred_action = torch.where(
+            steering > 0.0,
+            torch.full_like(steering, positive_action, dtype=torch.long),
+            torch.full_like(steering, negative_action, dtype=torch.long),
+        )
         logits = torch.full(
             (state.shape[0], path_length, action_dim),
             fill_value=-6.0,
@@ -460,7 +474,13 @@ class CartPoleDomain(InteractiveDomainAdapter):
                 if baseline_path is not None:
                     return baseline_path[:, 0, :].argmax(dim=-1)
             score = (state * self._teacher_linear_weight.view(1, -1)).sum(dim=-1) + self._teacher_linear_bias
-            return (score < 0.0).long()
+            positive_action = self._positive_steering_action()
+            negative_action = 1 - positive_action
+            return torch.where(
+                score > 0.0,
+                torch.full_like(score, positive_action, dtype=torch.long),
+                torch.full_like(score, negative_action, dtype=torch.long),
+            )
 
     def reset(self, seed: int | None = None) -> tuple[Any, dict[str, Any]]:
         observation, info = self._env.reset(seed=seed)
