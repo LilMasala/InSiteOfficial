@@ -2050,6 +2050,8 @@ class UnifiedTrainingOrchestrator:
                 for record in model.procedural_memory.records.values()
                 if record.extras is not None and record.extras.get("target_delta") is not None
             ]
+            expected_path_len = model.actor.path_length
+            skill_records = [r for r in skill_records if int(r.action_path.shape[0]) == expected_path_len]
             if skill_records:
                 sampled = random.sample(skill_records, min(16, len(skill_records)))
                 skill_paths = torch.stack([record.action_path for record in sampled], dim=0).to(self.device)
