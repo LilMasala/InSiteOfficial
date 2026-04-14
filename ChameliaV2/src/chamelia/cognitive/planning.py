@@ -127,6 +127,8 @@ class HighLevelPlanner(nn.Module):
     ) -> MacroPlan | None:
         if not retrieved_skills:
             return None
+        if goal_z is None:
+            return None
         if z.dim() != 1 or goal_z.dim() != 1:
             raise ValueError("HighLevelPlanner.plan currently expects 1D latent vectors.")
         planner_device = z.device
