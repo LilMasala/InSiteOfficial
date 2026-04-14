@@ -2,7 +2,7 @@ seed: 42
 device: mps
 run_dir: checkpoints/orchestrator_cartpole_local_light
 num_ctx_tokens: 16
-rollout_horizon: 3
+rollout_horizon: 8
 reasoning_steps: 4
 replay_capacity: 3000
 surprise_bonus_weight: 0.10
@@ -70,7 +70,7 @@ domains:
     baselines: [random]
     mcts_simulations: 48
     mcts_depth: 5
-    mcts_rollout_horizon: 20
+    mcts_rollout_horizon: 8
     mcts_use_baseline_guard: false
     primary_metric: episode_reward_mean
     primary_mode: max
