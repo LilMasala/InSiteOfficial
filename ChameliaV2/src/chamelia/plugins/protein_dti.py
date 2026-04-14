@@ -78,7 +78,13 @@ class ProteinDTIDomain(AbstractDomain):
             isinstance(item, ProteinDTIObservation) for item in observation
         ):
             return ProteinDTIBatch(observations=list(observation))
-        raise TypeError("ProteinDTIDomain expects ProteinDTIObservation or ProteinDTIBatch input.")
+        if isinstance(observation, dict):
+            prepared = self.prepare_bridge_observation(observation)
+            if isinstance(prepared, ProteinDTIBatch):
+                return prepared
+        raise TypeError(
+            "ProteinDTIDomain expects ProteinDTIObservation, ProteinDTIBatch, or a bridge observation dict."
+        )
 
     def decode_action(self, action_vec: torch.Tensor) -> Any:
         if action_vec.dim() == 1:
@@ -186,6 +192,52 @@ class ProteinDTIDomain(AbstractDomain):
             "raw_observation": batch,
             "affinity_type": self.affinity_type,
         }
+
+    def prepare_bridge_observation(self, observation: Any) -> ProteinDTIBatch:
+        if isinstance(observation, ProteinDTIBatch):
+            return observation
+        if isinstance(observation, ProteinDTIObservation):
+            return ProteinDTIBatch(observations=[observation])
+        if isinstance(observation, list) and all(
+            isinstance(item, ProteinDTIObservation) for item in observation
+        ):
+            return ProteinDTIBatch(observations=list(observation))
+        if not isinstance(observation, dict):
+            raise TypeError(
+                "ProteinDTI bridge observation must be a ProteinDTIObservation, "
+                "ProteinDTIBatch, or a dict with uniprot_id/candidate_ids."
+            )
+
+        if bool(observation.get("sample")):
+            sampled = self.sample_observation()
+            if sampled is None:
+                raise ValueError("ProteinDTIDomain could not sample a bridge observation.")
+            return ProteinDTIBatch(observations=[sampled])
+
+        raw_uniprot_id = observation.get("uniprot_id")
+        if not isinstance(raw_uniprot_id, str) or not raw_uniprot_id.strip():
+            raise ValueError("ProteinDTI bridge observation dict requires a non-empty 'uniprot_id'.")
+
+        raw_candidate_ids = observation.get("candidate_ids")
+        candidate_ids: list[str] | None = None
+        if raw_candidate_ids is not None:
+            if not isinstance(raw_candidate_ids, list) or not all(
+                isinstance(candidate_id, str) and candidate_id.strip()
+                for candidate_id in raw_candidate_ids
+            ):
+                raise ValueError("ProteinDTI bridge observation 'candidate_ids' must be a list of strings.")
+            candidate_ids = [candidate_id.strip() for candidate_id in raw_candidate_ids]
+
+        loaded = self.dataset.load_observation(
+            raw_uniprot_id.strip(),
+            candidate_ids=candidate_ids,
+            deterministic=candidate_ids is None,
+        )
+        if loaded is None:
+            raise ValueError(
+                f"ProteinDTIDomain could not load a measured observation for '{raw_uniprot_id}'."
+            )
+        return ProteinDTIBatch(observations=[loaded])
 
     def get_persistable_domain_state(self, domain_state: dict) -> dict[str, Any] | None:
         return {

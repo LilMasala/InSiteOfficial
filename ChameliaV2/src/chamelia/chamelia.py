@@ -895,6 +895,7 @@ class Chamelia(nn.Module):
         planner_diagnostics: list[dict[str, Any] | None] = [None] * z.shape[0]
         thinker_output: ThinkerOutput | None = None
         reasoning_trace: list[dict[str, torch.Tensor]] = []
+        goal_latents: torch.Tensor | None = None
         if self.planner_backend == "mcts" and self.mcts_search is not None:
             goal_latents = self._resolve_goal_latents(z, domain_state)
             planner_results: list[dict[str, Any]] = []

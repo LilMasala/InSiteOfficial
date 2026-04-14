@@ -2,224 +2,26 @@
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
+import pytest
 import torch
 
 from src.chamelia.domains.protein_dti.dataset import ProteinDTIDataset
 from src.chamelia.domains.protein_dti.tokenizer import ProteinDTIObservation, ProteinDrugTokenizer
 from src.chamelia.plugins.protein_dti import ProteinDTIDomain
-
-TEST_SCHEMA = """
-CREATE TABLE proteins (
-    uniprot_id TEXT PRIMARY KEY,
-    sequence TEXT NOT NULL,
-    sequence_length INTEGER NOT NULL,
-    organism TEXT,
-    protein_name TEXT,
-    gene_name TEXT,
-    best_pdb_id TEXT,
-    best_pdb_resolution REAL,
-    structure_source TEXT,
-    structure_path TEXT,
-    graph_path TEXT,
-    uniprot_fetched_at TEXT,
-    structure_fetched_at TEXT,
-    go_fetched_at TEXT,
-    cath_fetched_at TEXT,
-    graph_built_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE protein_go_terms (
-    uniprot_id TEXT NOT NULL,
-    go_id TEXT NOT NULL,
-    go_aspect TEXT NOT NULL,
-    go_term TEXT NOT NULL,
-    evidence_code TEXT,
-    PRIMARY KEY (uniprot_id, go_id)
-);
-
-CREATE TABLE protein_cath (
-    uniprot_id TEXT NOT NULL,
-    cath_id TEXT NOT NULL,
-    cath_class TEXT,
-    cath_arch TEXT,
-    cath_topology TEXT,
-    cath_homology TEXT,
-    PRIMARY KEY (uniprot_id, cath_id)
-);
-
-CREATE TABLE drugs (
-    chembl_id TEXT PRIMARY KEY,
-    smiles TEXT NOT NULL,
-    inchi_key TEXT,
-    mol_weight REAL,
-    logp REAL,
-    hbd INTEGER,
-    hba INTEGER,
-    rotatable_bonds INTEGER,
-    graph_path TEXT,
-    pubchem_cid TEXT,
-    drug_name TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE binding_affinities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    measurement_key TEXT NOT NULL UNIQUE,
-    uniprot_id TEXT NOT NULL,
-    chembl_id TEXT NOT NULL,
-    affinity_value REAL NOT NULL,
-    affinity_type TEXT NOT NULL,
-    source_dataset TEXT NOT NULL,
-    original_value REAL,
-    original_units TEXT,
-    assay_id TEXT,
-    created_at TEXT NOT NULL
-);
-
-CREATE VIEW binding_affinities_deduped AS
-SELECT
-    uniprot_id,
-    chembl_id,
-    AVG(affinity_value) AS affinity_value,
-    affinity_type,
-    COUNT(*) AS num_measurements,
-    MIN(source_dataset) AS primary_source,
-    GROUP_CONCAT(DISTINCT source_dataset) AS all_sources
-FROM binding_affinities
-GROUP BY uniprot_id, chembl_id, affinity_type;
-
-CREATE TABLE dataset_splits (
-    uniprot_id TEXT NOT NULL,
-    chembl_id TEXT NOT NULL,
-    affinity_type TEXT NOT NULL,
-    split TEXT NOT NULL,
-    split_strategy TEXT NOT NULL,
-    PRIMARY KEY (uniprot_id, chembl_id, affinity_type, split_strategy)
-);
-"""
-
-
-def _graph_payload(identifier: str, node_dim: int, edge_dim: int, *, num_nodes: int = 4) -> dict[str, torch.Tensor | str | dict[str, str]]:
-    edge_src = []
-    edge_dst = []
-    for index in range(num_nodes - 1):
-        edge_src.extend([index, index + 1])
-        edge_dst.extend([index + 1, index])
-    edge_count = len(edge_src)
-    return {
-        "identifier": identifier,
-        "x": torch.randn(num_nodes, node_dim, dtype=torch.float32),
-        "edge_index": torch.tensor([edge_src, edge_dst], dtype=torch.long),
-        "edge_attr": torch.randn(edge_count, edge_dim, dtype=torch.float32),
-        "metadata": {},
-    }
-
-
-def _write_graph(path: Path, payload: dict[str, torch.Tensor | str | dict[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
-
-
-def _seed_test_db(tmp_path: Path) -> tuple[Path, Path]:
-    data_dir = tmp_path / "data" / "protein_dti"
-    db_path = data_dir / "db" / "protein_dti.sqlite3"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.executescript(TEST_SCHEMA)
-
-    now = "2026-04-09T00:00:00+00:00"
-    proteins = [
-        ("P11111", "M" * 12, "graphs/proteins/P11111.pt"),
-        ("P22222", "A" * 14, "graphs/proteins/P22222.pt"),
-    ]
-    for uniprot_id, sequence, graph_path in proteins:
-        conn.execute(
-            """
-            INSERT INTO proteins
-                (uniprot_id, sequence, sequence_length, graph_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (uniprot_id, sequence, len(sequence), graph_path, now, now),
-        )
-    conn.executemany(
-        """
-        INSERT INTO protein_go_terms
-            (uniprot_id, go_id, go_aspect, go_term, evidence_code)
-        VALUES (?, ?, 'F', 'term', 'EXP')
-        """,
-        [("P11111", "GO:0001"), ("P22222", "GO:0002")],
-    )
-    conn.executemany(
-        """
-        INSERT INTO protein_cath
-            (uniprot_id, cath_id, cath_class, cath_arch, cath_topology, cath_homology)
-        VALUES (?, ?, '1', '10', ?, ?)
-        """,
-        [
-            ("P11111", "1.10.20.30", "20", "30"),
-            ("P22222", "2.40.50.60", "50", "60"),
-        ],
-    )
-
-    drugs = [
-        ("CHEMBL1", "CCO", "graphs/drugs/CHEMBL1.pt"),
-        ("CHEMBL2", "CCC", "graphs/drugs/CHEMBL2.pt"),
-        ("CHEMBL3", "CCN", "graphs/drugs/CHEMBL3.pt"),
-        ("CHEMBL4", "CCCl", "graphs/drugs/CHEMBL4.pt"),
-        ("CHEMBL5", "CCBr", "graphs/drugs/CHEMBL5.pt"),
-    ]
-    for chembl_id, smiles, graph_path in drugs:
-        conn.execute(
-            """
-            INSERT INTO drugs
-                (chembl_id, smiles, graph_path, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (chembl_id, smiles, graph_path, now, now),
-        )
-
-    affinities = [
-        ("m1", "P11111", "CHEMBL1", 9.0),
-        ("m2", "P11111", "CHEMBL2", 7.0),
-        ("m3", "P11111", "CHEMBL3", 5.0),
-        ("m4", "P22222", "CHEMBL4", 8.5),
-        ("m5", "P22222", "CHEMBL5", 6.0),
-    ]
-    for measurement_key, uniprot_id, chembl_id, affinity_value in affinities:
-        conn.execute(
-            """
-            INSERT INTO binding_affinities
-                (measurement_key, uniprot_id, chembl_id, affinity_value, affinity_type,
-                 source_dataset, original_value, original_units, assay_id, created_at)
-            VALUES (?, ?, ?, ?, 'Kd', 'synthetic', ?, 'nM', NULL, ?)
-            """,
-            (measurement_key, uniprot_id, chembl_id, affinity_value, affinity_value, now),
-        )
-
-    conn.commit()
-    conn.close()
-
-    _write_graph(data_dir / "graphs" / "proteins" / "P11111.pt", _graph_payload("P11111", 21, 19, num_nodes=6))
-    _write_graph(data_dir / "graphs" / "proteins" / "P22222.pt", _graph_payload("P22222", 21, 19, num_nodes=5))
-    for chembl_id in ("CHEMBL1", "CHEMBL2", "CHEMBL3", "CHEMBL4", "CHEMBL5"):
-        _write_graph(data_dir / "graphs" / "drugs" / f"{chembl_id}.pt", _graph_payload(chembl_id, 22, 6, num_nodes=4))
-    return db_path, data_dir
+from src.serving.bridge_runtime import BridgeRuntime
+from tests.protein_dti_test_utils import graph_payload, seed_test_db
 
 
 def test_protein_drug_tokenizer_emits_padded_standard_tokens() -> None:
     tokenizer = ProteinDrugTokenizer(embed_dim=32, max_candidate_drugs=4, protein_summary_tokens=3)
     first = ProteinDTIObservation(
         uniprot_id="P11111",
-        protein_graph=_graph_payload("P11111", 21, 19, num_nodes=6),
+        protein_graph=graph_payload("P11111", 21, 19, num_nodes=6),
         candidate_drugs=[
-            _graph_payload("CHEMBL1", 22, 6, num_nodes=4),
-            _graph_payload("CHEMBL2", 22, 6, num_nodes=4),
+            graph_payload("CHEMBL1", 22, 6, num_nodes=4),
+            graph_payload("CHEMBL2", 22, 6, num_nodes=4),
         ],
         candidate_ids=["CHEMBL1", "CHEMBL2"],
         affinity_values=[9.0, 7.0],
@@ -228,8 +30,8 @@ def test_protein_drug_tokenizer_emits_padded_standard_tokens() -> None:
     )
     second = ProteinDTIObservation(
         uniprot_id="P22222",
-        protein_graph=_graph_payload("P22222", 21, 19, num_nodes=5),
-        candidate_drugs=[_graph_payload("CHEMBL3", 22, 6, num_nodes=4)],
+        protein_graph=graph_payload("P22222", 21, 19, num_nodes=5),
+        candidate_drugs=[graph_payload("CHEMBL3", 22, 6, num_nodes=4)],
         candidate_ids=["CHEMBL3"],
         affinity_values=[8.0],
         go_terms=["GO:0002"],
@@ -248,7 +50,7 @@ def test_protein_drug_tokenizer_emits_padded_standard_tokens() -> None:
 
 
 def test_protein_dti_domain_ranking_cost_prefers_correct_order(tmp_path: Path) -> None:
-    db_path, data_dir = _seed_test_db(tmp_path)
+    db_path, data_dir = seed_test_db(tmp_path)
     domain = ProteinDTIDomain(
         db_path=str(db_path),
         data_base_dir=str(data_dir),
@@ -261,11 +63,11 @@ def test_protein_dti_domain_ranking_cost_prefers_correct_order(tmp_path: Path) -
     )
     observation = ProteinDTIObservation(
         uniprot_id="P11111",
-        protein_graph=_graph_payload("P11111", 21, 19, num_nodes=6),
+        protein_graph=graph_payload("P11111", 21, 19, num_nodes=6),
         candidate_drugs=[
-            _graph_payload("CHEMBL1", 22, 6, num_nodes=4),
-            _graph_payload("CHEMBL2", 22, 6, num_nodes=4),
-            _graph_payload("CHEMBL3", 22, 6, num_nodes=4),
+            graph_payload("CHEMBL1", 22, 6, num_nodes=4),
+            graph_payload("CHEMBL2", 22, 6, num_nodes=4),
+            graph_payload("CHEMBL3", 22, 6, num_nodes=4),
         ],
         candidate_ids=["CHEMBL1", "CHEMBL2", "CHEMBL3"],
         affinity_values=[9.0, 7.0, 5.0],
@@ -287,7 +89,7 @@ def test_protein_dti_domain_ranking_cost_prefers_correct_order(tmp_path: Path) -
 
 
 def test_protein_dti_dataset_builds_family_splits_and_samples_measured_candidates(tmp_path: Path) -> None:
-    db_path, data_dir = _seed_test_db(tmp_path)
+    db_path, data_dir = seed_test_db(tmp_path)
     dataset = ProteinDTIDataset(
         db_path=str(db_path),
         data_base_dir=str(data_dir),
@@ -309,3 +111,60 @@ def test_protein_dti_dataset_builds_family_splits_and_samples_measured_candidate
     assert set(sample.candidate_ids).issubset(measured_candidates[sample.uniprot_id])
     assert len(sample.candidate_ids) == len(sample.affinity_values)
     assert len(sample.candidate_ids) >= 2
+
+
+def test_protein_dti_bridge_payload_round_trips_through_chamelia(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path, data_dir = seed_test_db(tmp_path)
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_DB_PATH", str(db_path))
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_SPLIT", "train")
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_SPLIT_STRATEGY", "protein_family")
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_MAX_CANDIDATES", "4")
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_ACTION_DIM", "4")
+
+    runtime = BridgeRuntime(
+        backbone_mode="stub",
+        device="cpu",
+        model_version="protein-dti-test-model",
+    )
+    session = runtime.get_session("protein-1", "protein_dti")
+    uniprot_id = session.domain.dataset.protein_ids[0]  # type: ignore[attr-defined]
+    observation = session.domain.dataset.load_observation(  # type: ignore[attr-defined]
+        uniprot_id,
+        deterministic=True,
+    )
+    assert observation is not None
+    payload = {
+        "uniprot_id": uniprot_id,
+        "candidate_ids": list(observation.candidate_ids),
+    }
+
+    batch = session.domain.prepare_bridge_observation(payload)
+    tokenized = session.domain.get_tokenizer()(batch)
+    mask = tokenized.padding_mask.to(dtype=torch.float32) if tokenized.padding_mask is not None else torch.zeros(
+        tokenized.tokens.shape[0],
+        tokenized.tokens.shape[1],
+        dtype=torch.float32,
+    )
+    outputs = session.model(
+        tokenized.tokens,
+        mask,
+        session.domain.get_domain_state(payload),
+        input_kind="embedded_tokens",
+    )
+
+    assert outputs["action_vec"].shape == (1, session.domain.get_action_dim())
+    assert outputs["cost"]["ic"].shape == (1,)
+    delayed = session.domain.simulate_delayed_outcome(outputs["action_vec"], session.domain.get_domain_state(payload))
+    assert delayed is not None
+    record_id = session.model._pending_record_indices[0]
+    session.model.fill_outcome(
+        ic_realized=delayed["realized_intrinsic_cost"],
+        outcome_observation=delayed["outcome_observation"],
+    )
+    stored = session.model.memory.get_record_by_id(record_id)
+    assert stored is not None
+    assert stored.ic_realized is not None
+    assert stored.outcome_key is not None
+    critic_loss = session.model.train_critic_from_memory()
+    assert critic_loss is not None

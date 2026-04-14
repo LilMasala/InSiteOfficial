@@ -253,6 +253,7 @@ class MCTSSearch:
         rollout_horizon: int = 3,
         tree_reuse_similarity: float = 0.98,
         safety_cost_ceiling: float | None = None,
+        use_baseline_guard: bool = True,
         baseline_cost_margin: float = 0.25,
         baseline_uncertainty_scale: float = 3.0,
         imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
@@ -268,6 +269,7 @@ class MCTSSearch:
         self.rollout_horizon = rollout_horizon
         self.tree_reuse_similarity = tree_reuse_similarity
         self.safety_cost_ceiling = safety_cost_ceiling
+        self.use_baseline_guard = use_baseline_guard
         self.baseline_cost_margin = baseline_cost_margin
         self.baseline_uncertainty_scale = baseline_uncertainty_scale
         self.imagined_domain_state_builder = imagined_domain_state_builder
@@ -484,7 +486,7 @@ class MCTSSearch:
         required_predicted_improvement: float | None = None
         baseline_predicted_total: float | None = None
 
-        if self.simple_baseline_builder is not None and root.children:
+        if self.use_baseline_guard and self.simple_baseline_builder is not None and root.children:
             baseline_child = root.children[0]
             if baseline_child.path_from_parent is not None:
                 baseline_predicted_total = float(predicted_costs[0].item())
@@ -508,6 +510,7 @@ class MCTSSearch:
 
         return best_idx, best_child, {
             "reason": selection_reason,
+            "use_baseline_guard": bool(self.use_baseline_guard),
             "baseline_cost_margin": float(self.baseline_cost_margin),
             "baseline_uncertainty_scale": float(self.baseline_uncertainty_scale),
             "root_candidate_mean_costs": [float(child.mean_cost) for child in root.children],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ from src.chamelia.actor import Actor
 from src.chamelia.chamelia import Chamelia
 from src.chamelia.cognitive.clustering import DomainIndex, LoRAAdapterBank
 from src.chamelia.cognitive.lancedb_assessment import assess_vector_backends
-from src.chamelia.cognitive.latent_action import LatentActionEncoder
+from src.chamelia.cognitive.latent_action import LatentActionEncoder, LatentSkillCandidate
 from src.chamelia.cognitive.mamba_world_model import (
     MambaActionConditionedWorldModel,
     benchmark_world_models,
@@ -322,6 +323,47 @@ def test_mcts_baseline_guard_rejects_tiny_predicted_edge(tmp_path: Path) -> None
     )
 
 
+def test_mcts_can_disable_baseline_guard(tmp_path: Path) -> None:
+    model, _domain, _memory, _procedural = _build_chamelia(tmp_path)
+    assert model.mcts_search is not None
+    model.mcts_search.use_baseline_guard = False
+    root = MCTSNode(latent_state=torch.zeros(32), ctx_tokens=torch.zeros(4, 32), depth=0)
+    root.candidate_paths = torch.randn(3, 3, 8)
+    root.candidate_costs = torch.tensor([0.50, 0.45, 0.47], dtype=torch.float32)
+    root.children = [
+        MCTSNode(
+            latent_state=torch.zeros(32),
+            ctx_tokens=torch.zeros(4, 32),
+            depth=1,
+            path_from_parent=root.candidate_paths[0],
+            visit_count=4,
+            total_cost=4.0,
+        ),
+        MCTSNode(
+            latent_state=torch.zeros(32),
+            ctx_tokens=torch.zeros(4, 32),
+            depth=1,
+            path_from_parent=root.candidate_paths[1],
+            visit_count=4,
+            total_cost=1.8,
+        ),
+        MCTSNode(
+            latent_state=torch.zeros(32),
+            ctx_tokens=torch.zeros(4, 32),
+            depth=1,
+            path_from_parent=root.candidate_paths[2],
+            visit_count=4,
+            total_cost=2.4,
+        ),
+    ]
+
+    best_idx, _best_child, selection_debug = model.mcts_search._select_root_child(root)
+
+    assert best_idx == 1
+    assert selection_debug["reason"] == "lowest_mean_cost"
+    assert selection_debug["use_baseline_guard"] is False
+
+
 def test_mcts_reuses_selected_subtree_as_new_root(tmp_path: Path) -> None:
     model, domain, _memory, _procedural = _build_chamelia(tmp_path)
     assert model.mcts_search is not None
@@ -527,6 +569,64 @@ def test_sleep_fasttrack_promotes_without_waiting_for_sleep_cycle(tmp_path: Path
     assert promoted_record.extras["promotion_source"] == "online_fasttrack"
 
 
+def test_latent_action_encoder_moves_cpu_candidates_to_module_device(device: torch.device) -> None:
+    if device.type == "cpu":
+        pytest.skip("Requires a non-CPU device to verify device normalization.")
+
+    encoder = LatentActionEncoder(
+        action_dim=4,
+        skill_dim=8,
+        num_heads=2,
+        num_layers=1,
+        max_path_length=4,
+    ).to(device)
+    candidate = LatentSkillCandidate(
+        action_path=torch.randn(3, 4, device="cpu"),
+        symbolic_codes=None,
+        target_delta=None,
+        source_weight=1.0,
+        source_episodes=(1,),
+    )
+
+    embedding = encoder.encode_candidate(candidate)
+
+    assert embedding.device.type == device.type
+
+
+def test_procedural_memory_retrieve_is_stable_during_concurrent_skill_adds(tmp_path: Path) -> None:
+    procedural = ProceduralMemory(root=tmp_path / "procedural", skill_dim=8, use_faiss=False)
+    procedural.add_skill(
+        embedding=torch.randn(8),
+        action_path=torch.randn(3, 4),
+        name="seed",
+    )
+    query = torch.randn(8)
+    failures: list[BaseException] = []
+    stop_event = threading.Event()
+
+    def reader() -> None:
+        try:
+            while not stop_event.is_set():
+                procedural.retrieve(query, k=2)
+        except BaseException as exc:  # pragma: no cover - regression capture
+            failures.append(exc)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    try:
+        for idx in range(16):
+            procedural.add_skill(
+                embedding=torch.randn(8),
+                action_path=torch.randn(3, 4),
+                name=f"skill_{idx}",
+            )
+    finally:
+        stop_event.set()
+        thread.join(timeout=2.0)
+
+    assert not failures
+
+
 def test_love_decomposer_prefers_rare_high_quality_fragment() -> None:
     decomposer = LOVEDecomposer(min_frequency=1, max_segment_length=2)
     library: dict[tuple[int, ...], LOVEDecomposer._FragmentStats] = {
@@ -717,3 +817,28 @@ def test_stitch_bodegen_and_gemma_worker_harness() -> None:
     )
     assert name == "integrate_sequence"
     assert "learned sequence integration" in description
+
+
+def test_bodegen_optimizer_falls_back_from_mps_double() -> None:
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS not available")
+
+    encoder = LatentActionEncoder(action_dim=2, skill_dim=16, num_heads=2, num_layers=1, max_path_length=2).to("mps")
+    optimizer = BODEGenOptimizer(
+        latent_prompt_dim=encoder.latent_prompt_dim,
+        num_initial_points=3,
+        num_iterations=1,
+    )
+
+    best_prompt, best_path, best_embedding, best_score = optimizer.optimize(
+        lambda prompt, _path, _embedding: -float(((prompt - 0.5) ** 2).mean().item()),
+        latent_action_encoder=encoder,
+        path_length=2,
+        seed_paths=[torch.zeros(2, 2)],
+        device="mps",
+    )
+
+    assert best_prompt.shape == (encoder.latent_prompt_dim,)
+    assert best_path.shape == (2, 2)
+    assert best_embedding.shape == (16,)
+    assert isinstance(best_score, float)

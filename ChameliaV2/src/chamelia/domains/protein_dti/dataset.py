@@ -200,6 +200,11 @@ class ProteinDTIDataset:
     def close(self) -> None:
         self.conn.close()
 
+    @property
+    def protein_ids(self) -> list[str]:
+        """Return the proteins available for the configured split."""
+        return list(self._protein_ids)
+
     def _load_protein_ids(self) -> list[str]:
         rows = self.conn.execute(
             """
@@ -295,6 +300,39 @@ class ProteinDTIDataset:
             (self.split, self.split_strategy, uniprot_id, self.affinity_type),
         ).fetchall()
 
+    def _candidate_rows_for_ids(self, uniprot_id: str, candidate_ids: list[str]) -> list[sqlite3.Row]:
+        if not candidate_ids:
+            return []
+        placeholders = ", ".join("?" for _ in candidate_ids)
+        rows = self.conn.execute(
+            f"""
+            SELECT ba.chembl_id, ba.affinity_value
+            FROM binding_affinities_deduped ba
+            JOIN dataset_splits ds
+              ON ds.uniprot_id = ba.uniprot_id
+             AND ds.chembl_id = ba.chembl_id
+             AND ds.affinity_type = ba.affinity_type
+             AND ds.split = ?
+             AND ds.split_strategy = ?
+            JOIN drugs d
+              ON d.chembl_id = ba.chembl_id
+             AND d.graph_path IS NOT NULL
+            WHERE ba.uniprot_id = ?
+              AND ba.affinity_type = ?
+              AND ba.chembl_id IN ({placeholders})
+            ORDER BY ba.affinity_value DESC, ba.chembl_id ASC
+            """,
+            (
+                self.split,
+                self.split_strategy,
+                uniprot_id,
+                self.affinity_type,
+                *candidate_ids,
+            ),
+        ).fetchall()
+        row_by_id = {str(row["chembl_id"]): row for row in rows}
+        return [row_by_id[chembl_id] for chembl_id in candidate_ids if chembl_id in row_by_id]
+
     def _select_candidates(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
         if len(rows) <= self.max_candidate_drugs:
             return list(rows)
@@ -311,39 +349,59 @@ class ProteinDTIDataset:
         self.rng.shuffle(selected)
         return selected
 
+    def load_observation(
+        self,
+        uniprot_id: str,
+        *,
+        candidate_ids: list[str] | None = None,
+        deterministic: bool = False,
+    ) -> ProteinDTIObservation | None:
+        protein_graph = self._load_protein_graph(uniprot_id)
+        if protein_graph is None:
+            return None
+        if candidate_ids is not None:
+            candidate_rows = self._candidate_rows_for_ids(uniprot_id, list(candidate_ids))
+        else:
+            rows = self._candidate_rows(uniprot_id)
+            candidate_rows = (
+                list(rows[: self.max_candidate_drugs])
+                if deterministic
+                else self._select_candidates(rows)
+            )
+
+        resolved_candidate_ids: list[str] = []
+        candidate_graphs: list[Any] = []
+        affinity_values: list[float] = []
+        for row in candidate_rows:
+            chembl_id = str(row["chembl_id"])
+            graph = self._load_drug_graph(chembl_id)
+            if graph is None:
+                continue
+            resolved_candidate_ids.append(chembl_id)
+            candidate_graphs.append(graph)
+            affinity_values.append(float(row["affinity_value"]))
+        if len(resolved_candidate_ids) < self.min_ranked_candidates:
+            return None
+        go_terms, cath_ids = self._load_annotations(uniprot_id)
+        return ProteinDTIObservation(
+            uniprot_id=uniprot_id,
+            protein_graph=protein_graph,
+            candidate_drugs=candidate_graphs,
+            candidate_ids=resolved_candidate_ids,
+            affinity_values=affinity_values,
+            go_terms=go_terms,
+            cath_ids=cath_ids,
+            affinity_type=self.affinity_type,
+        )
+
     def sample_episode(self) -> ProteinDTIObservation | None:
         if not self._protein_ids:
             return None
         for _ in range(max(1, len(self._protein_ids) * 2)):
             uniprot_id = self.rng.choice(self._protein_ids)
-            protein_graph = self._load_protein_graph(uniprot_id)
-            if protein_graph is None:
-                continue
-            candidate_rows = self._select_candidates(self._candidate_rows(uniprot_id))
-            candidate_ids: list[str] = []
-            candidate_graphs: list[Any] = []
-            affinity_values: list[float] = []
-            for row in candidate_rows:
-                chembl_id = str(row["chembl_id"])
-                graph = self._load_drug_graph(chembl_id)
-                if graph is None:
-                    continue
-                candidate_ids.append(chembl_id)
-                candidate_graphs.append(graph)
-                affinity_values.append(float(row["affinity_value"]))
-            if len(candidate_ids) < self.min_ranked_candidates:
-                continue
-            go_terms, cath_ids = self._load_annotations(uniprot_id)
-            return ProteinDTIObservation(
-                uniprot_id=uniprot_id,
-                protein_graph=protein_graph,
-                candidate_drugs=candidate_graphs,
-                candidate_ids=candidate_ids,
-                affinity_values=affinity_values,
-                go_terms=go_terms,
-                cath_ids=cath_ids,
-                affinity_type=self.affinity_type,
-            )
+            observation = self.load_observation(uniprot_id)
+            if observation is not None:
+                return observation
         return None
 
     def __len__(self) -> int:

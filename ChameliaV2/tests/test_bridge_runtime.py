@@ -16,6 +16,7 @@ from src.serving.bridge_runtime import (
     retrieve_session,
     rollout_session,
 )
+from tests.protein_dti_test_utils import seed_test_db
 
 
 def _bridge_observation() -> dict[str, object]:
@@ -242,6 +243,76 @@ def test_bridge_runtime_uses_checkpoint_embedded_model_config(tmp_path: Path) ->
 
     assert runtime.model_version == "bridge-embedded-config-v1"
     assert session.model.num_ctx_tokens == 7
+
+
+def test_bridge_runtime_supports_protein_dti_bridge_payloads(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path, data_dir = seed_test_db(tmp_path)
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_DB_PATH", str(db_path))
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_SPLIT", "train")
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_SPLIT_STRATEGY", "protein_family")
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_MAX_CANDIDATES", "4")
+    monkeypatch.setenv("CHAMELIA_PROTEIN_DTI_ACTION_DIM", "4")
+
+    runtime = BridgeRuntime(
+        backbone_mode="stub",
+        device="cpu",
+        model_version="bridge-protein-dti-v1",
+    )
+    session = runtime.get_session("protein-bridge-1", "protein_dti")
+    uniprot_id = session.domain.dataset.protein_ids[0]  # type: ignore[attr-defined]
+    observation = session.domain.dataset.load_observation(  # type: ignore[attr-defined]
+        uniprot_id,
+        deterministic=True,
+    )
+    assert observation is not None
+    payload = {
+        "uniprot_id": uniprot_id,
+        "candidate_ids": list(observation.candidate_ids),
+    }
+
+    encoded = encode_session(
+        session,
+        input_kind="plugin_observation",
+        observation=payload,
+    )
+    retrieved = retrieve_session(session, z_t=encoded["z_t"])
+    configured = configure_session(
+        session,
+        encoded_state=encoded,
+        retrieved_memory=retrieved,
+    )
+    proposed = propose_session(
+        session,
+        mode="v3",
+        encoded_state=encoded,
+        configurator_output=configured,
+        retrieved_memory=retrieved,
+    )
+    rolled = rollout_session(
+        session,
+        encoded_state=encoded,
+        configurator_output=configured,
+        proposal_bundle=proposed,
+        rollout_horizon=2,
+    )
+    scored = critic_session(
+        session,
+        encoded_state=encoded,
+        configurator_output=configured,
+        proposal_bundle=proposed,
+        rollout_bundle=rolled,
+        domain_state=payload,
+    )
+
+    assert encoded["domain_name"] == "protein_dti"
+    assert encoded["model_version"] == "bridge-protein-dti-v1"
+    assert len(proposed["candidate_actions"]) == len(proposed["candidate_paths"])
+    assert len(rolled["trajectory"]) == len(proposed["candidate_paths"])
+    assert len(scored["candidate_total"]) == len(proposed["candidate_paths"])
 
 
 def test_bridge_runtime_ingests_julia_replay_examples_with_dedup_and_version_checks() -> None:

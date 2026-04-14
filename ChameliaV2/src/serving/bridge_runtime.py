@@ -17,7 +17,7 @@ from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
 from src.chamelia.hjepa_adapter import forward_hjepa
 from src.chamelia.memory import LatentMemory
 from src.chamelia.memory import EpisodeRecord, RetrievalTraceStep
-from src.chamelia.plugins import DomainRegistry, InSiteBridgeDomain
+from src.chamelia.plugins import DomainRegistry, InSiteBridgeDomain, ProteinDTIDomain
 from src.chamelia.plugins.base import AbstractDomain
 from src.chamelia.retrieval import MemoryRelevanceScorer
 from src.chamelia.world_model import ActionConditionedWorldModel
@@ -180,6 +180,25 @@ class BridgeRuntime:
         return configured_embed_dim
 
     def _build_domain(self, domain_name: str, embed_dim: int) -> AbstractDomain:
+        if domain_name == "protein_dti":
+            max_candidate_drugs = int(os.getenv("CHAMELIA_PROTEIN_DTI_MAX_CANDIDATES", "20"))
+            action_dim = int(
+                os.getenv("CHAMELIA_PROTEIN_DTI_ACTION_DIM", str(max_candidate_drugs))
+            )
+            return ProteinDTIDomain(
+                db_path=os.getenv("CHAMELIA_PROTEIN_DTI_DB_PATH"),
+                data_base_dir=os.getenv("CHAMELIA_PROTEIN_DTI_DATA_DIR"),
+                embed_dim=embed_dim,
+                max_candidate_drugs=max_candidate_drugs,
+                action_dim=action_dim,
+                affinity_type=os.getenv("CHAMELIA_PROTEIN_DTI_AFFINITY_TYPE", "Kd"),
+                split=os.getenv("CHAMELIA_PROTEIN_DTI_SPLIT", "train"),
+                split_strategy=os.getenv(
+                    "CHAMELIA_PROTEIN_DTI_SPLIT_STRATEGY",
+                    "protein_family",
+                ),
+                seed=int(os.getenv("CHAMELIA_PROTEIN_DTI_SEED", "42")),
+            )
         if domain_name in DomainRegistry.list_domains():
             return DomainRegistry.get(domain_name)
         if domain_name == "insite_t1d":
@@ -449,12 +468,15 @@ def encode_session(
         tokenizer_input = session.domain.prepare_bridge_observation(observation)
         tokenized = session.domain.get_tokenizer()(tokenizer_input)
         tokens_tensor = tokenized.tokens.to(device)
-        mask_tensor = torch.zeros(
-            tokens_tensor.shape[0],
-            tokens_tensor.shape[1],
-            device=device,
-            dtype=torch.float32,
-        )
+        if tokenized.padding_mask is None:
+            mask_tensor = torch.zeros(
+                tokens_tensor.shape[0],
+                tokens_tensor.shape[1],
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            mask_tensor = tokenized.padding_mask.to(device=device, dtype=torch.float32)
         hjepa_input_kind = "embedded_tokens"
     else:
         if tokens is None:

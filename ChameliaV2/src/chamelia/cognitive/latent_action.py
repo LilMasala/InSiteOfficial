@@ -102,7 +102,14 @@ class LatentActionEncoder(nn.Module):
         self.skill_head = spectral_norm(nn.Linear(skill_dim, skill_dim))
         self.transition_head = spectral_norm(nn.Linear(skill_dim, skill_dim))
 
+    def _module_device(self) -> torch.device:
+        return self.cls_token.device
+
     def _prepare_prompt(self, prompt_vector: torch.Tensor) -> torch.Tensor:
+        prompt_vector = prompt_vector.to(
+            device=self._module_device(),
+            dtype=self.prompt_proj.weight.dtype,
+        )
         if prompt_vector.dim() == 1:
             prompt_vector = prompt_vector.unsqueeze(0)
         if prompt_vector.dim() != 2 or prompt_vector.shape[-1] != self.latent_prompt_dim:
@@ -143,6 +150,10 @@ class LatentActionEncoder(nn.Module):
             if prompt_batch is None:
                 raise ValueError("Either action_path or prompt_vector must be provided.")
             action_path = self.decode_prompt(prompt_vector, path_length=path_length)
+        action_path = action_path.to(
+            device=self._module_device(),
+            dtype=self.action_proj.weight.dtype,
+        )
         if action_path.dim() == 2:
             action_path = action_path.unsqueeze(0)
         if action_path.dim() != 3:
@@ -156,6 +167,7 @@ class LatentActionEncoder(nn.Module):
             raise ValueError("prompt_vector batch dimension must match action_path.")
         tokens = self.action_proj(action_path)
         if symbolic_codes is not None:
+            symbolic_codes = symbolic_codes.to(device=self._module_device())
             if symbolic_codes.dim() == 1:
                 symbolic_codes = symbolic_codes.unsqueeze(0)
             if symbolic_codes.shape[0] != batch_size or symbolic_codes.shape[1] != path_length:

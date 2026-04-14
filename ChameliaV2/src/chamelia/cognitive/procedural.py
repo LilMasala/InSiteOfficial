@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import threading
 from typing import Any
 
 import numpy as np
@@ -273,6 +274,7 @@ class ProceduralMemory:
         self.csr_encoder = csr_encoder
         self.codec = codec
         self.records: dict[int, SkillRecord] = {}
+        self._records_lock = threading.RLock()
         self.retrieval_dim = (
             int(csr_encoder.output_dim) if csr_encoder is not None else int(skill_dim)
         )
@@ -397,7 +399,8 @@ class ProceduralMemory:
                 storage_format=str(row["storage_format"] or "dense"),
                 extras=json.loads(str(row["extras"] or "{}")),
             )
-            self.records[skill_id] = record
+            with self._records_lock:
+                self.records[skill_id] = record
             if not skip_rebuild and skill_id not in indexed_ids:
                 self.index.add(skill_id, record.retrieval_vector)
 
@@ -451,12 +454,14 @@ class ProceduralMemory:
             storage_format=storage_format,
             extras=extras or {},
         )
-        self.records[skill_id] = record
-        self.index.add(skill_id, retrieval_vector)
+        with self._records_lock:
+            self.records[skill_id] = record
+            self.index.add(skill_id, retrieval_vector)
         return record
 
     def get_skill(self, skill_id: int) -> SkillRecord | None:
-        return self.records.get(int(skill_id))
+        with self._records_lock:
+            return self.records.get(int(skill_id))
 
     def retrieve(
         self,
@@ -467,10 +472,12 @@ class ProceduralMemory:
         min_confidence: float = 0.0,
         trigger_weights: dict[int, float] | None = None,
     ) -> list[RetrievedSkill]:
-        if self.csr_encoder is not None and self.records:
+        with self._records_lock:
+            records_snapshot = dict(self.records)
+        if self.csr_encoder is not None and records_snapshot:
             query_vector = F.normalize(self._index_vector(query).float(), dim=-1)
             scored_pairs: list[tuple[int, float]] = []
-            for skill_id, record in self.records.items():
+            for skill_id, record in records_snapshot.items():
                 retrieval_vector = F.normalize(self._index_vector(record.embedding).float(), dim=-1)
                 similarity = float((query_vector * retrieval_vector).sum().item())
                 scored_pairs.append((skill_id, similarity))
@@ -478,10 +485,11 @@ class ProceduralMemory:
             skill_ids = [skill_id for skill_id, _ in scored_pairs[:k]]
             similarities = [score for _, score in scored_pairs[:k]]
         else:
-            skill_ids, similarities = self.index.search(self._index_vector(query), k)
+            with self._records_lock:
+                skill_ids, similarities = self.index.search(self._index_vector(query), k)
         retrieved: list[RetrievedSkill] = []
         for skill_id, similarity in zip(skill_ids, similarities, strict=False):
-            record = self.records.get(skill_id)
+            record = records_snapshot.get(skill_id)
             if record is None or record.deprecated_by is not None:
                 continue
             if record.confidence < min_confidence:
@@ -515,9 +523,11 @@ class ProceduralMemory:
             int(self.csr_encoder.output_dim) if self.csr_encoder is not None else int(self.skill_dim)
         )
         self.index = self._make_index()
+        with self._records_lock:
+            existing_records = dict(self.records)
         refreshed: dict[int, SkillRecord] = {}
-        for skill_id in sorted(self.records):
-            record = self.records[skill_id]
+        for skill_id in sorted(existing_records):
+            record = existing_records[skill_id]
             runtime_embedding, compressed_codes, storage_format = self._compress_embedding(record.embedding)
             retrieval_vector = self._index_vector(runtime_embedding)
             updated = SkillRecord(
@@ -540,10 +550,12 @@ class ProceduralMemory:
             )
             refreshed[skill_id] = updated
             self.index.add(skill_id, retrieval_vector)
-        self.records = refreshed
+        with self._records_lock:
+            self.records = refreshed
 
     def update_confidence(self, skill_id: int, confidence: float) -> None:
-        record = self.records.get(int(skill_id))
+        with self._records_lock:
+            record = self.records.get(int(skill_id))
         if record is None:
             raise KeyError(f"Unknown skill_id={skill_id}")
         updated = SkillRecord(
@@ -564,11 +576,13 @@ class ProceduralMemory:
             storage_format=record.storage_format,
             extras=record.extras,
         )
-        self.records[int(skill_id)] = updated
+        with self._records_lock:
+            self.records[int(skill_id)] = updated
         self.storage.update_skill(int(skill_id), confidence=float(confidence))
 
     def update_extras(self, skill_id: int, extras: dict[str, Any]) -> None:
-        record = self.records.get(int(skill_id))
+        with self._records_lock:
+            record = self.records.get(int(skill_id))
         if record is None:
             raise KeyError(f"Unknown skill_id={skill_id}")
         merged_extras = dict(record.extras)
@@ -591,11 +605,13 @@ class ProceduralMemory:
             storage_format=record.storage_format,
             extras=merged_extras,
         )
-        self.records[int(skill_id)] = updated
+        with self._records_lock:
+            self.records[int(skill_id)] = updated
         self.storage.update_skill(int(skill_id), extras=merged_extras)
 
     def deprecate(self, skill_id: int, replacement_id: int) -> None:
-        record = self.records.get(int(skill_id))
+        with self._records_lock:
+            record = self.records.get(int(skill_id))
         if record is None:
             raise KeyError(f"Unknown skill_id={skill_id}")
         updated = SkillRecord(
@@ -616,7 +632,8 @@ class ProceduralMemory:
             storage_format=record.storage_format,
             extras=record.extras,
         )
-        self.records[int(skill_id)] = updated
+        with self._records_lock:
+            self.records[int(skill_id)] = updated
         self.storage.update_skill(int(skill_id), deprecated_by=int(replacement_id))
 
     def save(self) -> None:

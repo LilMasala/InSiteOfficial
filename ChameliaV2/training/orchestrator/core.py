@@ -483,6 +483,7 @@ class DomainRunConfig:
     mcts_simulations: int = 16
     mcts_depth: int = 3
     mcts_rollout_horizon: int = 3
+    mcts_use_baseline_guard: bool = True
     primary_metric: str = "episode_reward_mean"
     primary_mode: str = "max"
     parity_threshold: float | None = None
@@ -551,6 +552,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 mcts_simulations=int(entry.get("mcts_simulations", 16)),
                 mcts_depth=int(entry.get("mcts_depth", 3)),
                 mcts_rollout_horizon=int(entry.get("mcts_rollout_horizon", 3)),
+                mcts_use_baseline_guard=bool(entry.get("mcts_use_baseline_guard", True)),
                 primary_metric=str(entry.get("primary_metric", "episode_reward_mean")),
                 primary_mode=str(entry.get("primary_mode", "max")),
                 parity_threshold=entry.get("parity_threshold"),
@@ -1072,6 +1074,7 @@ class UnifiedTrainingOrchestrator:
             simulations=domain_cfg.mcts_simulations,
             max_depth=domain_cfg.mcts_depth,
             rollout_horizon=domain_cfg.mcts_rollout_horizon,
+            use_baseline_guard=domain_cfg.mcts_use_baseline_guard,
         )
         model = Chamelia(
             hjepa=hjepa,
@@ -1187,7 +1190,14 @@ class UnifiedTrainingOrchestrator:
         if isinstance(tokenizer, torch.nn.Module):
             tokenizer.train()
         family_loss = self._build_representation_loss(family_name)
-        for _ in range(steps):
+        progress_interval = max(1, min(50, max(steps // 5, 1)))
+        loss_window: deque[float] = deque(maxlen=progress_interval)
+        print(
+            f"[{adapter.domain_name}] bootstrap_pretrain start steps={steps} "
+            f"batch_size={batch_size} mask_ratio={mask_ratio:.2f}",
+            flush=True,
+        )
+        for step_idx in range(1, steps + 1):
             batch_obs = random.sample(raw_observations, min(batch_size, len(raw_observations)))
             prepared = [adapter.prepare_bridge_observation(obs) for obs in batch_obs]
             collated = tokenizer.collate(prepared) if hasattr(tokenizer, "collate") else torch.stack(prepared, dim=0)
@@ -1211,6 +1221,14 @@ class UnifiedTrainingOrchestrator:
             loss = loss_dict["loss"]
             loss.backward()
             optimizer.step()
+            loss_window.append(float(loss.detach().item()))
+            if step_idx % progress_interval == 0 or step_idx == 1 or step_idx == steps:
+                print(
+                    f"[{adapter.domain_name}] bootstrap_pretrain step={step_idx}/{steps} "
+                    f"loss={float(loss.detach().item()):.4f} "
+                    f"loss_mean={mean(loss_window):.4f}",
+                    flush=True,
+                )
 
     def _extract_search_policy(
         self,

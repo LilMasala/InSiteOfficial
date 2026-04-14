@@ -448,14 +448,28 @@ class BODEGenOptimizer:
             or ExactMarginalLogLikelihood is None
         ):
             raise RuntimeError("botorch and gpytorch are required for BODE-GEN optimisation.")
+        requested_device = torch.device(device)
+        optimization_device = (
+            torch.device("cpu") if requested_device.type == "mps" else requested_device
+        )
         search_dim = int(self.latent_prompt_dim or latent_action_encoder.latent_prompt_dim)
         bounds = torch.tensor(
             [[0.0] * search_dim, [1.0] * search_dim],
             dtype=torch.double,
-            device=device,
+            device=optimization_device,
         )
-        low = torch.full((search_dim,), -self.latent_bound, dtype=torch.double, device=device)
-        high = torch.full((search_dim,), self.latent_bound, dtype=torch.double, device=device)
+        low = torch.full(
+            (search_dim,),
+            -self.latent_bound,
+            dtype=torch.double,
+            device=optimization_device,
+        )
+        high = torch.full(
+            (search_dim,),
+            self.latent_bound,
+            dtype=torch.double,
+            device=optimization_device,
+        )
 
         def _actualize(unit_candidate: torch.Tensor) -> torch.Tensor:
             return low + ((high - low) * unit_candidate)
@@ -463,7 +477,13 @@ class BODEGenOptimizer:
         train_x = []
         if seed_prompts:
             for prompt in seed_prompts[: self.num_initial_points]:
-                actual = prompt.detach().reshape(-1).to(device=device, dtype=torch.double)
+                actual = (
+                    prompt.detach()
+                    .reshape(-1)
+                    .float()
+                    .cpu()
+                    .to(device=optimization_device, dtype=torch.double)
+                )
                 if actual.numel() != search_dim:
                     continue
                 normalized = (actual - low) / (high - low).clamp_min(1.0e-6)
@@ -471,26 +491,32 @@ class BODEGenOptimizer:
         if seed_paths:
             for path in seed_paths[: self.num_initial_points]:
                 inferred = latent_action_encoder.infer_prompt(
-                    path.detach().to(device),
+                    path.detach().to(requested_device),
                     symbolic_codes=(
-                        symbolic_codes.to(device=device)
+                        symbolic_codes.to(device=requested_device)
                         if symbolic_codes is not None
                         else None
                     ),
                 ).squeeze(0)
-                actual = inferred.detach().reshape(-1).to(device=device, dtype=torch.double)
+                actual = (
+                    inferred.detach()
+                    .reshape(-1)
+                    .float()
+                    .cpu()
+                    .to(device=optimization_device, dtype=torch.double)
+                )
                 normalized = (actual - low) / (high - low).clamp_min(1.0e-6)
                 train_x.append(normalized.clamp(0.0, 1.0))
         sobol = torch.quasirandom.SobolEngine(search_dim, scramble=True)
         while len(train_x) < self.num_initial_points:
-            sample = sobol.draw(1, dtype=torch.double).squeeze(0).to(device)
+            sample = sobol.draw(1, dtype=torch.double).squeeze(0).to(optimization_device)
             train_x.append(sample)
         train_x_tensor = torch.stack(train_x, dim=0)
         observed_prompts: list[torch.Tensor] = []
         observed_embeddings: list[torch.Tensor] = []
 
         def _evaluate_prompt(prompt_vector: torch.Tensor) -> tuple[float, torch.Tensor, torch.Tensor]:
-            prompt_batch = prompt_vector.to(device=device, dtype=torch.float32).view(1, -1)
+            prompt_batch = prompt_vector.to(device=requested_device, dtype=torch.float32).view(1, -1)
             with torch.no_grad():
                 action_path = latent_action_encoder.decode_prompt(
                     prompt_batch,
@@ -499,7 +525,7 @@ class BODEGenOptimizer:
                 embedding = latent_action_encoder(
                     action_path,
                     symbolic_codes=(
-                        symbolic_codes.to(device=device)
+                        symbolic_codes.to(device=requested_device)
                         if symbolic_codes is not None
                         else None
                     ),
@@ -531,7 +557,7 @@ class BODEGenOptimizer:
         train_y_tensor = torch.tensor(
             [[score] for score in initial_scores],
             dtype=torch.double,
-            device=device,
+            device=optimization_device,
         )
         best_index = int(train_y_tensor.argmax().item())
         best_x = train_x_tensor[best_index].clone()
@@ -559,7 +585,7 @@ class BODEGenOptimizer:
             train_y_tensor = torch.cat(
                 [
                     train_y_tensor,
-                    torch.tensor([[candidate_y]], dtype=torch.double, device=device),
+                    torch.tensor([[candidate_y]], dtype=torch.double, device=optimization_device),
                 ],
                 dim=0,
             )

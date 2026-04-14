@@ -622,6 +622,30 @@ def test_bootstrap_seeded_replay_supports_replay_warmup_batches(tmp_path: Path) 
     )
 
 
+def test_bootstrap_pretrain_logs_progress(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "bootstrap_pretrain_logs")
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    domain_cfg = config.domains[0]
+    adapter = orchestrator._build_adapter(domain_cfg)
+    transitions = orchestrator._collect_bootstrap_trajectories(adapter, domain_cfg)
+    observations = orchestrator._bootstrap_observations(transitions)
+
+    orchestrator._pretrain_hjepa(
+        domain_cfg.family,
+        adapter,
+        observations,
+        steps=3,
+        batch_size=1,
+        mask_ratio=domain_cfg.mask_ratio,
+        lr=1.0e-4,
+    )
+
+    captured = capsys.readouterr().out
+    assert "bootstrap_pretrain start" in captured
+    assert "bootstrap_pretrain step=1/3" in captured
+    assert "bootstrap_pretrain step=3/3" in captured
+
+
 def test_evaluate_model_never_uses_training_exploration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = _tiny_orchestrator_config(tmp_path / "eval_no_explore")
     orchestrator = UnifiedTrainingOrchestrator(config)
