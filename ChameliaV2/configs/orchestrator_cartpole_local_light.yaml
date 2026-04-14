@@ -47,8 +47,8 @@ sleep:
 
 logging:
   representation_loss: hjepa
-  num_candidates: 6
-  path_length: 3
+  num_candidates: 2
+  path_length: 8
 
 domains:
   - name: cartpole
@@ -68,9 +68,9 @@ domains:
     planner_backend: mcts
     world_model_backend: mamba
     baselines: [random]
-    mcts_simulations: 16
-    mcts_depth: 3
-    mcts_rollout_horizon: 3
+    mcts_simulations: 48
+    mcts_depth: 5
+    mcts_rollout_horizon: 20
     mcts_use_baseline_guard: false
     primary_metric: episode_reward_mean
     primary_mode: max
@@ -80,6 +80,7 @@ domains:
         use_memory: true
         use_sleep: true
         train_hjepa: true
-        behavior_cloning_weight: 0.75
+        behavior_cloning_weight: 0.2
+        critic_loss_weight: 2.0
         exploration_epsilon_start: 0.5
         exploration_epsilon_end: 0.05

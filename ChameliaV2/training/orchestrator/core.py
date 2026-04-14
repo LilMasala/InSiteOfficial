@@ -196,6 +196,8 @@ class ReplayRecord:
     surprise_bonus: float = 0.0
     surprise_priority: float = 1.0
     promotion_source: str | None = None
+    episode_return: float = 0.0
+    planner_selected_path: torch.Tensor | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -236,6 +238,8 @@ class ReplayRecord:
             "surprise_bonus": float(self.surprise_bonus),
             "surprise_priority": float(self.surprise_priority),
             "promotion_source": self.promotion_source,
+            "episode_return": float(self.episode_return),
+            "planner_selected_path": None if self.planner_selected_path is None else self.planner_selected_path.detach().cpu(),
         }
 
     @classmethod
@@ -278,6 +282,8 @@ class ReplayRecord:
             surprise_bonus=float(payload.get("surprise_bonus", 0.0)),
             surprise_priority=float(payload.get("surprise_priority", 1.0)),
             promotion_source=payload.get("promotion_source"),
+            episode_return=float(payload.get("episode_return", 0.0)),
+            planner_selected_path=None if payload.get("planner_selected_path") is None else payload["planner_selected_path"].float(),
         )
 
 
@@ -1519,6 +1525,16 @@ class UnifiedTrainingOrchestrator:
     ) -> torch.Tensor:
         targets: list[int] = []
         for record in records:
+            # Planner-Led Imitation: prefer the planner's original selected action,
+            # not the executed action which may have been overridden by epsilon-random.
+            planner_path = record.planner_selected_path
+            if planner_path is not None:
+                vec = planner_path.detach().float()
+                if vec.dim() > 1:
+                    vec = vec[0]  # first step of the path
+                if vec.numel() >= action_dim:
+                    targets.append(int(vec[:action_dim].argmax().item()))
+                    continue
             vec = record.action_logits_or_vec.detach().float()
             if vec.dim() > 1:
                 vec = vec.reshape(-1)
@@ -1702,7 +1718,18 @@ class UnifiedTrainingOrchestrator:
                 repeated_targets,
                 reduction="none",
             ).view(first_step_logits.shape[0], first_step_logits.shape[1])
-            bc_loss = per_candidate_bc.min(dim=1).values.mean()
+            bc_per_sample = per_candidate_bc.min(dim=1).values
+            episode_returns = torch.tensor(
+                [record.episode_return for record in valid],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            ret_min, ret_max = episode_returns.min(), episode_returns.max()
+            if ret_max > ret_min:
+                bc_weights = (episode_returns - ret_min) / (ret_max - ret_min + 1e-8)
+            else:
+                bc_weights = torch.ones_like(episode_returns)
+            bc_loss = (bc_weights * bc_per_sample).mean()
         if target_weights is None:
             target_weights = torch.softmax(
                 (-candidate_costs["total"].detach()) / 0.25,
@@ -2513,6 +2540,7 @@ class UnifiedTrainingOrchestrator:
             surprise_bonus=float(surprise_bonus),
             surprise_priority=float(surprise_priority),
             promotion_source=promotion_source,
+            planner_selected_path=outputs["selected_path"][0].detach().cpu(),
         )
 
     @contextmanager
@@ -3021,6 +3049,9 @@ class UnifiedTrainingOrchestrator:
                     break
             episode_rewards.append(float(episode_reward))
             episode_lengths.append(int(step_idx + 1))
+            for r in self.replay.records:
+                if r.domain_id == domain_cfg.name and r.episode_id == episode_idx:
+                    r.episode_return = float(episode_reward)
             if episode_idx % progress_interval == 0 or episode_idx == 1:
                 output_summary = self._summarize_outputs(outputs)
                 planner_debug = self._extract_planner_diagnostics(outputs, batch_idx=0)
