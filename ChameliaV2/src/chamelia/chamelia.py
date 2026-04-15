@@ -240,6 +240,7 @@ class Chamelia(nn.Module):
         self.action_dim = self.geometry.A
         self.actor.bind_geometry(self.geometry)
         self.world_model.bind_geometry(self.geometry)
+        self.configurator.bind_geometry(self.geometry)
 
     def get_domain_tokenizer(self) -> nn.Module | None:
         """Return the registered domain tokenizer module if present.

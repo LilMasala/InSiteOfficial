@@ -93,9 +93,9 @@ class Actor(nn.Module):
             num_ctx_tokens: Expected number of configurator context tokens.
             posture_dim: Behavioural-intent bottleneck dimension P (default 16).
                 Kept intentionally small so postures act as compressed strategy
-                codes rather than full latent vectors.  Before being stored in
-                LatentMemory, postures are projected to D via
-                ``self.posture_to_intent``.
+                codes rather than full latent vectors.  ``MemoryRelevanceScorer``
+                handles the P → D projection internally before comparing postures
+                during retrieval, so no external projection is required.
 
         Returns:
             None.
@@ -197,29 +197,6 @@ class Actor(nn.Module):
         )
         self.mode_1_policy = nn.Linear(embed_dim, action_dim)
 
-        # Projects P-dimensional posture vectors to D-dimensional intent
-        # vectors before they are written to LatentMemory.  This keeps the
-        # internal posture bottleneck small while ensuring memory retrieval
-        # and RSD novelty comparisons happen in the shared D-space.
-        self.posture_to_intent = nn.Sequential(
-            nn.Linear(posture_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-        )
-
-    def encode_posture_as_intent(self, postures: torch.Tensor) -> torch.Tensor:
-        """Project P-dimensional postures to D-dimensional intent vectors.
-
-        Call this before storing ``selected_posture`` in an ``EpisodeRecord``
-        so that LatentMemory always holds D-dimensional representations.
-
-        Args:
-            postures: Tensor of shape [..., P].
-
-        Returns:
-            Tensor of shape [..., D].
-        """
-        return self.posture_to_intent(postures)
-
     def bind_geometry(self, geometry: "SessionGeometry") -> None:
         """Rebind action-dimension-dependent heads from a SessionGeometry.
 
@@ -230,16 +207,31 @@ class Actor(nn.Module):
 
         Only the four action-output heads (``action_head``, ``refinement_head``,
         ``posture_path_head``, ``mode_1_policy``) and, when H changes,
-        ``step_posture_embeddings`` are rebuilt.  The internal posture
-        architecture (bottleneck size P, projections, seeds) is domain-agnostic
-        and is never touched here.
+        ``step_posture_embeddings`` are rebuilt.
+
+        ``candidate_selection_head`` is NOT rebuilt here because its input
+        shape is ``D + P``, which depends only on ``embed_dim`` and
+        ``posture_dim`` — both are fixed for the lifetime of the model and
+        independent of the domain's action space.
 
         Args:
-            geometry: SessionGeometry describing {D, A, O, P, K, H, T}.
+            geometry: SessionGeometry describing {D, A, P, K, H, T}.
+
+        Raises:
+            ValueError: If ``geometry.P != self.posture_dim``.  The posture
+                bottleneck is a model-level constant; it cannot be changed by
+                switching domains.
 
         Returns:
             None.
         """
+        if geometry.P != self.posture_dim:
+            raise ValueError(
+                f"geometry.P={geometry.P} does not match "
+                f"actor.posture_dim={self.posture_dim}.  "
+                "The posture bottleneck is fixed at construction time."
+            )
+
         A = geometry.A
         H = geometry.H
 

@@ -157,16 +157,36 @@ class MambaActionConditionedWorldModel(nn.Module):
         self.state_norm = nn.LayerNorm(embed_dim)
 
     def bind_geometry(self, geometry: "SessionGeometry") -> None:
-        """Record A/P from geometry for introspection; projections self-bind via LazyLinear.
+        """Bind or rebind the action projection to a concrete action dimension.
+
+        Mirrors ``ActionConditionedWorldModel.bind_geometry``: replaces the
+        ``LazyLinear`` in ``action_proj`` with a materialised ``Linear(A, D)``
+        once A is known, and handles domain switches by rebuilding when A
+        changes.  Idempotent when A is unchanged and already materialised.
 
         Args:
-            geometry: SessionGeometry describing {D, A, O, P, K, H}.
+            geometry: SessionGeometry describing {D, A, P, K, H, T}.
 
         Returns:
             None.
         """
-        self.action_dim = geometry.A
-        self.posture_dim = geometry.P
+        A = geometry.A
+        is_lazy = isinstance(self.action_proj[0], nn.LazyLinear)
+        if not is_lazy and self.action_dim == A:
+            return
+
+        try:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+        except StopIteration:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+        self.action_proj = nn.Sequential(
+            nn.Linear(A, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+        ).to(device=device, dtype=dtype)
+        self.action_dim = A
 
     def forward(
         self,

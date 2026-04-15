@@ -996,36 +996,44 @@ class RSDAdversary:
     ) -> None:
         """Ensure the D-space generator and intent decoder are ready.
 
-        The generator is recreated only when ``latent_dim`` (D) changes,
-        which clears the novelty window to prevent dimension mismatches.
-        The intent decoder is recreated when ``action_dim`` (A) or
-        ``path_length`` (H) changes.
+        The generator and decoder are treated as a single unit.  The generator
+        learns to produce D-dimensional intent vectors that are meaningful only
+        *relative to a specific decoder*.  If the decoder is replaced (because
+        A or H changed), the generator's learned output distribution no longer
+        maps to valid actions — so both must be reset together.
+
+        Concretely, we reset the whole unit whenever any of the following
+        change: ``latent_dim`` (D), ``path_length`` (H), ``action_dim`` (A).
+        The novelty window is also cleared on any reset because its snapshots
+        were accumulated under the old generator.
         """
-        # -- Generator (D-space) ------------------------------------------
-        if self.generator is not None and self._latent_dim == latent_dim:
-            self.generator.to(device)
-        else:
+        action_space_changed = (
+            self.path_length != path_length or self.action_dim != action_dim
+        )
+        latent_space_changed = (self._latent_dim != latent_dim)
+        needs_reset = (
+            self.generator is None
+            or action_space_changed
+            or latent_space_changed
+        )
+
+        if needs_reset:
             self.generator = _DiagonalGaussianSkillGenerator(
                 state_dim=state_dim,
-                output_dim=latent_dim,  # always D, domain-agnostic
+                output_dim=latent_dim,  # always D — domain-agnostic
             ).to(device)
             self.generator_optim = torch.optim.Adam(
                 self.generator.parameters(), lr=self.learning_rate
             )
-            self._latent_dim = latent_dim
-            # Clear window: snapshots from a different D are incompatible.
-            self.window.clear()
-
-        # -- Intent decoder (D → path_length * action_dim) ----------------
-        if (
-            self.intent_decoder is None
-            or self.path_length != path_length
-            or self.action_dim != action_dim
-        ):
             self.intent_decoder = nn.Linear(latent_dim, path_length * action_dim).to(device)
+            self._latent_dim = latent_dim
             self.path_length = path_length
             self.action_dim = action_dim
+            # Window snapshots are tied to the old generator's output space;
+            # discard them to prevent stale KL comparisons.
+            self.window.clear()
         else:
+            self.generator.to(device)
             self.intent_decoder.to(device)
 
     def _decode_intents(self, intents: torch.Tensor) -> torch.Tensor:

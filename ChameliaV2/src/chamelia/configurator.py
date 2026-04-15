@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from src.chamelia.session_geometry import SessionGeometry
 
 
 class TransformerBlock(nn.Module):
@@ -98,6 +102,10 @@ class Configurator(nn.Module):
         self.num_ctx_tokens = num_ctx_tokens
         self.memory_read_k = memory_read_k
         self.num_hierarchies = num_hierarchies
+        # Stored for idempotent rebuilds in bind_geometry.
+        self._num_heads = num_heads
+        self._mlp_ratio = mlp_ratio
+        self._dropout = dropout
 
         self.ctx_tokens = nn.Parameter(torch.empty(1, num_ctx_tokens, embed_dim))
         nn.init.trunc_normal_(self.ctx_tokens, std=0.02)
@@ -137,6 +145,72 @@ class Configurator(nn.Module):
         self.norm_memory = nn.LayerNorm(embed_dim)
         self.norm_out = nn.LayerNorm(embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
+
+    def bind_geometry(self, geometry: "SessionGeometry") -> None:
+        """Rebind attention heads and context-token budget from a SessionGeometry.
+
+        Idempotent: a no-op when both ``geometry.num_heads`` and
+        ``geometry.num_ctx_tokens`` already match the current configuration.
+
+        When ``num_heads`` changes, ``self_attn_layers``,
+        ``cross_attn_to_latent``, and ``cross_attn_to_memory`` are rebuilt
+        with the new head count.  Existing weights are lost on a genuine head-
+        count change, so this should only happen at session initialisation
+        rather than mid-training domain switches.
+
+        When ``num_ctx_tokens`` changes, ``ctx_tokens`` is re-initialised to a
+        fresh parameter of the correct shape.
+
+        Args:
+            geometry: SessionGeometry whose ``num_heads`` and ``num_ctx_tokens``
+                properties drive the rebuild decision.
+
+        Returns:
+            None.
+        """
+        new_heads = geometry.num_heads
+        new_ctx = geometry.num_ctx_tokens
+        heads_match = (new_heads == self._num_heads)
+        ctx_match = (new_ctx == self.num_ctx_tokens)
+        if heads_match and ctx_match:
+            return
+
+        try:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+        except StopIteration:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+        D = self.embed_dim
+
+        if not heads_match:
+            num_layers = len(self.self_attn_layers)
+            self.self_attn_layers = nn.ModuleList(
+                [
+                    TransformerBlock(
+                        embed_dim=D,
+                        num_heads=new_heads,
+                        mlp_ratio=self._mlp_ratio,
+                        dropout=self._dropout,
+                    )
+                    for _ in range(num_layers)
+                ]
+            ).to(device=device, dtype=dtype)
+            self.cross_attn_to_latent = nn.MultiheadAttention(
+                D, new_heads, dropout=self._dropout, batch_first=True
+            ).to(device=device, dtype=dtype)
+            self.cross_attn_to_memory = nn.MultiheadAttention(
+                D, new_heads, dropout=self._dropout, batch_first=True
+            ).to(device=device, dtype=dtype)
+            self._num_heads = new_heads
+
+        if not ctx_match:
+            self.ctx_tokens = nn.Parameter(
+                torch.empty(1, new_ctx, D, device=device, dtype=dtype)
+            )
+            nn.init.trunc_normal_(self.ctx_tokens, std=0.02)
+            self.num_ctx_tokens = new_ctx
 
     def forward(
         self,

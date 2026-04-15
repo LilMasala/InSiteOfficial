@@ -109,21 +109,42 @@ class ActionConditionedWorldModel(nn.Module):
         self.state_norm = nn.LayerNorm(embed_dim)
 
     def bind_geometry(self, geometry: "SessionGeometry") -> None:
-        """Rebind action/posture projections from a SessionGeometry.
+        """Bind or rebind the action projection to a concrete action dimension.
 
-        Because ``action_proj`` and ``posture_proj`` now use ``LazyLinear``,
-        this method is optional — the projections self-materialise on the first
-        forward pass.  Calling it explicitly eagerly materialises the weights
-        and records the current A/P dims for introspection.
+        The world model is constructed with ``action_proj`` as a
+        ``LazyLinear`` so that A does not need to be known at construction
+        time.  This method replaces it with a materialised ``Linear(A, D)``
+        once A is known.
+
+        Idempotent: a no-op when A is unchanged and ``action_proj`` has
+        already been materialised (i.e. is no longer a ``LazyLinear``).
+        On a domain switch with a different A, the projection is rebuilt
+        with fresh weights — the world model must re-learn the new action
+        embedding from that point onward.
 
         Args:
-            geometry: SessionGeometry describing {D, A, O, P, K, H}.
+            geometry: SessionGeometry describing {D, A, P, K, H, T}.
 
         Returns:
             None.
         """
-        self.action_dim = geometry.A
-        self.posture_dim = geometry.P
+        A = geometry.A
+        is_lazy = isinstance(self.action_proj[0], nn.LazyLinear)
+        if not is_lazy and self.action_dim == A:
+            return
+
+        try:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+        except StopIteration:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+        self.action_proj = nn.Sequential(
+            nn.Linear(A, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+        ).to(device=device, dtype=dtype)
+        self.action_dim = A
 
     def forward(
         self,
