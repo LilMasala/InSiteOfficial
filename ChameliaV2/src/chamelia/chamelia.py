@@ -226,12 +226,16 @@ class Chamelia(nn.Module):
             self.mcts_search.imagined_domain_state_builder = domain.build_imagined_domain_state
             self.mcts_search.simple_baseline_builder = domain.build_simple_baseline_path
 
-        # Build SessionGeometry and propagate to all geometry-aware sub-modules.
+        # Build SessionGeometry and propagate to geometry-aware sub-modules.
+        # H is the Actor's per-candidate path length; T is the world-model's
+        # rollout horizon for value estimation.  They are distinct concepts.
         self.geometry = SessionGeometry.from_domain(
             domain,
             D=self.embed_dim,
+            P=self.actor.posture_dim,
             K=self.actor.num_candidates,
-            H=self.rollout_horizon,
+            H=self.actor.path_length,
+            T=self.rollout_horizon,
         )
         self.action_dim = self.geometry.A
         self.actor.bind_geometry(self.geometry)

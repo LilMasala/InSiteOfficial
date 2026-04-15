@@ -50,17 +50,13 @@ class ActionConditionedWorldModel(nn.Module):
         self,
         embed_dim: int = 512,
         action_dim: int = 64,
-        posture_dim: int | None = None,
+        posture_dim: int = 16,
         num_heads: int = 8,
         num_layers: int = 2,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         max_horizon: int = 8,
     ) -> None:
-        # posture_dim defaults to embed_dim (P=D) matching the Actor convention.
-        if posture_dim is None:
-            posture_dim = embed_dim
-
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
@@ -71,14 +67,16 @@ class ActionConditionedWorldModel(nn.Module):
             nn.Linear(embed_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
-        # LazyLinear defers in_features binding to the first forward pass so
-        # that the world model does not need to know A at construction time.
+        # LazyLinear defers in_features (= A) to the first forward pass so
+        # the world model does not need to know the action dimension at
+        # construction time.  posture_proj uses a regular Linear because P
+        # is known at construction.
         self.action_proj = nn.Sequential(
             nn.LazyLinear(embed_dim),
             nn.LayerNorm(embed_dim),
         )
         self.posture_proj = nn.Sequential(
-            nn.LazyLinear(embed_dim),
+            nn.Linear(posture_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
         self.time_embed = nn.Embedding(max_horizon, embed_dim)

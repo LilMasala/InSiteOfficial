@@ -105,7 +105,7 @@ class MambaActionConditionedWorldModel(nn.Module):
         *,
         embed_dim: int = 512,
         action_dim: int = 64,
-        posture_dim: int | None = None,
+        posture_dim: int = 16,
         num_layers: int = 2,
         mlp_ratio: float = 2.0,
         dropout: float = 0.0,
@@ -115,19 +115,16 @@ class MambaActionConditionedWorldModel(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
     ) -> None:
-        # posture_dim defaults to embed_dim (P=D).
-        if posture_dim is None:
-            posture_dim = embed_dim
-
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
         self.posture_dim = posture_dim
         self.max_horizon = max_horizon
         self.state_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim))
-        # LazyLinear defers in_features so A is not needed at construction time.
+        # LazyLinear defers in_features (= A) to the first forward pass.
+        # posture_proj uses a regular Linear because P is known at construction.
         self.action_proj = nn.Sequential(nn.LazyLinear(embed_dim), nn.LayerNorm(embed_dim))
-        self.posture_proj = nn.Sequential(nn.LazyLinear(embed_dim), nn.LayerNorm(embed_dim))
+        self.posture_proj = nn.Sequential(nn.Linear(posture_dim, embed_dim), nn.LayerNorm(embed_dim))
         self.reasoning_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim))
         self.ctx_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim))
         self.time_embed = nn.Embedding(max_horizon, embed_dim)

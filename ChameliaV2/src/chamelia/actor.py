@@ -79,7 +79,7 @@ class Actor(nn.Module):
         num_ctx_tokens: int = 16,
         num_candidates: int = 6,
         path_length: int = 3,
-        posture_dim: int | None = None,
+        posture_dim: int = 16,
     ) -> None:
         """Initialize the actor.
 
@@ -91,16 +91,15 @@ class Actor(nn.Module):
             mlp_ratio: Expansion ratio for transformer MLPs.
             dropout: Dropout probability.
             num_ctx_tokens: Expected number of configurator context tokens.
+            posture_dim: Behavioural-intent bottleneck dimension P (default 16).
+                Kept intentionally small so postures act as compressed strategy
+                codes rather than full latent vectors.  Before being stored in
+                LatentMemory, postures are projected to D via
+                ``self.posture_to_intent``.
 
         Returns:
             None.
         """
-        # posture_dim defaults to embed_dim (P=D): postures are D-dimensional
-        # intent vectors stored directly in LatentMemory.  Passing an explicit
-        # posture_dim < embed_dim is kept for backwards-compat but deprecated.
-        if posture_dim is None:
-            posture_dim = embed_dim
-
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
@@ -198,24 +197,56 @@ class Actor(nn.Module):
         )
         self.mode_1_policy = nn.Linear(embed_dim, action_dim)
 
-    def bind_geometry(self, geometry: "SessionGeometry") -> None:
-        """Late-bind action-dimension-dependent heads from a SessionGeometry.
+        # Projects P-dimensional posture vectors to D-dimensional intent
+        # vectors before they are written to LatentMemory.  This keeps the
+        # internal posture bottleneck small while ensuring memory retrieval
+        # and RSD novelty comparisons happen in the shared D-space.
+        self.posture_to_intent = nn.Sequential(
+            nn.Linear(posture_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
 
-        Called by ``Chamelia.set_domain()`` at the start of every session.
-        Rebuilds the four action-output layers (``action_head``,
-        ``refinement_head``, ``posture_path_head``, ``mode_1_policy``) to
-        emit exactly ``geometry.A`` action dimensions.  If ``geometry.H``
-        differs from the current ``path_length``, ``step_posture_embeddings``
-        is also re-initialised.
+    def encode_posture_as_intent(self, postures: torch.Tensor) -> torch.Tensor:
+        """Project P-dimensional postures to D-dimensional intent vectors.
+
+        Call this before storing ``selected_posture`` in an ``EpisodeRecord``
+        so that LatentMemory always holds D-dimensional representations.
 
         Args:
-            geometry: SessionGeometry describing {D, A, O, P, K, H}.
+            postures: Tensor of shape [..., P].
+
+        Returns:
+            Tensor of shape [..., D].
+        """
+        return self.posture_to_intent(postures)
+
+    def bind_geometry(self, geometry: "SessionGeometry") -> None:
+        """Rebind action-dimension-dependent heads from a SessionGeometry.
+
+        Idempotent: if ``geometry.A == self.action_dim`` and
+        ``geometry.H == self.path_length`` the call is a no-op so that the
+        existing initialised weights are preserved (e.g. after ``.to(device)``
+        has already placed them on the target device).
+
+        Only the four action-output heads (``action_head``, ``refinement_head``,
+        ``posture_path_head``, ``mode_1_policy``) and, when H changes,
+        ``step_posture_embeddings`` are rebuilt.  The internal posture
+        architecture (bottleneck size P, projections, seeds) is domain-agnostic
+        and is never touched here.
+
+        Args:
+            geometry: SessionGeometry describing {D, A, O, P, K, H, T}.
 
         Returns:
             None.
         """
         A = geometry.A
         H = geometry.H
+
+        # Idempotent guard: skip rebuild if nothing action-relevant changed.
+        if self.action_dim == A and self.path_length == H:
+            return
+
         D = self.embed_dim
         P = self.posture_dim
         try:
