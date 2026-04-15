@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from src.chamelia.session_geometry import SessionGeometry
 
 
 class TransformerBlock(nn.Module):
@@ -45,13 +50,17 @@ class ActionConditionedWorldModel(nn.Module):
         self,
         embed_dim: int = 512,
         action_dim: int = 64,
-        posture_dim: int = 16,
+        posture_dim: int | None = None,
         num_heads: int = 8,
         num_layers: int = 2,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         max_horizon: int = 8,
     ) -> None:
+        # posture_dim defaults to embed_dim (P=D) matching the Actor convention.
+        if posture_dim is None:
+            posture_dim = embed_dim
+
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
@@ -62,12 +71,14 @@ class ActionConditionedWorldModel(nn.Module):
             nn.Linear(embed_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
+        # LazyLinear defers in_features binding to the first forward pass so
+        # that the world model does not need to know A at construction time.
         self.action_proj = nn.Sequential(
-            nn.Linear(action_dim, embed_dim),
+            nn.LazyLinear(embed_dim),
             nn.LayerNorm(embed_dim),
         )
         self.posture_proj = nn.Sequential(
-            nn.Linear(posture_dim, embed_dim),
+            nn.LazyLinear(embed_dim),
             nn.LayerNorm(embed_dim),
         )
         self.time_embed = nn.Embedding(max_horizon, embed_dim)
@@ -98,6 +109,23 @@ class ActionConditionedWorldModel(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         self.state_norm = nn.LayerNorm(embed_dim)
+
+    def bind_geometry(self, geometry: "SessionGeometry") -> None:
+        """Rebind action/posture projections from a SessionGeometry.
+
+        Because ``action_proj`` and ``posture_proj`` now use ``LazyLinear``,
+        this method is optional — the projections self-materialise on the first
+        forward pass.  Calling it explicitly eagerly materialises the weights
+        and records the current A/P dims for introspection.
+
+        Args:
+            geometry: SessionGeometry describing {D, A, O, P, K, H}.
+
+        Returns:
+            None.
+        """
+        self.action_dim = geometry.A
+        self.posture_dim = geometry.P
 
     def forward(
         self,

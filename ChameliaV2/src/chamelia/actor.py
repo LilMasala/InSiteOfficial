@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from src.chamelia.session_geometry import SessionGeometry
 
 
 class TransformerBlock(nn.Module):
@@ -74,7 +79,7 @@ class Actor(nn.Module):
         num_ctx_tokens: int = 16,
         num_candidates: int = 6,
         path_length: int = 3,
-        posture_dim: int = 16,
+        posture_dim: int | None = None,
     ) -> None:
         """Initialize the actor.
 
@@ -90,6 +95,12 @@ class Actor(nn.Module):
         Returns:
             None.
         """
+        # posture_dim defaults to embed_dim (P=D): postures are D-dimensional
+        # intent vectors stored directly in LatentMemory.  Passing an explicit
+        # posture_dim < embed_dim is kept for backwards-compat but deprecated.
+        if posture_dim is None:
+            posture_dim = embed_dim
+
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
@@ -186,6 +197,62 @@ class Actor(nn.Module):
             nn.Linear(embed_dim // 2, 1),
         )
         self.mode_1_policy = nn.Linear(embed_dim, action_dim)
+
+    def bind_geometry(self, geometry: "SessionGeometry") -> None:
+        """Late-bind action-dimension-dependent heads from a SessionGeometry.
+
+        Called by ``Chamelia.set_domain()`` at the start of every session.
+        Rebuilds the four action-output layers (``action_head``,
+        ``refinement_head``, ``posture_path_head``, ``mode_1_policy``) to
+        emit exactly ``geometry.A`` action dimensions.  If ``geometry.H``
+        differs from the current ``path_length``, ``step_posture_embeddings``
+        is also re-initialised.
+
+        Args:
+            geometry: SessionGeometry describing {D, A, O, P, K, H}.
+
+        Returns:
+            None.
+        """
+        A = geometry.A
+        H = geometry.H
+        D = self.embed_dim
+        P = self.posture_dim
+        try:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+        except StopIteration:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+        self.action_head = nn.Sequential(
+            nn.Linear(D, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, A * H),
+        ).to(device=device, dtype=dtype)
+
+        self.refinement_head = nn.Sequential(
+            nn.Linear(D, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, A * H),
+        ).to(device=device, dtype=dtype)
+
+        self.posture_path_head = nn.Sequential(
+            nn.Linear(P, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, A),
+        ).to(device=device, dtype=dtype)
+
+        self.mode_1_policy = nn.Linear(D, A).to(device=device, dtype=dtype)
+
+        if H != self.path_length:
+            self.path_length = H
+            self.step_posture_embeddings = nn.Parameter(
+                torch.empty(1, 1, H, P, device=device, dtype=dtype)
+            )
+            nn.init.trunc_normal_(self.step_posture_embeddings, std=0.02)
+
+        self.action_dim = A
 
     def _encode_state(self, z: torch.Tensor) -> torch.Tensor:
         """Encode the current latent state into a planning token."""

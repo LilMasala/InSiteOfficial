@@ -929,7 +929,23 @@ class _DiagonalGaussianSkillGenerator(nn.Module):
 
 
 class RSDAdversary:
-    """Regret-aware adversarial skill discovery with a latent generator policy."""
+    """Regret-aware adversarial skill discovery operating in Global-D intent space.
+
+    Architecture
+    ------------
+    The generator policy is a diagonal-Gaussian MLP that maps D-dimensional
+    latent states to D-dimensional *intent* vectors — one intent per episode
+    in the eligible batch.  A lightweight ``intent_decoder`` (``nn.Linear``)
+    then projects each intent to ``path_length × action_dim`` for world-model
+    evaluation.
+
+    Operating in D-space (rather than raw action space) has two benefits:
+
+    1.  The novelty window stores D-dimensional snapshots regardless of A,
+        eliminating the cross-domain dimension-mismatch crash on CartPole.
+    2.  Skill novelty is measured in the same space as LatentMemory keys,
+        so cosine distance in the window is semantically meaningful.
+    """
 
     def __init__(
         self,
@@ -949,10 +965,16 @@ class RSDAdversary:
         self.confidence_weight = confidence_weight
         self.regret_floor = regret_floor
         self.distinct_threshold = distinct_threshold
+        # Generator operates in D-space; recreated only when D changes.
         self.generator: _DiagonalGaussianSkillGenerator | None = None
         self.generator_optim: torch.optim.Optimizer | None = None
+        self._latent_dim: int | None = None
+        # Intent decoder maps D → path_length * action_dim; recreated when
+        # A or H changes.  Not part of any nn.Module tree — managed here.
+        self.intent_decoder: nn.Linear | None = None
         self.path_length: int | None = None
         self.action_dim: int | None = None
+        # Novelty window: all snapshots are D-dimensional intent vectors.
         self.window: list[_GeneratorSnapshot] = []
         self.previous_world_model: Any | None = None
         self.previous_cost_module: Any | None = None
@@ -967,30 +989,58 @@ class RSDAdversary:
         self,
         *,
         state_dim: int,
+        latent_dim: int,
         path_length: int,
         action_dim: int,
         device: torch.device,
     ) -> None:
-        output_dim = path_length * action_dim
-        if (
-            self.generator is not None
-            and self.path_length == path_length
-            and self.action_dim == action_dim
-        ):
-            self.generator.to(device)
-            return
-        self.generator = _DiagonalGaussianSkillGenerator(
-            state_dim=state_dim,
-            output_dim=output_dim,
-        ).to(device)
-        self.generator_optim = torch.optim.Adam(self.generator.parameters(), lr=self.learning_rate)
-        self.path_length = path_length
-        self.action_dim = action_dim
+        """Ensure the D-space generator and intent decoder are ready.
 
-    def _reshape_paths(self, flat_paths: torch.Tensor) -> torch.Tensor:
-        if self.path_length is None or self.action_dim is None:
+        The generator is recreated only when ``latent_dim`` (D) changes,
+        which clears the novelty window to prevent dimension mismatches.
+        The intent decoder is recreated when ``action_dim`` (A) or
+        ``path_length`` (H) changes.
+        """
+        # -- Generator (D-space) ------------------------------------------
+        if self.generator is not None and self._latent_dim == latent_dim:
+            self.generator.to(device)
+        else:
+            self.generator = _DiagonalGaussianSkillGenerator(
+                state_dim=state_dim,
+                output_dim=latent_dim,  # always D, domain-agnostic
+            ).to(device)
+            self.generator_optim = torch.optim.Adam(
+                self.generator.parameters(), lr=self.learning_rate
+            )
+            self._latent_dim = latent_dim
+            # Clear window: snapshots from a different D are incompatible.
+            self.window.clear()
+
+        # -- Intent decoder (D → path_length * action_dim) ----------------
+        if (
+            self.intent_decoder is None
+            or self.path_length != path_length
+            or self.action_dim != action_dim
+        ):
+            self.intent_decoder = nn.Linear(latent_dim, path_length * action_dim).to(device)
+            self.path_length = path_length
+            self.action_dim = action_dim
+        else:
+            self.intent_decoder.to(device)
+
+    def _decode_intents(self, intents: torch.Tensor) -> torch.Tensor:
+        """Decode D-dimensional intent vectors into action paths.
+
+        Args:
+            intents: Tensor of shape [B, D].
+
+        Returns:
+            Tensor of shape [B, path_length, action_dim].
+        """
+        if self.intent_decoder is None or self.path_length is None or self.action_dim is None:
             raise RuntimeError("RSD generator has not been initialized.")
-        return flat_paths.view(flat_paths.shape[0], self.path_length, self.action_dim)
+        flat = self.intent_decoder(intents)
+        return flat.view(flat.shape[0], self.path_length, self.action_dim)
 
     def _evaluate_paths(
         self,
@@ -1030,6 +1080,7 @@ class RSDAdversary:
         mean: torch.Tensor,
         log_std: torch.Tensor,
     ) -> torch.Tensor:
+        """KL-based novelty against the D-space intent window."""
         if not self.window:
             return torch.zeros(mean.shape[0], device=mean.device, dtype=mean.dtype)
         current_var = (2.0 * log_std).exp()
@@ -1079,6 +1130,15 @@ class RSDAdversary:
             device=paths.device,
         )
 
+    @staticmethod
+    def _normalize_regret(regret: torch.Tensor) -> torch.Tensor:
+        """Safely normalize regret; returns zero tensor for collapsed variance."""
+        mean = regret.mean()
+        std = regret.std(unbiased=False)
+        if std.item() < 1.0e-8:
+            return torch.zeros_like(regret)
+        return (regret - mean) / std
+
     def _update_window(
         self,
         mean: torch.Tensor,
@@ -1124,19 +1184,24 @@ class RSDAdversary:
         device = reference.key.device
         path_length = int(reference.selected_path.shape[0])
         action_dim = int(reference.selected_path.shape[-1])
+        # D is the state key dimension; generator and window always use D.
+        latent_dim = int(reference.key.shape[-1])
         self._ensure_generator(
-            state_dim=int(reference.key.shape[-1]),
+            state_dim=latent_dim,
+            latent_dim=latent_dim,
             path_length=path_length,
             action_dim=action_dim,
             device=device,
         )
         assert self.generator is not None
         assert self.generator_optim is not None
-        state_batch = torch.stack([record.key.detach().float() for record in eligible], dim=0).to(device)
+        state_batch = torch.stack(
+            [record.key.detach().float() for record in eligible], dim=0
+        ).to(device)
         for _ in range(self.generator_steps):
             distribution, mean, log_std = self.generator(state_batch)
-            flat_paths = distribution.rsample()
-            paths = self._reshape_paths(flat_paths)
+            intents = distribution.rsample()          # [B, D]
+            paths = self._decode_intents(intents)     # [B, H, A]
             current_value = self._evaluate_paths(
                 world_model=world_model,
                 cost_module=cost_module,
@@ -1153,8 +1218,8 @@ class RSDAdversary:
             else:
                 previous_value = torch.zeros_like(current_value)
             regret = current_value - previous_value
-            normalized_regret = (regret - regret.mean()) / regret.std(unbiased=False).clamp_min(1.0e-6)
-            log_prob = distribution.log_prob(flat_paths)
+            normalized_regret = self._normalize_regret(regret)
+            log_prob = distribution.log_prob(intents)
             window_novelty = self._window_novelty(mean, log_std)
             confidence_penalty = self._confidence_penalty(
                 paths=paths,
@@ -1171,7 +1236,8 @@ class RSDAdversary:
             loss.backward()
             self.generator_optim.step()
         distribution, mean, log_std = self.generator(state_batch)
-        paths = self._reshape_paths(mean)
+        intents = mean                                # deterministic decode
+        paths = self._decode_intents(intents)
         current_value = self._evaluate_paths(
             world_model=world_model,
             cost_module=cost_module,

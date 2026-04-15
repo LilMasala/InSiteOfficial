@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from src.chamelia.session_geometry import SessionGeometry
 
 
 try:
@@ -102,7 +105,7 @@ class MambaActionConditionedWorldModel(nn.Module):
         *,
         embed_dim: int = 512,
         action_dim: int = 64,
-        posture_dim: int = 16,
+        posture_dim: int | None = None,
         num_layers: int = 2,
         mlp_ratio: float = 2.0,
         dropout: float = 0.0,
@@ -112,14 +115,19 @@ class MambaActionConditionedWorldModel(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
     ) -> None:
+        # posture_dim defaults to embed_dim (P=D).
+        if posture_dim is None:
+            posture_dim = embed_dim
+
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
         self.posture_dim = posture_dim
         self.max_horizon = max_horizon
         self.state_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim))
-        self.action_proj = nn.Sequential(nn.Linear(action_dim, embed_dim), nn.LayerNorm(embed_dim))
-        self.posture_proj = nn.Sequential(nn.Linear(posture_dim, embed_dim), nn.LayerNorm(embed_dim))
+        # LazyLinear defers in_features so A is not needed at construction time.
+        self.action_proj = nn.Sequential(nn.LazyLinear(embed_dim), nn.LayerNorm(embed_dim))
+        self.posture_proj = nn.Sequential(nn.LazyLinear(embed_dim), nn.LayerNorm(embed_dim))
         self.reasoning_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim))
         self.ctx_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim))
         self.time_embed = nn.Embedding(max_horizon, embed_dim)
@@ -150,6 +158,18 @@ class MambaActionConditionedWorldModel(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         self.state_norm = nn.LayerNorm(embed_dim)
+
+    def bind_geometry(self, geometry: "SessionGeometry") -> None:
+        """Record A/P from geometry for introspection; projections self-bind via LazyLinear.
+
+        Args:
+            geometry: SessionGeometry describing {D, A, O, P, K, H}.
+
+        Returns:
+            None.
+        """
+        self.action_dim = geometry.A
+        self.posture_dim = geometry.P
 
     def forward(
         self,
@@ -205,7 +225,7 @@ class MambaActionConditionedWorldModel(nn.Module):
         token_sequence: list[torch.Tensor] = []
         posture_tokens: list[torch.Tensor | None] = []
         for step_idx in range(path_length):
-            step_action = actions[:, :, step_idx, :].reshape(-1, self.action_dim)
+            step_action = actions[:, :, step_idx, :].reshape(-1, actions.shape[-1])
             token = self.state_proj(current) + self.action_proj(step_action) + ctx_summary
             token = token + self.time_embed(
                 torch.full((token.shape[0],), step_idx, device=token.device, dtype=torch.long)

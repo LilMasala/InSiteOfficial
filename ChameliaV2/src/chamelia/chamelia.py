@@ -43,6 +43,7 @@ from src.chamelia.retrieval import (
     ProceduralRelevanceScorer,
     compute_retrieval_relevance_loss,
 )
+from src.chamelia.session_geometry import SessionGeometry
 from src.chamelia.world_model import ActionConditionedWorldModel
 from src.models.hjepa import HJEPA
 
@@ -169,6 +170,7 @@ class Chamelia(nn.Module):
         self.world_model_backend = world_model_backend
         self.skill_confidence_threshold = skill_confidence_threshold
         self.model_version = model_version
+        self.geometry: SessionGeometry | None = None
         self._pending_record_indices: list[int] = []
         self._step_counter = 0
         self.high_level_planner = high_level_planner
@@ -191,7 +193,11 @@ class Chamelia(nn.Module):
         self.set_domain(domain)
 
     def set_domain(self, domain: AbstractDomain) -> None:
-        """Attach a runtime domain plugin and register its tokenizer if trainable.
+        """Attach a runtime domain plugin and bind geometry to all sub-modules.
+
+        Creates a ``SessionGeometry`` from the domain (fixing A, P=D) and
+        calls ``bind_geometry()`` on the Actor and World Model so that their
+        action-dimension-dependent heads are correctly sized for this domain.
 
         Args:
             domain: Active runtime domain.
@@ -219,6 +225,17 @@ class Chamelia(nn.Module):
         if self.mcts_search is not None:
             self.mcts_search.imagined_domain_state_builder = domain.build_imagined_domain_state
             self.mcts_search.simple_baseline_builder = domain.build_simple_baseline_path
+
+        # Build SessionGeometry and propagate to all geometry-aware sub-modules.
+        self.geometry = SessionGeometry.from_domain(
+            domain,
+            D=self.embed_dim,
+            K=self.actor.num_candidates,
+            H=self.rollout_horizon,
+        )
+        self.action_dim = self.geometry.A
+        self.actor.bind_geometry(self.geometry)
+        self.world_model.bind_geometry(self.geometry)
 
     def get_domain_tokenizer(self) -> nn.Module | None:
         """Return the registered domain tokenizer module if present.
