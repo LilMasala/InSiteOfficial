@@ -350,6 +350,86 @@ class CognitiveStorage:
                 values,
             )
 
+    def replace_skills(self, records: list[dict[str, Any]]) -> None:
+        with self._managed_connection() as conn:
+            conn.execute("DELETE FROM skill_sources")
+            conn.execute("DELETE FROM skill_constraints")
+            conn.execute("DELETE FROM skills")
+            for payload in records:
+                embedding_blob, embedding_shape = serialize_tensor(payload["embedding"])
+                embedding_codes_blob, embedding_codes_shape = serialize_codes(payload.get("embedding_codes"))
+                retrieval_blob, retrieval_shape = serialize_tensor(payload.get("retrieval_vector"))
+                action_blob, action_shape = serialize_tensor(payload["action_path"])
+                if embedding_blob is None or embedding_shape is None:
+                    raise ValueError("embedding is required")
+                if action_blob is None or action_shape is None:
+                    raise ValueError("action_path is required")
+                created_at = _now_iso()
+                conn.execute(
+                    """
+                    INSERT INTO skills (
+                        skill_id, name, description, confidence, deprecated_by, domain_name,
+                        symbolic_program, embedding, embedding_shape, embedding_codes, embedding_codes_shape,
+                        retrieval_vector, retrieval_shape, storage_format, action_path, action_shape,
+                        trigger_weights, extras, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(payload["skill_id"]),
+                        payload.get("name"),
+                        payload.get("description"),
+                        float(payload["confidence"]),
+                        payload.get("deprecated_by"),
+                        payload.get("domain_name"),
+                        (
+                            json.dumps(list(payload["symbolic_program"]))
+                            if payload.get("symbolic_program") is not None
+                            else None
+                        ),
+                        embedding_blob,
+                        embedding_shape,
+                        embedding_codes_blob,
+                        embedding_codes_shape,
+                        retrieval_blob,
+                        retrieval_shape,
+                        str(payload.get("storage_format", "dense")),
+                        action_blob,
+                        action_shape,
+                        json.dumps(payload.get("trigger_weights") or {}),
+                        json.dumps(_ensure_jsonable(payload.get("extras") or {})),
+                        created_at,
+                        created_at,
+                    ),
+                )
+                constraints = payload.get("constraints") or {}
+                if constraints:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO skill_constraints (skill_id, constraint_key, constraint_value)
+                        VALUES (?, ?, ?)
+                        """,
+                        [
+                            (
+                                int(payload["skill_id"]),
+                                str(key),
+                                json.dumps(_ensure_jsonable(value)),
+                            )
+                            for key, value in constraints.items()
+                        ],
+                    )
+                source_episodes = payload.get("source_episodes") or ()
+                if source_episodes:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO skill_sources (skill_id, episode_id)
+                        VALUES (?, ?)
+                        """,
+                        [
+                            (int(payload["skill_id"]), int(episode_id))
+                            for episode_id in source_episodes
+                        ],
+                    )
+
     def fetch_skills(self) -> list[sqlite3.Row]:
         with self._managed_connection() as conn:
             return list(conn.execute("SELECT * FROM skills ORDER BY skill_id ASC"))
@@ -440,6 +520,34 @@ class CognitiveStorage:
     def fetch_clusters(self) -> list[sqlite3.Row]:
         with self._managed_connection() as conn:
             return list(conn.execute("SELECT * FROM domain_clusters ORDER BY cluster_id ASC"))
+
+    def replace_clusters(self, records: list[dict[str, Any]]) -> None:
+        with self._managed_connection() as conn:
+            conn.execute("DELETE FROM domain_clusters")
+            for payload in records:
+                centroid = payload.get("centroid")
+                centroid_blob, centroid_shape = serialize_tensor(centroid)
+                if centroid_blob is None or centroid_shape is None:
+                    raise ValueError("cluster centroid is required")
+                conn.execute(
+                    """
+                    INSERT INTO domain_clusters (
+                        cluster_id, domain_name, centroid, centroid_shape, count,
+                        trigger_weights, adapter_payload, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(payload["cluster_id"]),
+                        str(payload["domain_name"]),
+                        centroid_blob,
+                        centroid_shape,
+                        int(payload["count"]),
+                        json.dumps(payload.get("trigger_weights") or {}),
+                        payload.get("adapter_payload"),
+                        str(payload.get("created_at") or _now_iso()),
+                        str(payload.get("updated_at") or _now_iso()),
+                    ),
+                )
 
     def _list_lancedb_tables(self, db: Any) -> list[str]:
         table_names = db.list_tables()

@@ -1352,11 +1352,22 @@ class Chamelia(nn.Module):
 
         batch_count = min(len(self._pending_record_indices), outcome_z.shape[0], realized_tensor.shape[0])
         for batch_idx in range(batch_count):
-            self.memory.fill_outcome(
-                self._pending_record_indices[batch_idx],
+            record_id = int(self._pending_record_indices[batch_idx])
+            filled = self.memory.fill_outcome(
+                record_id,
                 ic_realized=float(realized_tensor[batch_idx].item()),
                 outcome_key=outcome_z.detach()[batch_idx],
             )
+            if (
+                filled
+                and self.procedural_memory is not None
+            ):
+                record = self.memory.get_record_by_id(record_id)
+                if record is not None and record.skill_trace:
+                    self.procedural_memory.record_realized_usage(
+                        record.skill_trace,
+                        realized_cost=float(realized_tensor[batch_idx].item()),
+                    )
         self._pending_record_indices = []
 
     def train_critic_from_memory(self) -> torch.Tensor | None:

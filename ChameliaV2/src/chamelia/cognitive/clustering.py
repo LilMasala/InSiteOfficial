@@ -319,6 +319,59 @@ class DomainIndex:
             self.adapter_bank.clear_active()
         self.storage.close()
 
+    def state_dict(self) -> dict[str, Any]:
+        cluster_payloads: list[dict[str, Any]] = []
+        for cluster_id in sorted(self.clusters):
+            cluster = self.clusters[cluster_id]
+            adapter_payload = None
+            if self.adapter_bank is not None:
+                adapter_payload = self.adapter_bank.serialize_cluster(cluster.cluster_id)
+            cluster_payloads.append(
+                {
+                    "cluster_id": cluster.cluster_id,
+                    "domain_name": cluster.domain_name,
+                    "centroid": cluster.centroid.detach().cpu().clone(),
+                    "count": int(cluster.count),
+                    "trigger_weights": dict(cluster.trigger_weights),
+                    "adapter_payload": adapter_payload,
+                }
+            )
+        return {"clusters": cluster_payloads}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if self.adapter_bank is not None:
+            self.adapter_bank.clear_active()
+            self.adapter_bank.adapters = {}
+        payloads = list(state.get("clusters") or [])
+        self.clusters = {}
+        restored_rows: list[dict[str, Any]] = []
+        for payload in payloads:
+            cluster = DomainCluster(
+                cluster_id=int(payload["cluster_id"]),
+                domain_name=str(payload["domain_name"]),
+                centroid=torch.as_tensor(payload["centroid"]).detach().float().cpu().clone(),
+                count=int(payload["count"]),
+                trigger_weights={
+                    str(key): float(value)
+                    for key, value in dict(payload.get("trigger_weights") or {}).items()
+                },
+            )
+            self.clusters[cluster.cluster_id] = cluster
+            adapter_payload = payload.get("adapter_payload")
+            if self.adapter_bank is not None:
+                self.adapter_bank.load_cluster(cluster.cluster_id, adapter_payload)
+            restored_rows.append(
+                {
+                    "cluster_id": cluster.cluster_id,
+                    "domain_name": cluster.domain_name,
+                    "centroid": cluster.centroid,
+                    "count": cluster.count,
+                    "trigger_weights": cluster.trigger_weights,
+                    "adapter_payload": adapter_payload,
+                }
+            )
+        self.storage.replace_clusters(restored_rows)
+
     def _spawn_cluster(self, z: torch.Tensor, domain_name: str) -> int:
         cluster_id = self.storage.upsert_cluster(
             cluster_id=None,

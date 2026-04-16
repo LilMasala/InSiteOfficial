@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import threading
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -19,12 +20,19 @@ from src.chamelia.cognitive.mamba_world_model import (
 )
 from src.chamelia.cognitive.planning import HighLevelPlanner, MCTSNode, MCTSSearch, Talker
 from src.chamelia.cognitive.procedural import ProceduralMemory
+from src.chamelia.cognitive.procedural import (
+    SKILL_LIFECYCLE_ACTIVE,
+    SKILL_LIFECYCLE_INTERNALIZABLE,
+    SKILL_LIFECYCLE_PROVISIONAL,
+)
 from src.chamelia.cognitive.representation import (
     ContrastiveSparseRepresentation,
     InformationOrderedBottleneck,
     IsotropicSkillCodec,
     VectorQuantizer,
 )
+from src.chamelia.cognitive.storage import _import_lancedb, _import_pyarrow
+import src.chamelia.cognitive.sleep as sleep_module
 from src.chamelia.cognitive.sleep import SleepCoordinator
 from src.chamelia.cognitive.sleep import (
     BODEGenOptimizer,
@@ -90,7 +98,12 @@ def _build_chamelia(
     )
     cost = CostModule(intrinsic_cost=intrinsic, trainable_critic=critic)
     memory = LatentMemory(embed_dim=embed_dim, max_episodes=32, retrieval_k=4, device="cpu")
-    procedural = ProceduralMemory(root=root / "procedural", skill_dim=embed_dim, use_faiss=False)
+    procedural = ProceduralMemory(
+        root=root / "procedural",
+        skill_dim=embed_dim,
+        use_faiss=False,
+        use_lancedb=False,
+    )
     planner = HighLevelPlanner(embed_dim=embed_dim, skill_dim=embed_dim)
     world_model = None
     if world_model_backend != "mamba":
@@ -213,6 +226,8 @@ def test_representation_and_procedural_memory_roundtrip(tmp_path: Path) -> None:
 
 
 def test_lancedb_episode_archive_roundtrip(tmp_path: Path) -> None:
+    if _import_lancedb() is None or _import_pyarrow() is None:
+        pytest.skip("Requires lancedb and pyarrow")
     storage = CognitiveStorage(tmp_path / "archive")
     storage.archive_episode(
         7,
@@ -569,6 +584,307 @@ def test_sleep_fasttrack_promotes_without_waiting_for_sleep_cycle(tmp_path: Path
     assert promoted_record.extras["promotion_source"] == "online_fasttrack"
 
 
+class _ConstantWorldModel(nn.Module):
+    def __init__(self, embed_dim: int) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
+        self.embed_dim = embed_dim
+        self.max_horizon = 4
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        actions: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        candidate_postures: torch.Tensor | None = None,
+        reasoning_states: torch.Tensor | None = None,
+        horizon: int = 1,
+    ) -> dict[str, torch.Tensor]:
+        _ = candidate_postures, reasoning_states, horizon
+        batch_size, candidates, path_length, _ = actions.shape
+        zeros = torch.zeros(
+            batch_size,
+            candidates,
+            path_length,
+            self.embed_dim,
+            dtype=z.dtype,
+            device=z.device,
+        )
+        return {
+            "trajectory": zeros,
+            "terminal_latents": zeros[:, :, -1, :],
+        }
+
+
+class _ActionSumCost:
+    def score_candidates(
+        self,
+        z: torch.Tensor,
+        actions: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        domain_state: dict[str, object],
+        future_z: torch.Tensor,
+        future_trajectory: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        _ = z, ctx_tokens, domain_state, future_z, future_trajectory
+        total = -actions.sum(dim=-1).sum(dim=-1)
+        return {
+            "total": total,
+            "ic": total,
+            "tc": torch.zeros_like(total),
+        }
+
+
+def test_provisional_skill_is_persisted_but_hidden_from_default_retrieval(tmp_path: Path) -> None:
+    procedural = ProceduralMemory(
+        root=tmp_path / "procedural",
+        skill_dim=8,
+        use_faiss=False,
+        use_lancedb=False,
+    )
+    embedding = torch.ones(8)
+    record = procedural.add_skill(
+        embedding=embedding,
+        action_path=torch.ones(3, 4),
+        name="candidate",
+        lifecycle=SKILL_LIFECYCLE_PROVISIONAL,
+    )
+
+    hidden = procedural.retrieve(embedding, k=4)
+    visible = procedural.retrieve(embedding, k=4, include_provisional=True)
+
+    assert procedural.is_provisional(record)
+    assert hidden == []
+    assert len(visible) == 1
+    assert visible[0].record.skill_id == record.skill_id
+
+
+def test_sleep_cycle_registers_rejected_skill_as_provisional_and_activates_only_baseline_winner(
+    tmp_path: Path,
+) -> None:
+    memory = LatentMemory(embed_dim=8, max_episodes=8, retrieval_k=1, device="cpu")
+    procedural = ProceduralMemory(
+        root=tmp_path / "procedural",
+        skill_dim=8,
+        use_faiss=False,
+        use_lancedb=False,
+    )
+    encoder = LatentActionEncoder(
+        action_dim=4,
+        skill_dim=8,
+        num_heads=2,
+        num_layers=1,
+        max_path_length=4,
+    )
+    sleep = SleepCoordinator(
+        episodic_memory=memory,
+        procedural_memory=procedural,
+        latent_action_encoder=encoder,
+        world_model=_ConstantWorldModel(embed_dim=8),
+        cost_module=_ActionSumCost(),
+        sleep_interval_steps=999,
+    )
+    record = EpisodeRecord(
+        key=torch.zeros(8),
+        action=torch.zeros(4),
+        ctx_tokens=torch.zeros(2, 8),
+        ic_at_decision=0.0,
+        ic_realized=-1.0,
+        tc_predicted=0.0,
+        outcome_key=torch.zeros(8),
+        step=0,
+        domain_name="toy",
+        selected_path=torch.ones(3, 4),
+        record_id=1,
+    )
+    memory.store(record)
+    good = LatentSkillCandidate(
+        action_path=torch.full((3, 4), 2.0),
+        symbolic_codes=None,
+        target_delta=None,
+        source_weight=0.5,
+        source_episodes=(1,),
+    )
+    bad = LatentSkillCandidate(
+        action_path=torch.full((3, 4), -2.0),
+        symbolic_codes=None,
+        target_delta=None,
+        source_weight=3.0,
+        source_episodes=(1,),
+    )
+    sleep.decomposer.decompose = lambda records: []
+    sleep.compressor.compress = lambda segments: []
+    sleep.dream.extract = lambda records: []
+    sleep.rsd.propose = lambda **kwargs: [bad, good]
+    sleep._bodegen_candidates = lambda **kwargs: []
+
+    report = sleep.run_cycle()
+    stored_records = list(procedural.records.values())
+    active = [item for item in stored_records if procedural.is_active(item)]
+    provisional = [item for item in stored_records if procedural.is_provisional(item)]
+    active_record = active[0]
+    provisional_record = provisional[0]
+
+    assert len(report.promotions) == 1
+    assert len(stored_records) == 2
+    assert len(active) == 1
+    assert len(provisional) == 1
+    assert procedural.retrieve(active_record.embedding, k=4)
+    assert not any(
+        item.record.skill_id == provisional_record.skill_id
+        for item in procedural.retrieve(provisional_record.embedding, k=4, include_provisional=False)
+    )
+
+
+def test_realized_usage_unlocks_internalizable_lifecycle(tmp_path: Path) -> None:
+    procedural = ProceduralMemory(
+        root=tmp_path / "procedural",
+        skill_dim=8,
+        use_faiss=False,
+        use_lancedb=False,
+        internalization_min_usage_count=2,
+        internalization_min_success_count=1,
+        internalization_min_avg_reward=0.0,
+    )
+    proven = procedural.add_skill(
+        embedding=torch.randn(8),
+        action_path=torch.randn(3, 4),
+        name="proven",
+        lifecycle=SKILL_LIFECYCLE_ACTIVE,
+    )
+    harmful = procedural.add_skill(
+        embedding=torch.randn(8),
+        action_path=torch.randn(3, 4),
+        name="harmful",
+        lifecycle=SKILL_LIFECYCLE_ACTIVE,
+    )
+
+    procedural.record_realized_usage((proven.skill_id,), realized_cost=-1.0)
+    procedural.record_realized_usage((proven.skill_id,), realized_cost=-0.5)
+    procedural.record_realized_usage((harmful.skill_id,), realized_cost=1.0)
+    procedural.record_realized_usage((harmful.skill_id,), realized_cost=1.0)
+
+    proven_record = procedural.get_skill(proven.skill_id)
+    harmful_record = procedural.get_skill(harmful.skill_id)
+
+    assert proven_record is not None
+    assert harmful_record is not None
+    assert procedural.lifecycle_for(proven_record) == SKILL_LIFECYCLE_INTERNALIZABLE
+    assert procedural.lifecycle_for(harmful_record) == SKILL_LIFECYCLE_ACTIVE
+    assert {record.skill_id for record in procedural.internalizable_records()} == {proven.skill_id}
+
+
+def test_elite_restore_restores_procedural_state_and_replay(tmp_path: Path) -> None:
+    from training.orchestrator import (
+        DomainPhaseConfig,
+        DomainRunConfig,
+        OrchestratorConfig,
+        UnifiedTrainingOrchestrator,
+    )
+
+    config = OrchestratorConfig(
+        device="cpu",
+        run_dir=str(tmp_path / "rollback"),
+        replay_capacity=32,
+        family_backbones={
+            "state_vector_hjepa": {
+                "encoder_type": "vit_tiny_patch16_224",
+                "embed_dim": 192,
+                "predictor_depth": 1,
+                "predictor_num_heads": 4,
+                "num_hierarchies": 2,
+            }
+        },
+        memory={"max_episodes": 16, "retrieval_k": 2, "device": "cpu", "use_iob": False},
+        procedural={"use_faiss": False, "use_lancedb": False, "use_csr": False, "use_isotropic_storage": False},
+        sleep={"interval_steps": 2},
+        logging={"representation_loss": "hjepa", "num_candidates": 3, "path_length": 2},
+        domains=[
+            DomainRunConfig(
+                name="cartpole",
+                family="state_vector_hjepa",
+                bootstrap_random_episodes=1,
+                bootstrap_simple_episodes=1,
+                bootstrap_pretrain_steps=1,
+                bootstrap_replay_warmup_steps=1,
+                bootstrap_batch_size=1,
+                mask_ratio=0.25,
+                max_episode_steps=4,
+                optimizer_interval=1,
+                sleep_interval_episodes=1,
+                checkpoint_interval_episodes=1,
+                evaluation_episodes=1,
+                world_model_backend="mamba",
+                mcts_simulations=1,
+                mcts_depth=1,
+                mcts_rollout_horizon=1,
+                baselines=("random",),
+                phases={"core_control": DomainPhaseConfig(episodes=1)},
+            )
+        ],
+    )
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    domain_cfg = config.domains[0]
+    adapter = orchestrator._build_adapter(domain_cfg)
+    model = orchestrator._build_model(domain_cfg, adapter)
+    optimizer = torch.optim.AdamW(orchestrator._parameter_groups(model, domain_cfg, DomainPhaseConfig(episodes=1)))
+    observation, info = adapter.reset(seed=0)
+    tokenized = adapter.tokenize_observation(observation)
+    domain_state = adapter.build_domain_state(observation, info)
+    model(
+        tokens=tokenized.tokens.to(orchestrator.device),
+        mask=torch.zeros(
+            tokenized.tokens.shape[0],
+            tokenized.tokens.shape[1],
+            dtype=torch.float32,
+            device=orchestrator.device,
+        ),
+        domain_state=domain_state,
+        actor_mode="mode2",
+        store_to_memory=False,
+    )
+
+    initial_param = next(model.parameters()).detach().clone()
+    first_skill = model.procedural_memory.add_skill(
+        embedding=torch.randn(model.embed_dim),
+        action_path=torch.randn(model.actor.path_length, model.action_dim),
+        name="elite_skill",
+        lifecycle=SKILL_LIFECYCLE_ACTIVE,
+    )
+    assert model.domain_index is not None
+    elite_route = model.domain_index.route(torch.zeros(model.embed_dim), adapter.domain_name)
+    model.domain_index.record_skill_trigger(elite_route.cluster_id, first_skill.skill_id, weight=2.0)
+    checkpoint_path = orchestrator._save_checkpoint(
+        domain_cfg=domain_cfg,
+        phase_name="core_control",
+        episode_idx=1,
+        model=model,
+        optimizer=optimizer,
+        evaluation={"full": {"episode_reward_mean": 100.0}},
+    )
+
+    with torch.no_grad():
+        next(model.parameters()).add_(5.0)
+    model.procedural_memory.add_skill(
+        embedding=torch.randn(model.embed_dim),
+        action_path=torch.randn(model.actor.path_length, model.action_dim),
+        name="poison",
+        lifecycle=SKILL_LIFECYCLE_ACTIVE,
+    )
+    model.domain_index.record_skill_trigger(elite_route.cluster_id, 999, weight=5.0)
+    payload = torch.load(checkpoint_path, map_location=orchestrator.device, weights_only=False)
+    orchestrator._restore_checkpoint_in_place(payload, model=model, optimizer=optimizer)
+
+    restored_param = next(model.parameters()).detach().clone()
+    restored_records = list(model.procedural_memory.records.values())
+    restored_triggers = model.domain_index.get_trigger_weights(elite_route.cluster_id)
+
+    assert torch.allclose(restored_param, initial_param)
+    assert len(restored_records) == 1
+    assert restored_records[0].skill_id == first_skill.skill_id
+    assert restored_triggers == {first_skill.skill_id: 2.0}
+
+
 def test_latent_action_encoder_moves_cpu_candidates_to_module_device(device: torch.device) -> None:
     if device.type == "cpu":
         pytest.skip("Requires a non-CPU device to verify device normalization.")
@@ -748,6 +1064,8 @@ def test_chamelia_can_select_mamba_world_model_backend(tmp_path: Path) -> None:
 
 
 def test_stitch_bodegen_and_gemma_worker_harness() -> None:
+    if sleep_module.SingleTaskGP is None:
+        pytest.skip("Requires botorch and gpytorch")
     segments = [
         LOVEDecomposer().decompose(
             [
@@ -822,6 +1140,8 @@ def test_stitch_bodegen_and_gemma_worker_harness() -> None:
 def test_bodegen_optimizer_falls_back_from_mps_double() -> None:
     if not torch.backends.mps.is_available():
         pytest.skip("MPS not available")
+    if sleep_module.SingleTaskGP is None:
+        pytest.skip("Requires botorch and gpytorch")
 
     encoder = LatentActionEncoder(action_dim=2, skill_dim=16, num_heads=2, num_layers=1, max_path_length=2).to("mps")
     optimizer = BODEGenOptimizer(

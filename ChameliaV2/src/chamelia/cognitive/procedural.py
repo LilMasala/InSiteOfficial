@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import threading
 from typing import Any
 
@@ -27,6 +28,10 @@ from src.chamelia.cognitive.storage import (
 _FAISS_MODULE: Any | None = None
 _LANCEDB_MODULE: Any | None = None
 _PYARROW_MODULE: Any | None = None
+
+SKILL_LIFECYCLE_PROVISIONAL = "provisional"
+SKILL_LIFECYCLE_ACTIVE = "active"
+SKILL_LIFECYCLE_INTERNALIZABLE = "internalizable"
 
 
 def _import_faiss() -> Any | None:
@@ -66,6 +71,31 @@ def _import_pyarrow() -> Any | None:
         return None
     _PYARROW_MODULE = imported_pyarrow
     return _PYARROW_MODULE
+
+
+def _detach_nested_to_cpu(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _detach_nested_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_nested_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_nested_to_cpu(item) for item in value)
+    return value
+
+
+def _skill_lifecycle(extras: dict[str, Any] | None) -> str:
+    if extras is None:
+        return SKILL_LIFECYCLE_ACTIVE
+    lifecycle = str(extras.get("lifecycle", SKILL_LIFECYCLE_ACTIVE)).strip().lower()
+    if lifecycle in {
+        SKILL_LIFECYCLE_PROVISIONAL,
+        SKILL_LIFECYCLE_ACTIVE,
+        SKILL_LIFECYCLE_INTERNALIZABLE,
+    }:
+        return lifecycle
+    return SKILL_LIFECYCLE_ACTIVE
 
 
 @dataclass(frozen=True)
@@ -128,6 +158,10 @@ class TensorSkillIndex:
         np.save(path.with_suffix(".npy"), self.embeddings.numpy())
         meta_path.write_text(json.dumps(self.skill_ids))
 
+    def reset(self) -> None:
+        self.skill_ids = []
+        self.embeddings = torch.empty(0, self.dim, dtype=torch.float32)
+
     @classmethod
     def load(cls, dim: int, path: Path, meta_path: Path) -> "TensorSkillIndex":
         index = cls(dim=dim)
@@ -175,6 +209,13 @@ class FaissSkillIndex:
             raise RuntimeError("faiss is not installed")
         faiss.write_index(self.index, str(path))
         meta_path.write_text(json.dumps(self.skill_ids))
+
+    def reset(self) -> None:
+        faiss = _import_faiss()
+        if faiss is None:
+            raise RuntimeError("faiss is not installed")
+        self.index = faiss.IndexFlatIP(self.dim)
+        self.skill_ids = []
 
     @classmethod
     def load(cls, dim: int, path: Path, meta_path: Path) -> "FaissSkillIndex":
@@ -239,6 +280,24 @@ class LanceSkillIndex:
         except Exception:
             return
 
+    def reset(self) -> None:
+        self.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.root.mkdir(parents=True, exist_ok=True)
+        lancedb = _import_lancedb()
+        pa = _import_pyarrow()
+        if lancedb is None or pa is None:
+            raise RuntimeError("lancedb and pyarrow are required for the LanceDB backend")
+        self.db = lancedb.connect(self.root)
+        schema = pa.schema(
+            [
+                pa.field("skill_id", pa.int64()),
+                pa.field("vector", lancedb.vector(self.dim)),
+            ]
+        )
+        self.table = self.db.create_table(self.table_name, schema=schema, mode="create")
+        self.table_exists = False
+
     def close(self) -> None:
         """Release LanceDB handles before Python interpreter teardown."""
         for handle_name in ("table", "db"):
@@ -267,12 +326,18 @@ class ProceduralMemory:
         use_lancedb: bool | None = None,
         csr_encoder: ContrastiveSparseRepresentation | None = None,
         codec: IsotropicSkillCodec | None = None,
+        internalization_min_usage_count: int = 2,
+        internalization_min_success_count: int = 1,
+        internalization_min_avg_reward: float = 0.0,
     ) -> None:
         self.skill_dim = skill_dim
         self.device = device
         self.storage = CognitiveStorage(root)
         self.csr_encoder = csr_encoder
         self.codec = codec
+        self.internalization_min_usage_count = max(1, int(internalization_min_usage_count))
+        self.internalization_min_success_count = max(1, int(internalization_min_success_count))
+        self.internalization_min_avg_reward = float(internalization_min_avg_reward)
         self.records: dict[int, SkillRecord] = {}
         self._records_lock = threading.RLock()
         self.retrieval_dim = (
@@ -418,7 +483,10 @@ class ProceduralMemory:
         symbolic_program: tuple[str, ...] | None = None,
         trigger_weights: dict[str, float] | None = None,
         extras: dict[str, Any] | None = None,
+        lifecycle: str = SKILL_LIFECYCLE_ACTIVE,
     ) -> SkillRecord:
+        merged_extras = dict(extras or {})
+        merged_extras["lifecycle"] = str(lifecycle)
         runtime_embedding, compressed_codes, storage_format = self._compress_embedding(embedding)
         retrieval_vector = self._index_vector(runtime_embedding)
         skill_id = self.storage.insert_skill(
@@ -435,7 +503,7 @@ class ProceduralMemory:
             domain_name=domain_name,
             symbolic_program=symbolic_program,
             trigger_weights=trigger_weights,
-            extras=extras,
+            extras=merged_extras,
         )
         record = SkillRecord(
             skill_id=skill_id,
@@ -452,7 +520,7 @@ class ProceduralMemory:
             trigger_weights=trigger_weights or {},
             compressed_codes=compressed_codes,
             storage_format=storage_format,
-            extras=extras or {},
+            extras=merged_extras,
         )
         with self._records_lock:
             self.records[skill_id] = record
@@ -471,6 +539,7 @@ class ProceduralMemory:
         domain_name: str | None = None,
         min_confidence: float = 0.0,
         trigger_weights: dict[int, float] | None = None,
+        include_provisional: bool = False,
     ) -> list[RetrievedSkill]:
         with self._records_lock:
             records_snapshot = dict(self.records)
@@ -491,6 +560,8 @@ class ProceduralMemory:
         for skill_id, similarity in zip(skill_ids, similarities, strict=False):
             record = records_snapshot.get(skill_id)
             if record is None or record.deprecated_by is not None:
+                continue
+            if not include_provisional and self.is_provisional(record):
                 continue
             if record.confidence < min_confidence:
                 continue
@@ -558,24 +629,7 @@ class ProceduralMemory:
             record = self.records.get(int(skill_id))
         if record is None:
             raise KeyError(f"Unknown skill_id={skill_id}")
-        updated = SkillRecord(
-            skill_id=record.skill_id,
-            embedding=record.embedding,
-            retrieval_vector=record.retrieval_vector,
-            action_path=record.action_path,
-            confidence=float(confidence),
-            source_episodes=record.source_episodes,
-            constraints=record.constraints,
-            name=record.name,
-            description=record.description,
-            domain_name=record.domain_name,
-            symbolic_program=record.symbolic_program,
-            trigger_weights=record.trigger_weights,
-            deprecated_by=record.deprecated_by,
-            compressed_codes=record.compressed_codes,
-            storage_format=record.storage_format,
-            extras=record.extras,
-        )
+        updated = self._updated_record(record, confidence=float(confidence))
         with self._records_lock:
             self.records[int(skill_id)] = updated
         self.storage.update_skill(int(skill_id), confidence=float(confidence))
@@ -585,14 +639,51 @@ class ProceduralMemory:
             record = self.records.get(int(skill_id))
         if record is None:
             raise KeyError(f"Unknown skill_id={skill_id}")
-        merged_extras = dict(record.extras)
+        merged_extras = dict(record.extras or {})
         merged_extras.update(extras)
-        updated = SkillRecord(
+        updated = self._updated_record(record, extras=merged_extras)
+        with self._records_lock:
+            self.records[int(skill_id)] = updated
+        self.storage.update_skill(int(skill_id), extras=merged_extras)
+
+    def update_lifecycle(self, skill_id: int, lifecycle: str) -> None:
+        self.update_extras(int(skill_id), {"lifecycle": str(lifecycle)})
+
+    def lifecycle_for(self, skill: SkillRecord | int) -> str:
+        record = skill if isinstance(skill, SkillRecord) else self.get_skill(int(skill))
+        if record is None:
+            raise KeyError(f"Unknown skill={skill}")
+        return _skill_lifecycle(record.extras)
+
+    def is_provisional(self, skill: SkillRecord | int) -> bool:
+        return self.lifecycle_for(skill) == SKILL_LIFECYCLE_PROVISIONAL
+
+    def is_internalizable(self, skill: SkillRecord | int) -> bool:
+        return self.lifecycle_for(skill) == SKILL_LIFECYCLE_INTERNALIZABLE
+
+    def is_active(self, skill: SkillRecord | int) -> bool:
+        return self.lifecycle_for(skill) in {
+            SKILL_LIFECYCLE_ACTIVE,
+            SKILL_LIFECYCLE_INTERNALIZABLE,
+        }
+
+    def _updated_record(
+        self,
+        record: SkillRecord,
+        *,
+        confidence: float | None = None,
+        deprecated_by: int | None = None,
+        extras: dict[str, Any] | None = None,
+        retrieval_vector: torch.Tensor | None = None,
+        compressed_codes: torch.Tensor | None = None,
+        storage_format: str | None = None,
+    ) -> SkillRecord:
+        return SkillRecord(
             skill_id=record.skill_id,
             embedding=record.embedding,
-            retrieval_vector=record.retrieval_vector,
+            retrieval_vector=record.retrieval_vector if retrieval_vector is None else retrieval_vector,
             action_path=record.action_path,
-            confidence=record.confidence,
+            confidence=record.confidence if confidence is None else float(confidence),
             source_episodes=record.source_episodes,
             constraints=record.constraints,
             name=record.name,
@@ -600,38 +691,169 @@ class ProceduralMemory:
             domain_name=record.domain_name,
             symbolic_program=record.symbolic_program,
             trigger_weights=record.trigger_weights,
-            deprecated_by=record.deprecated_by,
-            compressed_codes=record.compressed_codes,
-            storage_format=record.storage_format,
-            extras=merged_extras,
+            deprecated_by=record.deprecated_by if deprecated_by is None else int(deprecated_by),
+            compressed_codes=record.compressed_codes if compressed_codes is None else compressed_codes,
+            storage_format=record.storage_format if storage_format is None else storage_format,
+            extras=record.extras if extras is None else extras,
         )
+
+    def record_realized_usage(
+        self,
+        skill_ids: tuple[int, ...] | list[int],
+        *,
+        realized_cost: float,
+    ) -> None:
+        realized_reward = -float(realized_cost)
+        for skill_id in skill_ids:
+            with self._records_lock:
+                record = self.records.get(int(skill_id))
+            if record is None:
+                continue
+            merged_extras = dict(record.extras or {})
+            usage_count = int(merged_extras.get("usage_count", 0)) + 1
+            successful_usage_count = int(merged_extras.get("successful_usage_count", 0))
+            if realized_reward > 0.0:
+                successful_usage_count += 1
+            reward_sum = float(merged_extras.get("realized_reward_sum", 0.0)) + realized_reward
+            merged_extras.update(
+                {
+                    "usage_count": usage_count,
+                    "successful_usage_count": successful_usage_count,
+                    "realized_reward_sum": reward_sum,
+                    "last_realized_reward": realized_reward,
+                }
+            )
+            mean_reward = reward_sum / float(max(1, usage_count))
+            current_lifecycle = _skill_lifecycle(merged_extras)
+            if (
+                current_lifecycle != SKILL_LIFECYCLE_PROVISIONAL
+                and usage_count >= self.internalization_min_usage_count
+                and successful_usage_count >= self.internalization_min_success_count
+                and mean_reward >= self.internalization_min_avg_reward
+            ):
+                merged_extras["lifecycle"] = SKILL_LIFECYCLE_INTERNALIZABLE
+            self.update_extras(int(skill_id), merged_extras)
+
+    def internalizable_records(self) -> list[SkillRecord]:
         with self._records_lock:
-            self.records[int(skill_id)] = updated
-        self.storage.update_skill(int(skill_id), extras=merged_extras)
+            snapshot = list(self.records.values())
+        return [
+            record
+            for record in snapshot
+            if record.deprecated_by is None and self.is_internalizable(record)
+        ]
+
+    def state_dict(self) -> dict[str, Any]:
+        with self._records_lock:
+            snapshot = dict(self.records)
+        return {
+            "skill_dim": int(self.skill_dim),
+            "retrieval_dim": int(self.retrieval_dim),
+            "records": [
+                {
+                    "skill_id": int(record.skill_id),
+                    "embedding": record.embedding.detach().cpu(),
+                    "retrieval_vector": record.retrieval_vector.detach().cpu(),
+                    "action_path": record.action_path.detach().cpu(),
+                    "confidence": float(record.confidence),
+                    "source_episodes": tuple(int(value) for value in record.source_episodes),
+                    "constraints": _detach_nested_to_cpu(record.constraints),
+                    "name": record.name,
+                    "description": record.description,
+                    "domain_name": record.domain_name,
+                    "symbolic_program": record.symbolic_program,
+                    "trigger_weights": record.trigger_weights,
+                    "deprecated_by": record.deprecated_by,
+                    "compressed_codes": (
+                        None if record.compressed_codes is None else record.compressed_codes.detach().cpu()
+                    ),
+                    "storage_format": record.storage_format,
+                    "extras": _detach_nested_to_cpu(record.extras or {}),
+                }
+                for record in sorted(snapshot.values(), key=lambda item: item.skill_id)
+            ],
+        }
+
+    def load_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        sync_storage: bool = True,
+    ) -> None:
+        close_index = getattr(self.index, "close", None)
+        if callable(close_index):
+            try:
+                close_index()
+            except Exception:
+                pass
+        self.index = self._make_index()
+        reset_index = getattr(self.index, "reset", None)
+        if callable(reset_index):
+            reset_index()
+        restored: dict[int, SkillRecord] = {}
+        serialized_records: list[dict[str, Any]] = []
+        for payload in state.get("records", []):
+            record = SkillRecord(
+                skill_id=int(payload["skill_id"]),
+                embedding=payload["embedding"].detach().float().cpu(),
+                retrieval_vector=payload["retrieval_vector"].detach().float().cpu(),
+                action_path=payload["action_path"].detach().float().cpu(),
+                confidence=float(payload["confidence"]),
+                source_episodes=tuple(int(value) for value in payload.get("source_episodes", ())),
+                constraints=dict(payload.get("constraints", {})),
+                name=payload.get("name"),
+                description=payload.get("description"),
+                domain_name=payload.get("domain_name"),
+                symbolic_program=(
+                    tuple(payload["symbolic_program"])
+                    if payload.get("symbolic_program") is not None
+                    else None
+                ),
+                trigger_weights=dict(payload.get("trigger_weights") or {}),
+                deprecated_by=(
+                    None if payload.get("deprecated_by") is None else int(payload["deprecated_by"])
+                ),
+                compressed_codes=(
+                    None
+                    if payload.get("compressed_codes") is None
+                    else payload["compressed_codes"].detach().long().cpu()
+                ),
+                storage_format=str(payload.get("storage_format", "dense")),
+                extras=dict(payload.get("extras") or {}),
+            )
+            restored[record.skill_id] = record
+            self.index.add(record.skill_id, record.retrieval_vector)
+            serialized_records.append(
+                {
+                    "skill_id": record.skill_id,
+                    "embedding": record.embedding,
+                    "embedding_codes": record.compressed_codes,
+                    "retrieval_vector": record.retrieval_vector,
+                    "storage_format": record.storage_format,
+                    "action_path": record.action_path,
+                    "confidence": record.confidence,
+                    "source_episodes": record.source_episodes,
+                    "constraints": record.constraints,
+                    "name": record.name,
+                    "description": record.description,
+                    "domain_name": record.domain_name,
+                    "symbolic_program": record.symbolic_program,
+                    "trigger_weights": record.trigger_weights,
+                    "deprecated_by": record.deprecated_by,
+                    "extras": record.extras or {},
+                }
+            )
+        with self._records_lock:
+            self.records = restored
+        if sync_storage:
+            self.storage.replace_skills(serialized_records)
 
     def deprecate(self, skill_id: int, replacement_id: int) -> None:
         with self._records_lock:
             record = self.records.get(int(skill_id))
         if record is None:
             raise KeyError(f"Unknown skill_id={skill_id}")
-        updated = SkillRecord(
-            skill_id=record.skill_id,
-            embedding=record.embedding,
-            retrieval_vector=record.retrieval_vector,
-            action_path=record.action_path,
-            confidence=record.confidence,
-            source_episodes=record.source_episodes,
-            constraints=record.constraints,
-            name=record.name,
-            description=record.description,
-            domain_name=record.domain_name,
-            symbolic_program=record.symbolic_program,
-            trigger_weights=record.trigger_weights,
-            deprecated_by=int(replacement_id),
-            compressed_codes=record.compressed_codes,
-            storage_format=record.storage_format,
-            extras=record.extras,
-        )
+        updated = self._updated_record(record, deprecated_by=int(replacement_id))
         with self._records_lock:
             self.records[int(skill_id)] = updated
         self.storage.update_skill(int(skill_id), deprecated_by=int(replacement_id))

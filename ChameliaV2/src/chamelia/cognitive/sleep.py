@@ -17,7 +17,12 @@ import torch.nn.functional as F
 
 from src.chamelia.cognitive.clustering import DomainIndex
 from src.chamelia.cognitive.latent_action import LatentActionEncoder, LatentSkillCandidate
-from src.chamelia.cognitive.procedural import ProceduralMemory, SkillRecord
+from src.chamelia.cognitive.procedural import (
+    ProceduralMemory,
+    SkillRecord,
+    SKILL_LIFECYCLE_ACTIVE,
+    SKILL_LIFECYCLE_PROVISIONAL,
+)
 
 try:
     import stitch_core
@@ -842,6 +847,63 @@ class DreamDecompiler:
 class ChoreographerEvaluator:
     """Imagination-first skill evaluation loop."""
 
+    def _score_path(
+        self,
+        *,
+        world_model: Any,
+        cost_module: Any,
+        record: Any,
+        action_path: torch.Tensor,
+    ) -> float | None:
+        if getattr(record, "ctx_tokens", None) is None:
+            return None
+        world_device = next(iter(world_model.parameters()), None)
+        world_device = world_device.device if world_device is not None else torch.device("cpu")
+        z = record.key.detach().float().unsqueeze(0).to(world_device)
+        ctx_tokens = record.ctx_tokens.detach().float().unsqueeze(0).to(world_device)
+        actions = action_path.detach().float().unsqueeze(0).unsqueeze(0).to(world_device)
+        rollout = world_model(
+            z=z,
+            actions=actions,
+            ctx_tokens=ctx_tokens,
+            candidate_postures=None,
+            reasoning_states=None,
+            horizon=min(action_path.shape[0], world_model.max_horizon),
+        )
+        score = cost_module.score_candidates(
+            z=z,
+            actions=actions,
+            ctx_tokens=ctx_tokens,
+            domain_state={},
+            future_z=rollout["terminal_latents"],
+            future_trajectory=rollout["trajectory"],
+        )["total"][0, 0]
+        return -float(score.item())
+
+    def baseline_score(
+        self,
+        *,
+        world_model: Any,
+        cost_module: Any,
+        reference_records: list[Any],
+    ) -> float:
+        scores: list[float] = []
+        for record in reference_records[: min(8, len(reference_records))]:
+            selected_path = getattr(record, "selected_path", None)
+            if selected_path is None:
+                continue
+            score = self._score_path(
+                world_model=world_model,
+                cost_module=cost_module,
+                record=record,
+                action_path=selected_path,
+            )
+            if score is not None:
+                scores.append(score)
+        if not scores:
+            return 0.0
+        return sum(scores) / len(scores)
+
     def evaluate(
         self,
         *,
@@ -853,33 +915,17 @@ class ChoreographerEvaluator:
         evaluated: list[tuple[LatentSkillCandidate, float]] = []
         if not reference_records:
             return evaluated
-        world_device = next(iter(world_model.parameters()), None)
-        world_device = world_device.device if world_device is not None else torch.device("cpu")
         for candidate in candidates:
             sample_scores: list[float] = []
             for record in reference_records[: min(8, len(reference_records))]:
-                if getattr(record, "ctx_tokens", None) is None:
-                    continue
-                z = record.key.detach().float().unsqueeze(0).to(world_device)
-                ctx_tokens = record.ctx_tokens.detach().float().unsqueeze(0).to(world_device)
-                actions = candidate.action_path.detach().float().unsqueeze(0).unsqueeze(0).to(world_device)
-                rollout = world_model(
-                    z=z,
-                    actions=actions,
-                    ctx_tokens=ctx_tokens,
-                    candidate_postures=None,
-                    reasoning_states=None,
-                    horizon=min(candidate.action_path.shape[0], world_model.max_horizon),
+                score = self._score_path(
+                    world_model=world_model,
+                    cost_module=cost_module,
+                    record=record,
+                    action_path=candidate.action_path,
                 )
-                score = cost_module.score_candidates(
-                    z=z,
-                    actions=actions,
-                    ctx_tokens=ctx_tokens,
-                    domain_state={},
-                    future_z=rollout["terminal_latents"],
-                    future_trajectory=rollout["trajectory"],
-                )["total"][0, 0]
-                sample_scores.append(-float(score.item()) * candidate.source_weight)
+                if score is not None:
+                    sample_scores.append(score)
             if sample_scores:
                 evaluated.append((candidate, sum(sample_scores) / len(sample_scores)))
         evaluated.sort(key=lambda item: item[1], reverse=True)
@@ -1402,6 +1448,7 @@ class SleepCoordinator:
         autodoc_worker: GemmaAutoDocWorker | None = None,
         fasttrack_return_threshold: float = 0.5,
         fasttrack_surprise_threshold: float = 0.35,
+        promotion_margin: float = 1.0e-4,
     ) -> None:
         self.episodic_memory = episodic_memory
         self.procedural_memory = procedural_memory
@@ -1418,6 +1465,7 @@ class SleepCoordinator:
         self.autodoc = LILOAutoDoc(worker=autodoc_worker)
         self.fasttrack_return_threshold = float(fasttrack_return_threshold)
         self.fasttrack_surprise_threshold = float(fasttrack_surprise_threshold)
+        self.promotion_margin = float(promotion_margin)
         self._pending = threading.Event()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
@@ -1512,6 +1560,7 @@ class SleepCoordinator:
             embedding,
             k=1,
             domain_name=getattr(record, "domain_name", None),
+            include_provisional=True,
         )
         extras = {
             "promotion_source": "online_fasttrack",
@@ -1525,6 +1574,8 @@ class SleepCoordinator:
             updated_confidence = max(float(matched.confidence), 0.35 + (0.1 * min(1.0, float(utility_score))))
             self.procedural_memory.update_confidence(matched.skill_id, updated_confidence)
             self.procedural_memory.update_extras(matched.skill_id, extras)
+            if self.procedural_memory.is_provisional(matched):
+                self.procedural_memory.update_lifecycle(matched.skill_id, SKILL_LIFECYCLE_ACTIVE)
             refreshed = self.procedural_memory.get_skill(matched.skill_id)
             if refreshed is None:
                 return None
@@ -1544,6 +1595,7 @@ class SleepCoordinator:
             description=description,
             domain_name=getattr(record, "domain_name", None),
             extras=extras,
+            lifecycle=SKILL_LIFECYCLE_ACTIVE,
         )
         return SkillPromotion(
             record=promoted_record,
@@ -1641,6 +1693,74 @@ class SleepCoordinator:
             )
         return generated
 
+    def _upsert_sleep_skill(
+        self,
+        *,
+        embedding: torch.Tensor,
+        candidate: LatentSkillCandidate,
+        confidence: float,
+        name: str,
+        description: str,
+        domain_name: str | None,
+        evaluation_score: float,
+        baseline_score: float,
+        passed_audit: bool,
+    ) -> SkillRecord:
+        extras = {
+            "promotion_source": "sleep",
+            "evaluation_score": float(evaluation_score),
+            "baseline_score": float(baseline_score),
+            "audit_passed": bool(passed_audit),
+            "source_weight": float(candidate.source_weight),
+            "target_delta": (
+                candidate.target_delta.detach().float().cpu()
+                if candidate.target_delta is not None
+                else None
+            ),
+        }
+        prior_match = self.procedural_memory.retrieve(
+            embedding.detach().float().cpu(),
+            k=1,
+            domain_name=domain_name,
+            include_provisional=True,
+        )
+        if prior_match and float(prior_match[0].similarity) >= 0.985:
+            matched = self.procedural_memory.get_skill(prior_match[0].record.skill_id)
+            if matched is None:
+                raise KeyError(f"Missing skill_id={prior_match[0].record.skill_id}")
+            self.procedural_memory.update_confidence(
+                matched.skill_id,
+                max(float(matched.confidence), float(confidence)),
+            )
+            self.procedural_memory.update_extras(matched.skill_id, extras)
+            if passed_audit and self.procedural_memory.is_provisional(matched):
+                self.procedural_memory.update_lifecycle(matched.skill_id, SKILL_LIFECYCLE_ACTIVE)
+            refreshed = self.procedural_memory.get_skill(matched.skill_id)
+            if refreshed is None:
+                raise KeyError(f"Missing skill_id={matched.skill_id}")
+            return refreshed
+        return self.procedural_memory.add_skill(
+            embedding=embedding,
+            action_path=candidate.action_path,
+            source_episodes=candidate.source_episodes,
+            constraints={"source_weight": candidate.source_weight},
+            confidence=confidence,
+            name=name,
+            description=description,
+            domain_name=domain_name,
+            symbolic_program=(
+                tuple(str(int(value)) for value in candidate.symbolic_codes.reshape(-1))
+                if candidate.symbolic_codes is not None
+                else None
+            ),
+            extras=extras,
+            lifecycle=(
+                SKILL_LIFECYCLE_ACTIVE
+                if passed_audit
+                else SKILL_LIFECYCLE_PROVISIONAL
+            ),
+        )
+
     def run_cycle(self) -> SleepCycleReport:
         started = time.time()
         records = self._gather_records()
@@ -1669,6 +1789,11 @@ class SleepCoordinator:
             cost_module=self.cost_module,
             reference_records=records,
             candidates=scored_candidates,
+        )
+        baseline_score = self.choreographer.baseline_score(
+            world_model=self.world_model,
+            cost_module=self.cost_module,
+            reference_records=records,
         )
         if records and len(evaluated) >= 2:
             query_latent = torch.stack(
@@ -1700,43 +1825,20 @@ class SleepCoordinator:
         for ordinal, (candidate, evaluation_score) in enumerate(evaluated[:8], start=1):
             embedding = self.latent_action_encoder.encode_candidate(candidate).squeeze(0)
             name, description = self.autodoc.describe(candidate, ordinal)
-            prior_match = self.procedural_memory.retrieve(
-                embedding.detach().float().cpu(),
-                k=1,
-                domain_name=records[0].domain_name if records else None,
-            )
-            record = self.procedural_memory.add_skill(
+            passed_audit = float(evaluation_score) > float(baseline_score + self.promotion_margin)
+            record = self._upsert_sleep_skill(
                 embedding=embedding,
-                action_path=candidate.action_path,
-                source_episodes=candidate.source_episodes,
-                constraints={"source_weight": candidate.source_weight},
+                candidate=candidate,
                 confidence=max(0.1, float(torch.sigmoid(torch.tensor(evaluation_score)).item())),
                 name=name,
                 description=description,
                 domain_name=records[0].domain_name if records else None,
-                symbolic_program=(
-                    tuple(str(int(value)) for value in candidate.symbolic_codes.reshape(-1))
-                    if candidate.symbolic_codes is not None
-                    else None
-                ),
-                extras={
-                    "evaluation_score": float(evaluation_score),
-                    "target_delta": (
-                        candidate.target_delta.detach().float().cpu()
-                        if candidate.target_delta is not None
-                        else None
-                    ),
-                },
+                evaluation_score=float(evaluation_score),
+                baseline_score=float(baseline_score),
+                passed_audit=passed_audit,
             )
-            if prior_match:
-                matched = self.procedural_memory.get_skill(prior_match[0].record.skill_id)
-                if (
-                    matched is not None
-                    and matched.skill_id != record.skill_id
-                    and str(matched.extras.get("promotion_source", "")) == "online_fasttrack"
-                    and float(prior_match[0].similarity) >= 0.985
-                ):
-                    self.procedural_memory.deprecate(matched.skill_id, record.skill_id)
+            if not passed_audit:
+                continue
             for source_episode in candidate.source_episodes:
                 compiled_signatures.add((float(source_episode),))
             if self.domain_index is not None and records:

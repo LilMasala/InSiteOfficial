@@ -512,6 +512,8 @@ class OrchestratorConfig:
     surprise_replay_alpha: float = 1.0
     fasttrack_return_threshold: float = 0.5
     fasttrack_surprise_threshold: float = 0.35
+    elite_rollback_enabled: bool = True
+    elite_rollback_drop_pct: float = 0.25
     router_top_k: int = 2
     family_backbones: dict[str, dict[str, Any]] = field(default_factory=dict)
     memory: dict[str, Any] = field(default_factory=dict)
@@ -578,6 +580,8 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
         surprise_replay_alpha=float(raw.get("surprise_replay_alpha", 1.0)),
         fasttrack_return_threshold=float(raw.get("fasttrack_return_threshold", 0.5)),
         fasttrack_surprise_threshold=float(raw.get("fasttrack_surprise_threshold", 0.35)),
+        elite_rollback_enabled=bool(raw.get("elite_rollback_enabled", True)),
+        elite_rollback_drop_pct=float(raw.get("elite_rollback_drop_pct", 0.25)),
         router_top_k=int(raw.get("router_top_k", 2)),
         family_backbones=dict(raw.get("family_backbones", {})),
         memory=dict(raw.get("memory", {})),
@@ -2048,7 +2052,11 @@ class UnifiedTrainingOrchestrator:
             skill_records = [
                 record
                 for record in model.procedural_memory.records.values()
-                if record.extras is not None and record.extras.get("target_delta") is not None
+                if (
+                    record.extras is not None
+                    and record.extras.get("target_delta") is not None
+                    and model.procedural_memory.is_active(record)
+                )
             ]
             expected_path_len = model.actor.path_length
             skill_records = [r for r in skill_records if int(r.action_path.shape[0]) == expected_path_len]
@@ -2076,12 +2084,12 @@ class UnifiedTrainingOrchestrator:
         return torch.stack(losses).mean()
 
     def _compute_codec_loss(self, model: Chamelia) -> torch.Tensor | None:
-        if model.skill_codec is None or model.procedural_memory is None or not model.procedural_memory.records:
+        if model.skill_codec is None or model.procedural_memory is None:
             return None
-        sampled = random.sample(
-            list(model.procedural_memory.records.values()),
-            min(32, len(model.procedural_memory.records)),
-        )
+        candidates = model.procedural_memory.internalizable_records()
+        if not candidates:
+            return None
+        sampled = random.sample(candidates, min(32, len(candidates)))
         embeddings = torch.stack([record.embedding for record in sampled], dim=0).to(self.device)
         return model.skill_codec(embeddings)["loss"]
 
@@ -2693,6 +2701,16 @@ class UnifiedTrainingOrchestrator:
             "optimizer_state_dict": optimizer.state_dict(),
             "episodic_memory": model.memory.state_dict(),
             "replay": self.replay.state_dict(),
+            "procedural_state": (
+                model.procedural_memory.state_dict()
+                if model.procedural_memory is not None
+                else None
+            ),
+            "domain_index_state": (
+                model.domain_index.state_dict()
+                if getattr(model, "domain_index", None) is not None
+                else None
+            ),
             "procedural_root": str(model.procedural_memory.storage.paths.root),
             "sleep_metadata": {
                 "last_report": model.sleep_coordinator.last_report if model.sleep_coordinator is not None else None,
@@ -2714,12 +2732,41 @@ class UnifiedTrainingOrchestrator:
         self.backbones.load_state_dict(payload["backbones"])
         adapter = self._build_adapter(domain_cfg)
         model = self._build_model(domain_cfg, adapter)
+        self._restore_checkpoint_in_place(
+            payload,
+            model=model,
+            optimizer=optimizer,
+        )
+        return model, payload
+
+    def _restore_checkpoint_in_place(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: Chamelia,
+        optimizer: torch.optim.Optimizer | None = None,
+    ) -> None:
         model.load_state_dict(payload["model_state_dict"])
         model.memory.load_state_dict(payload["episodic_memory"])
         self.replay.load_state_dict(payload["replay"])
+        if model.procedural_memory is not None and payload.get("procedural_state") is not None:
+            model.procedural_memory.load_state_dict(payload["procedural_state"])
+        if getattr(model, "domain_index", None) is not None and payload.get("domain_index_state") is not None:
+            model.domain_index.load_state_dict(payload["domain_index_state"])
         if optimizer is not None and "optimizer_state_dict" in payload:
             optimizer.load_state_dict(payload["optimizer_state_dict"])
-        return model, payload
+
+    def _metric_drop_fraction(
+        self,
+        *,
+        best_value: float,
+        current_value: float,
+        mode: str,
+    ) -> float:
+        scale = max(abs(float(best_value)), 1.0)
+        if str(mode).lower() == "min":
+            return max(0.0, float(current_value) - float(best_value)) / scale
+        return max(0.0, float(best_value) - float(current_value)) / scale
 
     def _promote_checkpoint(
         self,
@@ -2789,9 +2836,12 @@ class UnifiedTrainingOrchestrator:
         exploratory_surprises: list[float] = []
         non_exploratory_surprises: list[float] = []
         provisional_skill_uses = 0
+        rollback_count = 0
         decision_count = 0
         episode_rewards: deque[float] = deque(maxlen=100)
         episode_lengths: deque[int] = deque(maxlen=100)
+        best_primary_value: float | None = None
+        best_checkpoint_path: Path | None = None
         print(
             f"[{domain_cfg.name}] starting phase={phase_name} "
             f"episodes={phase_cfg.episodes} memory={phase_cfg.use_memory} "
@@ -3019,7 +3069,7 @@ class UnifiedTrainingOrchestrator:
                 skill_trace = tuple(outputs.get("skill_traces", [()])[0] or ())
                 if skill_trace and model.procedural_memory is not None:
                     if any(
-                        str(model.procedural_memory.get_skill(skill_id).extras.get("promotion_source", "")) == "online_fasttrack"
+                        model.procedural_memory.is_provisional(skill_id)
                         for skill_id in skill_trace
                         if model.procedural_memory.get_skill(skill_id) is not None
                     ):
@@ -3119,6 +3169,7 @@ class UnifiedTrainingOrchestrator:
                         "provisional_skill_usage_rate": (
                             float(provisional_skill_uses) / float(max(1, decision_count))
                         ),
+                        "elite_rollback_count": int(rollback_count),
                         **last_execution_metadata,
                         **output_summary,
                     },
@@ -3181,6 +3232,7 @@ class UnifiedTrainingOrchestrator:
                     "provisional_skill_usage_rate": (
                         float(provisional_skill_uses) / float(max(1, decision_count))
                     ),
+                    "elite_rollback_count": int(rollback_count),
                 }
                 checkpoint_path = self._save_checkpoint(
                     domain_cfg=domain_cfg,
@@ -3193,6 +3245,7 @@ class UnifiedTrainingOrchestrator:
                 phase_metrics = metrics
                 phase_metrics["behavior_diagnostics"] = behavior_diagnostics
                 metric_value = float(metrics["full"].get(domain_cfg.primary_metric, 0.0))
+                current_primary_value = metric_value
                 print(
                     f"[{domain_cfg.name}][{phase_name}] checkpoint episode={episode_idx} "
                     + self._summarize_metrics(metrics, primary_metric=domain_cfg.primary_metric)
@@ -3216,12 +3269,53 @@ class UnifiedTrainingOrchestrator:
                     metric_value = -metric_value
                 is_best = metric_value >= best_metric
                 best_metric = max(best_metric, metric_value)
+                if is_best:
+                    best_primary_value = current_primary_value
+                    best_checkpoint_path = checkpoint_path
                 self._promote_checkpoint(
                     checkpoint_path,
                     domain_cfg=domain_cfg,
                     phase_name=phase_name,
                     is_best=is_best,
                 )
+                if (
+                    self.config.elite_rollback_enabled
+                    and not is_best
+                    and best_checkpoint_path is not None
+                    and best_primary_value is not None
+                ):
+                    drop_fraction = self._metric_drop_fraction(
+                        best_value=best_primary_value,
+                        current_value=current_primary_value,
+                        mode=domain_cfg.primary_mode,
+                    )
+                    if drop_fraction >= float(self.config.elite_rollback_drop_pct):
+                        payload = torch.load(best_checkpoint_path, map_location=self.device, weights_only=False)
+                        self._restore_checkpoint_in_place(
+                            payload,
+                            model=model,
+                            optimizer=optimizer,
+                        )
+                        transfer_optimizer = self._build_transfer_optimizer(model)
+                        rollback_count += 1
+                        self._promote_checkpoint(
+                            best_checkpoint_path,
+                            domain_cfg=domain_cfg,
+                            phase_name=phase_name,
+                            is_best=True,
+                        )
+                        self._append_diagnostic_event(
+                            domain_name=domain_cfg.name,
+                            phase_name=phase_name,
+                            kind="elite_rollback",
+                            payload={
+                                "episode_idx": episode_idx,
+                                "best_checkpoint_path": str(best_checkpoint_path),
+                                "best_primary_value": float(best_primary_value),
+                                "current_primary_value": float(current_primary_value),
+                                "drop_fraction": float(drop_fraction),
+                            },
+                        )
         if phase_cfg.use_sleep and model.sleep_coordinator is not None:
             model.sleep_coordinator.stop()
             if model.sleep_coordinator.last_report is not None:
@@ -3257,6 +3351,7 @@ class UnifiedTrainingOrchestrator:
                     mean(non_exploratory_surprises) if non_exploratory_surprises else 0.0
                 ),
                 "provisional_skill_usage_rate": float(provisional_skill_uses) / float(max(1, decision_count)),
+                "elite_rollback_count": int(rollback_count),
             },
         )
         print(
