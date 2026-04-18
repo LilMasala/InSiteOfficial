@@ -34,7 +34,7 @@ from src.chamelia.configurator import Configurator
 from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
 from src.chamelia.hjepa_adapter import forward_hjepa
 from src.chamelia.memory import LatentMemory
-from src.chamelia.plugins import CartPoleDomain, Connect4Domain, InteractiveDomainAdapter
+from src.chamelia.plugins import CartPoleDomain, ChessDomain, Connect4Domain, InteractiveDomainAdapter
 from src.chamelia.retrieval import (
     MemoryRelevanceScorer,
     ProceduralRelevanceScorer,
@@ -671,6 +671,7 @@ class UnifiedTrainingOrchestrator:
         self._synthetic_episode_id = -1
         self.adapter_builders: dict[str, Any] = {
             "cartpole": CartPoleDomain,
+            "chess": ChessDomain,
             "connect4": Connect4Domain,
         }
 
@@ -2586,7 +2587,7 @@ class UnifiedTrainingOrchestrator:
         kind: str,
     ) -> dict[str, float]:
         summaries: list[dict[str, Any]] = []
-        if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+        if hasattr(adapter, "set_eval_opponent_depth"):
             adapter.set_eval_opponent_depth(4)
         for episode_idx in range(episodes):
             observation, info = adapter.reset(seed=self.config.seed + 10_000 + episode_idx)
@@ -2605,9 +2606,11 @@ class UnifiedTrainingOrchestrator:
                     "episode_reward": reward_total,
                     "episode_length": step_count,
                     "winner": winner,
+                    "draw": bool(info.get("draw", False)),
+                    "invalid_action": bool(info.get("invalid_action", False)),
                 }
             )
-        if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+        if hasattr(adapter, "set_eval_opponent_depth"):
             adapter.set_eval_opponent_depth(0)
         metrics = adapter.compute_metrics(summaries)
         metrics["episodes"] = float(episodes)
@@ -2630,7 +2633,7 @@ class UnifiedTrainingOrchestrator:
                 model.train()
             else:
                 model.eval()
-            if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+            if hasattr(adapter, "set_eval_opponent_depth"):
                 adapter.set_eval_opponent_depth(4)
             with torch.no_grad():
                 for episode_idx in range(episodes):
@@ -2664,9 +2667,11 @@ class UnifiedTrainingOrchestrator:
                             "episode_reward": reward_total,
                             "episode_length": step_count,
                             "winner": winner,
+                            "draw": bool(info.get("draw", False)),
+                            "invalid_action": bool(info.get("invalid_action", False)),
                         }
                     )
-            if hasattr(adapter, "set_eval_opponent_depth") and domain_cfg.name == "connect4":
+            if hasattr(adapter, "set_eval_opponent_depth"):
                 adapter.set_eval_opponent_depth(0)
             model.train(was_training)
         metrics = adapter.compute_metrics(summaries)
@@ -3221,6 +3226,9 @@ class UnifiedTrainingOrchestrator:
                         for baseline in domain_cfg.baselines
                     },
                 }
+                maybe_enable_self_play = getattr(adapter, "maybe_enable_self_play", None)
+                if callable(maybe_enable_self_play):
+                    metrics["full"]["self_play_enabled"] = float(maybe_enable_self_play(metrics["full"]))
                 behavior_diagnostics = {
                     "baseline_guard_fraction": float(baseline_guard_count) / float(max(1, decision_count)),
                     "exploration_fraction": float(exploratory_action_count) / float(max(1, decision_count)),

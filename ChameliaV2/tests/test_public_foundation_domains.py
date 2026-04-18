@@ -105,12 +105,16 @@ def test_public_stage3_chess_annotated_loader_exposes_engine_metadata(tmp_path: 
         [
             {
                 "moves": ["e2e4", "e7e5", "g1f3"],
+                "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "best_move": "g1f3",
                 "candidate_moves": ["g1f3", "f1c4", "d2d4"],
                 "candidate_scores_cp": [42, 18, -30],
                 "candidate_blunder_losses_cp": [0, 24, 72],
                 "principal_variation": ["g1f3", "b8c6", "f1b5"],
                 "centipawn_eval": 42,
                 "result": "1-0",
+                "turn": "white",
+                "source": "stockfish_local_generator",
             }
         ],
     )
@@ -119,12 +123,16 @@ def test_public_stage3_chess_annotated_loader_exposes_engine_metadata(tmp_path: 
         [
             {
                 "moves": ["d2d4", "d7d5", "c2c4"],
+                "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "best_move": "c2c4",
                 "candidate_moves": ["c2c4", "g1f3"],
                 "candidate_scores_cp": [25, 5],
                 "candidate_blunder_losses_cp": [0, 20],
                 "principal_variation": ["c2c4", "e7e6"],
                 "centipawn_eval": 25,
                 "result": "1/2-1/2",
+                "turn": "white",
+                "source": "stockfish_local_generator",
             }
         ],
     )
@@ -136,6 +144,9 @@ def test_public_stage3_chess_annotated_loader_exposes_engine_metadata(tmp_path: 
     assert float(train_batch.domain_state["candidate_move_weights"][0].sum().item()) > 0.99
     assert float(train_batch.domain_state["centipawn_eval"][0].item()) == 42.0
     assert train_batch.domain_state["principal_variation_tokens"].shape[-1] == 8
+    assert train_batch.domain_state["fen"][0] == "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    assert train_batch.domain_state["turn"][0] == "white"
+    assert train_batch.domain_state["source"][0] == "stockfish_local_generator"
 
 
 def test_stage3_engine_guided_cost_prefers_best_ranked_candidate() -> None:

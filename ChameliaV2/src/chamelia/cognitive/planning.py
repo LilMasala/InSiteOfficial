@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.chamelia.action_spec import ActionPath
 from src.chamelia.cognitive.latent_action import estimate_target_delta
 from src.chamelia.cognitive.procedural import RetrievedSkill
 
@@ -37,6 +38,24 @@ class FrozenReasoningChain:
 
 
 @dataclass(frozen=True)
+class ThoughtTrace:
+    """Within-decision thought-token scratchpad."""
+
+    tokens: tuple[torch.Tensor, ...] = ()
+
+    def append(self, token: torch.Tensor) -> "ThoughtTrace":
+        return ThoughtTrace(tokens=self.tokens + (token.detach(),))
+
+    def clear(self) -> "ThoughtTrace":
+        return ThoughtTrace(tokens=())
+
+    def as_tensor(self) -> torch.Tensor | None:
+        if not self.tokens:
+            return None
+        return torch.stack(self.tokens, dim=0)
+
+
+@dataclass(frozen=True)
 class ThinkerOutput:
     """Frozen Thinker output handed downstream to the Talker."""
 
@@ -44,6 +63,7 @@ class ThinkerOutput:
     action_vec: torch.Tensor
     selected_path: torch.Tensor
     metadata: dict[str, Any]
+    thought_trace: ThoughtTrace = ThoughtTrace()
 
 
 class Talker(nn.Module):
@@ -57,11 +77,13 @@ class Talker(nn.Module):
         num_heads: int = 4,
         num_layers: int = 2,
         max_tokens: int = 32,
+        use_gemma_backbone: bool = False,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
         self.vocab_size = vocab_size
         self.max_tokens = max_tokens
+        self.use_gemma_backbone = bool(use_gemma_backbone)
         self.query_tokens = nn.Parameter(torch.zeros(1, max_tokens, latent_dim))
         nn.init.trunc_normal_(self.query_tokens, std=0.02)
         layer = nn.TransformerDecoderLayer(
@@ -77,15 +99,25 @@ class Talker(nn.Module):
         thinker_output: ThinkerOutput | FrozenReasoningChain | torch.Tensor,
         *,
         max_tokens: int | None = None,
+        belief_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if isinstance(thinker_output, ThinkerOutput):
-            memory = thinker_output.reasoning_chain.as_tensor().unsqueeze(0)
+            memory = (
+                thinker_output.thought_trace.as_tensor()
+                if thinker_output.thought_trace.tokens
+                else thinker_output.reasoning_chain.as_tensor()
+            )
+            memory = memory.unsqueeze(0)
         elif isinstance(thinker_output, FrozenReasoningChain):
             memory = thinker_output.as_tensor().unsqueeze(0)
         else:
             memory = thinker_output
         if memory.dim() == 2:
             memory = memory.unsqueeze(0)
+        if belief_tokens is not None:
+            if belief_tokens.dim() == 2:
+                belief_tokens = belief_tokens.unsqueeze(0)
+            memory = torch.cat([memory, belief_tokens], dim=1)
         query_len = min(int(max_tokens or self.max_tokens), self.max_tokens)
         queries = self.query_tokens[:, :query_len, :].expand(memory.shape[0], -1, -1)
         decoded = self.decoder(tgt=queries, memory=memory)
@@ -190,6 +222,9 @@ class MCTSNode:
     candidate_reasoning_states: torch.Tensor | None = None
     candidate_terminal_latents: torch.Tensor | None = None
     candidate_trajectories: torch.Tensor | None = None
+    candidate_uncertainty: torch.Tensor | None = None
+    thought_token: torch.Tensor | None = None
+    is_reflect: bool = False
     children: list["MCTSNode"] = field(default_factory=list)
 
     @property
@@ -220,9 +255,11 @@ class MCTSResult:
     candidate_reasoning_states: torch.Tensor | None
     candidate_terminal_latents: torch.Tensor | None
     candidate_trajectories: torch.Tensor | None
+    candidate_uncertainty: torch.Tensor | None
     selected_candidate_idx: int
     root: MCTSNode
     reasoning_chain: FrozenReasoningChain
+    thought_trace: ThoughtTrace
     tree_trace: dict[str, Any]
     reused_tree: bool
 
@@ -258,7 +295,13 @@ class MCTSSearch:
         use_baseline_guard: bool = True,
         baseline_cost_margin: float = 0.25,
         baseline_uncertainty_scale: float = 3.0,
-        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
+        reflect_cost_base: float = 0.05,
+        reflect_cost_step: float = 0.05,
+        max_reasoning_rounds: int = 4,
+        imagined_domain_state_builder: Callable[
+            [dict[str, Any], torch.Tensor | None, torch.Tensor, int], dict[str, Any]
+        ]
+        | None = None,
         simple_baseline_builder: Callable[[dict[str, Any], int, int], torch.Tensor | None] | None = None,
     ) -> None:
         self.actor = actor
@@ -274,6 +317,9 @@ class MCTSSearch:
         self.use_baseline_guard = use_baseline_guard
         self.baseline_cost_margin = baseline_cost_margin
         self.baseline_uncertainty_scale = baseline_uncertainty_scale
+        self.reflect_cost_base = float(reflect_cost_base)
+        self.reflect_cost_step = float(reflect_cost_step)
+        self.max_reasoning_rounds = max(1, int(max_reasoning_rounds))
         self.imagined_domain_state_builder = imagined_domain_state_builder
         self.simple_baseline_builder = simple_baseline_builder
         self._previous_root: MCTSNode | None = None
@@ -326,6 +372,8 @@ class MCTSSearch:
         node: MCTSNode,
         *,
         domain_state: dict[str, Any],
+        thought_trace: ThoughtTrace | None = None,
+        reasoning_round: int = 0,
         retrieved_postures: torch.Tensor | None = None,
         retrieved_posture_scores: torch.Tensor | None = None,
         skill_seed_path: torch.Tensor | None = None,
@@ -351,10 +399,16 @@ class MCTSSearch:
                 else retrieved_posture_scores
             ),
             simple_baseline_path=simple_baseline_path,
+            thought_tokens=(
+                thought_trace.as_tensor().unsqueeze(0)
+                if thought_trace is not None and thought_trace.as_tensor() is not None
+                else None
+            ),
         )
         candidate_paths = proposal["candidate_paths"]
         candidate_postures = proposal["candidate_postures"]
         reasoning_states = proposal["reasoning_states"]
+        thought_token = proposal["thought_token"][0].detach()
         if skill_seed_path is not None:
             if skill_seed_path.dim() == 1:
                 skill_seed_path = skill_seed_path.unsqueeze(0).unsqueeze(0)
@@ -403,17 +457,25 @@ class MCTSSearch:
             domain_state=domain_state,
             future_z=rollout["terminal_latents"],
             future_trajectory=rollout["trajectory"],
+            uncertainty=rollout.get("uncertainty"),
             imagined_domain_state_builder=self.imagined_domain_state_builder,
         )
         total_costs = candidate_costs["total"][0]
+        reflect_cost = (
+            self.reflect_cost_base + (float(reasoning_round) * self.reflect_cost_step)
+        )
+        reflect_cost_tensor = total_costs.new_tensor([reflect_cost])
+        total_costs_with_reflect = torch.cat([total_costs, reflect_cost_tensor], dim=0)
         node.candidate_paths = candidate_paths[0].detach()
         node.candidate_ic = candidate_costs["ic"][0].detach()
         node.candidate_tc = candidate_costs["tc"][0].detach()
-        node.candidate_costs = total_costs.detach()
+        node.candidate_costs = total_costs_with_reflect.detach()
         node.candidate_postures = candidate_postures[0].detach()
         node.candidate_reasoning_states = reasoning_states[0].detach()
         node.candidate_terminal_latents = rollout["terminal_latents"][0].detach()
         node.candidate_trajectories = rollout["trajectory"][0].detach()
+        node.candidate_uncertainty = rollout.get("uncertainty", None)
+        node.thought_token = thought_token
         node.expanded = True
         node.children = []
         for idx in range(candidate_paths.shape[1]):
@@ -434,6 +496,21 @@ class MCTSSearch:
                 safety_triggered=safety_triggered,
             )
             node.children.append(child)
+        if reasoning_round + 1 < self.max_reasoning_rounds:
+            node.children.append(
+                MCTSNode(
+                    latent_state=node.latent_state.detach(),
+                    ctx_tokens=node.ctx_tokens.detach(),
+                    depth=node.depth + 1,
+                    path_from_parent=None,
+                    action_from_parent=None,
+                    posture=None,
+                    reasoning_state=thought_token,
+                    immediate_cost=float(reflect_cost),
+                    thought_token=thought_token,
+                    is_reflect=True,
+                )
+            )
 
     def _select_child(self, node: MCTSNode) -> MCTSNode:
         if not node.children:
@@ -488,7 +565,12 @@ class MCTSSearch:
         required_predicted_improvement: float | None = None
         baseline_predicted_total: float | None = None
 
-        if self.use_baseline_guard and self.simple_baseline_builder is not None and root.children:
+        if (
+            self.use_baseline_guard
+            and self.simple_baseline_builder is not None
+            and root.children
+            and not best_child.is_reflect
+        ):
             baseline_child = root.children[0]
             if baseline_child.path_from_parent is not None:
                 baseline_predicted_total = float(predicted_costs[0].item())
@@ -525,6 +607,7 @@ class MCTSSearch:
             "selected_predicted_total": float(predicted_costs[best_idx].item()),
             "actual_predicted_improvement": actual_predicted_improvement,
             "required_predicted_improvement": required_predicted_improvement,
+            "selected_is_reflect": bool(best_child.is_reflect),
         }
 
     def search(
@@ -533,12 +616,14 @@ class MCTSSearch:
         z: torch.Tensor,
         ctx_tokens: torch.Tensor,
         domain_state: dict[str, Any],
+        thought_trace: ThoughtTrace | None = None,
         goal_z: torch.Tensor | None = None,
         retrieved_postures: torch.Tensor | None = None,
         retrieved_posture_scores: torch.Tensor | None = None,
         retrieved_skills: list[RetrievedSkill] | None = None,
         budget_multiplier: float = 1.0,
     ) -> MCTSResult:
+        active_trace = thought_trace or ThoughtTrace()
         root, reused_tree = self._maybe_reuse_root(z.detach(), ctx_tokens.detach())
         bounded_multiplier = max(0.5, min(4.0, float(budget_multiplier)))
         simulation_budget = max(1, int(round(float(self.simulations) * bounded_multiplier)))
@@ -547,6 +632,7 @@ class MCTSSearch:
             goal_z=goal_z.detach() if goal_z is not None else None,
             retrieved_skills=retrieved_skills,
         )
+        reasoning_round = len(active_trace.tokens)
         for _ in range(simulation_budget):
             node = root
             selection_path = [root]
@@ -557,6 +643,8 @@ class MCTSSearch:
                 self._expand_node(
                     node,
                     domain_state=domain_state,
+                    thought_trace=active_trace,
+                    reasoning_round=reasoning_round,
                     retrieved_postures=retrieved_postures,
                     retrieved_posture_scores=retrieved_posture_scores,
                     skill_seed_path=skill_seed_path if node.depth == 0 else None,
@@ -568,6 +656,24 @@ class MCTSSearch:
         if root.candidate_paths is None or root.candidate_costs is None or not root.children:
             raise RuntimeError("MCTS root never expanded.")
         best_idx, best_child, selection_debug = self._select_root_child(root)
+        if best_child.is_reflect and root.thought_token is not None:
+            active_trace = active_trace.append(root.thought_token)
+            reasoning_round = len(active_trace.tokens)
+            root.expanded = False
+            root.children = []
+            root.candidate_costs = None
+            root.candidate_paths = None
+            return self.search(
+                z=z,
+                ctx_tokens=ctx_tokens,
+                domain_state=domain_state,
+                thought_trace=active_trace,
+                goal_z=goal_z,
+                retrieved_postures=retrieved_postures,
+                retrieved_posture_scores=retrieved_posture_scores,
+                retrieved_skills=retrieved_skills,
+                budget_multiplier=budget_multiplier,
+            )
         selected_path = best_child.path_from_parent
         if selected_path is None:
             raise RuntimeError("Expanded child is missing a selected path.")
@@ -596,11 +702,14 @@ class MCTSSearch:
         tree_trace["selection_debug"] = selection_debug
         tree_trace["budget_multiplier"] = bounded_multiplier
         tree_trace["simulation_budget"] = simulation_budget
+        tree_trace["reasoning_round"] = reasoning_round
+        tree_trace["thought_trace_len"] = len(active_trace.tokens)
         tree_trace["root_candidate_costs"] = [float(value) for value in root.candidate_costs.tolist()]
         if root.candidate_ic is not None:
             tree_trace["root_candidate_ic"] = [float(value) for value in root.candidate_ic.tolist()]
         if root.candidate_tc is not None:
             tree_trace["root_candidate_tc"] = [float(value) for value in root.candidate_tc.tolist()]
+        action_candidate_count = int(root.candidate_paths.shape[0])
         self._previous_root = self._re_root_subtree(best_child, depth=0)
         return MCTSResult(
             selected_path=selected_path.detach(),
@@ -609,7 +718,7 @@ class MCTSSearch:
             candidate_paths=root.candidate_paths.detach(),
             candidate_ic=root.candidate_ic.detach() if root.candidate_ic is not None else None,
             candidate_tc=root.candidate_tc.detach() if root.candidate_tc is not None else None,
-            candidate_costs=root.candidate_costs.detach(),
+            candidate_costs=root.candidate_costs[:action_candidate_count].detach(),
             candidate_postures=(
                 root.candidate_postures.detach() if root.candidate_postures is not None else None
             ),
@@ -628,9 +737,15 @@ class MCTSSearch:
                 if root.candidate_trajectories is not None
                 else None
             ),
+            candidate_uncertainty=(
+                root.candidate_uncertainty.detach()
+                if root.candidate_uncertainty is not None and torch.is_tensor(root.candidate_uncertainty)
+                else None
+            ),
             selected_candidate_idx=best_idx,
             root=root,
             reasoning_chain=reasoning_chain,
+            thought_trace=active_trace,
             tree_trace=tree_trace,
             reused_tree=reused_tree,
         )

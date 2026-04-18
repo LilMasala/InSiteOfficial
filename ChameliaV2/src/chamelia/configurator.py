@@ -141,8 +141,16 @@ class Configurator(nn.Module):
         self.cross_attn_to_memory = nn.MultiheadAttention(
             embed_dim, num_heads, dropout=dropout, batch_first=True
         )
+        self.cross_attn_to_thought = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.cross_attn_to_semantic = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
         self.norm_latent = nn.LayerNorm(embed_dim)
         self.norm_memory = nn.LayerNorm(embed_dim)
+        self.norm_thought = nn.LayerNorm(embed_dim)
+        self.norm_semantic = nn.LayerNorm(embed_dim)
         self.norm_out = nn.LayerNorm(embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
 
@@ -203,6 +211,12 @@ class Configurator(nn.Module):
             self.cross_attn_to_memory = nn.MultiheadAttention(
                 D, new_heads, dropout=self._dropout, batch_first=True
             ).to(device=device, dtype=dtype)
+            self.cross_attn_to_thought = nn.MultiheadAttention(
+                D, new_heads, dropout=self._dropout, batch_first=True
+            ).to(device=device, dtype=dtype)
+            self.cross_attn_to_semantic = nn.MultiheadAttention(
+                D, new_heads, dropout=self._dropout, batch_first=True
+            ).to(device=device, dtype=dtype)
             self._num_heads = new_heads
 
         if not ctx_match:
@@ -217,6 +231,8 @@ class Configurator(nn.Module):
         hjepa_outputs: dict,
         memory_tokens: torch.Tensor | None,
         memory_scores: torch.Tensor | None = None,
+        thought_tokens: torch.Tensor | None = None,
+        semantic_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate context tokens from hierarchical latent state and memory.
 
@@ -283,6 +299,20 @@ class Configurator(nn.Module):
                 query=ctx,
                 key=mem,
                 value=mem,
+            )[0]
+        if thought_tokens is not None and thought_tokens.numel() > 0:
+            thought = self.norm_thought(thought_tokens)
+            ctx = ctx + self.cross_attn_to_thought(
+                query=ctx,
+                key=thought,
+                value=thought,
+            )[0]
+        if semantic_tokens is not None and semantic_tokens.numel() > 0:
+            semantic = self.norm_semantic(semantic_tokens)
+            ctx = ctx + self.cross_attn_to_semantic(
+                query=ctx,
+                key=semantic,
+                value=semantic,
             )[0]
 
         ctx = self.norm_out(ctx)

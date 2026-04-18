@@ -402,9 +402,11 @@ class Connect4Domain(InteractiveDomainAdapter):
     def build_imagined_domain_state(
         self,
         current_domain_state: dict[str, Any],
+        action: torch.Tensor | None,
         future_z: torch.Tensor,
         step_idx: int,
     ) -> dict[str, Any]:
+        _ = action
         _ = step_idx
         legal_logits, winning_logits, blocking_logits = self._decode_action_features(future_z)
         imagined = dict(current_domain_state)

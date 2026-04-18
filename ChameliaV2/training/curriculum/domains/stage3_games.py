@@ -197,6 +197,9 @@ class GamesCurriculumDomain(BaseCurriculumDomain):
             "principal_variation_tokens",
             "centipawn_eval",
             "best_move_token",
+            "fen",
+            "turn",
+            "source",
         ):
             if key in raw_batch:
                 batch.targets[key] = raw_batch[key]

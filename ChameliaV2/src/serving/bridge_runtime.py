@@ -17,7 +17,7 @@ from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
 from src.chamelia.hjepa_adapter import forward_hjepa
 from src.chamelia.memory import LatentMemory
 from src.chamelia.memory import EpisodeRecord, RetrievalTraceStep
-from src.chamelia.plugins import DomainRegistry, InSiteBridgeDomain, ProteinDTIDomain
+from src.chamelia.plugins import ChessDomain, DomainRegistry, InSiteBridgeDomain, ProteinDTIDomain
 from src.chamelia.plugins.base import AbstractDomain
 from src.chamelia.retrieval import MemoryRelevanceScorer
 from src.chamelia.world_model import ActionConditionedWorldModel
@@ -203,6 +203,8 @@ class BridgeRuntime:
             return DomainRegistry.get(domain_name)
         if domain_name == "insite_t1d":
             domain = InSiteBridgeDomain(embed_dim=embed_dim, action_dim=8)
+        elif domain_name == "chess":
+            domain = ChessDomain(embed_dim=embed_dim)
         elif domain_name == "language":
             domain = LanguageCurriculumDomain(batch_size=1, seq_len=32).build_runtime_domain(embed_dim)
         elif domain_name == "basic_arithmetic":
@@ -213,8 +215,6 @@ class BridgeRuntime:
             domain = PatternCurriculumDomain(
                 domain_variant="basic_arithmetic_patterns", batch_size=1, seq_len=32
             ).build_runtime_domain(embed_dim)
-        elif domain_name == "chess":
-            domain = GamesCurriculumDomain(domain_variant="chess", batch_size=1, seq_len=64).build_runtime_domain(embed_dim)
         elif domain_name == "collaborative":
             domain = CollaborativeCurriculumDomain(batch_size=1, seq_len=32).build_runtime_domain(embed_dim)
         elif domain_name in {"synthetic_patients", "health"}:

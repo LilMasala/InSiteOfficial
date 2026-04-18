@@ -25,6 +25,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from src.chamelia.action_spec import ActionSpec
+
 
 @dataclass(frozen=True)
 class SessionGeometry:
@@ -41,7 +43,7 @@ class SessionGeometry:
     """
 
     D: int = 512
-    A: int = 64
+    action_spec: ActionSpec = ActionSpec.continuous(64)
     P: int = 16
     K: int = 6
     H: int = 3
@@ -50,8 +52,8 @@ class SessionGeometry:
     def __post_init__(self) -> None:
         if self.D <= 0:
             raise ValueError("D must be a positive integer.")
-        if self.A <= 0:
-            raise ValueError("A must be a positive integer.")
+        if self.action_spec.primary_width <= 0:
+            raise ValueError("ActionSpec primary width must be a positive integer.")
         if self.P <= 0:
             raise ValueError("P must be a positive integer.")
         if self.K <= 0:
@@ -88,14 +90,23 @@ class SessionGeometry:
             T: World-model rollout horizon (default 8).
 
         Returns:
-            SessionGeometry with A bound to ``domain.get_action_dim()``.
+            SessionGeometry with ``action_spec`` bound to the domain.
         """
-        A: int = domain.get_action_dim()  # type: ignore[attr-defined]
-        return cls(D=D, A=A, P=P, K=K, H=H, T=T)
+        action_spec = (
+            domain.get_action_spec()  # type: ignore[attr-defined]
+            if hasattr(domain, "get_action_spec")
+            else ActionSpec.continuous(domain.get_action_dim())  # type: ignore[attr-defined]
+        )
+        return cls(D=D, action_spec=action_spec, P=P, K=K, H=H, T=T)
 
     # ------------------------------------------------------------------
     # Derived helpers
     # ------------------------------------------------------------------
+
+    @property
+    def A(self) -> int:
+        """Compatibility shim returning the active action width."""
+        return self.action_spec.primary_width
 
     @property
     def num_heads(self) -> int:

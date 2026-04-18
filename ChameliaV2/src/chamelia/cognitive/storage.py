@@ -216,6 +216,33 @@ class CognitiveStorage:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS beliefs (
+                    belief_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain_name TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    update_count INTEGER NOT NULL DEFAULT 0,
+                    embedding BLOB NOT NULL,
+                    embedding_shape TEXT NOT NULL,
+                    provenance_json TEXT NOT NULL DEFAULT '[]',
+                    description TEXT,
+                    extras TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS adapter_update_log (
+                    cluster_id INTEGER NOT NULL,
+                    cycle_digest TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (cluster_id, cycle_digest)
+                )
+                """
+            )
 
     def _ensure_column(
         self,
@@ -548,6 +575,112 @@ class CognitiveStorage:
                         str(payload.get("updated_at") or _now_iso()),
                     ),
                 )
+
+    def insert_belief(
+        self,
+        *,
+        domain_name: str,
+        embedding: torch.Tensor,
+        confidence: float,
+        provenance: set[int] | tuple[int, ...] | list[int],
+        update_count: int = 1,
+        description: str | None = None,
+        extras: dict[str, Any] | None = None,
+    ) -> int:
+        embedding_blob, embedding_shape = serialize_tensor(embedding)
+        if embedding_blob is None or embedding_shape is None:
+            raise ValueError("belief embedding is required")
+        timestamp = _now_iso()
+        with self._managed_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO beliefs (
+                    domain_name, confidence, update_count, embedding, embedding_shape,
+                    provenance_json, description, extras, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    domain_name,
+                    float(confidence),
+                    int(update_count),
+                    embedding_blob,
+                    embedding_shape,
+                    json.dumps(sorted(int(item) for item in provenance)),
+                    description,
+                    json.dumps(extras or {}),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def update_belief(
+        self,
+        *,
+        belief_id: int,
+        embedding: torch.Tensor,
+        confidence: float,
+        provenance: set[int] | tuple[int, ...] | list[int],
+        update_count: int,
+        description: str | None = None,
+        extras: dict[str, Any] | None = None,
+    ) -> None:
+        embedding_blob, embedding_shape = serialize_tensor(embedding)
+        if embedding_blob is None or embedding_shape is None:
+            raise ValueError("belief embedding is required")
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                UPDATE beliefs
+                SET confidence = ?, update_count = ?, embedding = ?, embedding_shape = ?,
+                    provenance_json = ?, description = ?, extras = ?, updated_at = ?
+                WHERE belief_id = ?
+                """,
+                (
+                    float(confidence),
+                    int(update_count),
+                    embedding_blob,
+                    embedding_shape,
+                    json.dumps(sorted(int(item) for item in provenance)),
+                    description,
+                    json.dumps(extras or {}),
+                    _now_iso(),
+                    int(belief_id),
+                ),
+            )
+
+    def fetch_beliefs(self, domain_name: str | None = None) -> list[sqlite3.Row]:
+        with self._managed_connection() as conn:
+            if domain_name is None:
+                return list(conn.execute("SELECT * FROM beliefs ORDER BY belief_id ASC"))
+            return list(
+                conn.execute(
+                    "SELECT * FROM beliefs WHERE domain_name = ? ORDER BY belief_id ASC",
+                    (str(domain_name),),
+                )
+            )
+
+    def has_adapter_update_log(self, cluster_id: int, cycle_digest: str) -> bool:
+        with self._managed_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM adapter_update_log
+                WHERE cluster_id = ? AND cycle_digest = ?
+                """,
+                (int(cluster_id), str(cycle_digest)),
+            ).fetchone()
+        return row is not None
+
+    def insert_adapter_update_log(self, cluster_id: int, cycle_digest: str) -> None:
+        with self._managed_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO adapter_update_log (cluster_id, cycle_digest, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (int(cluster_id), str(cycle_digest), _now_iso()),
+            )
 
     def _list_lancedb_tables(self, db: Any) -> list[str]:
         table_names = db.list_tables()

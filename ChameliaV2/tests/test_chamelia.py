@@ -205,9 +205,11 @@ class ImaginedStateDomain(DummyDomain):
     def build_imagined_domain_state(
         self,
         current_domain_state: dict[str, Any],
+        action: torch.Tensor | None,
         future_z: torch.Tensor,
         step_idx: int,
     ) -> dict[str, Any]:
+        _ = action
         imagined = dict(current_domain_state)
         imagined["state_scalar"] = future_z[:, 0] + float(step_idx)
         return imagined

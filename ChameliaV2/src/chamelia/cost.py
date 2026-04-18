@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.chamelia.action_spec import ActionPath, coerce_action_path
+
 
 def _repeat_domain_state(domain_state: dict[str, Any], repeats: int) -> dict[str, Any]:
     """Repeat batch-shaped domain-state tensors to match flattened candidates."""
@@ -17,20 +19,25 @@ def _repeat_domain_state(domain_state: dict[str, Any], repeats: int) -> dict[str
     for key, value in domain_state.items():
         if torch.is_tensor(value) and value.dim() > 0:
             repeated[key] = value.repeat_interleave(repeats, dim=0)
+        elif isinstance(value, tuple):
+            repeated[key] = tuple(item for entry in value for item in [copy(entry)] * repeats)
+        elif isinstance(value, list):
+            repeated[key] = [copy(entry) for entry in value for _ in range(repeats)]
         else:
             repeated[key] = copy(value)
     return repeated
 
 
 def _maybe_build_imagined_domain_state(
-    builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None,
+    builder: Callable[[dict[str, Any], torch.Tensor | None, torch.Tensor, int], dict[str, Any]] | None,
     domain_state: dict[str, Any],
+    action: torch.Tensor | None,
     future_z: torch.Tensor,
     step_idx: int,
 ) -> dict[str, Any]:
     if builder is None:
         return domain_state
-    return builder(domain_state, future_z, step_idx)
+    return builder(domain_state, action, future_z, step_idx)
 
 
 def _flatten_path_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
@@ -271,6 +278,7 @@ class CostModule(nn.Module):
         intrinsic_cost: IntrinsicCost,
         trainable_critic: TrainableCritic,
         gamma: float = 0.99,
+        uncertainty_penalty_weight: float = 0.0,
     ) -> None:
         """Initialize the combined cost module.
 
@@ -286,16 +294,17 @@ class CostModule(nn.Module):
         self.intrinsic_cost = intrinsic_cost
         self.trainable_critic = trainable_critic
         self.gamma = float(gamma)
+        self.uncertainty_penalty_weight = float(uncertainty_penalty_weight)
 
     def forward(
         self,
         z: torch.Tensor,
-        action: torch.Tensor,
+        action: torch.Tensor | ActionPath,
         ctx_tokens: torch.Tensor,
         domain_state: dict,
         future_z: torch.Tensor | None = None,
         horizon: int = 1,
-        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
+        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor | None, torch.Tensor, int], dict[str, Any]] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute intrinsic, trainable, and total cost terms.
 
@@ -311,15 +320,17 @@ class CostModule(nn.Module):
                 - "tc": [B]
                 - "total": [B]
         """
+        action_tensor = coerce_action_path(action).as_tensor()
         critic_latent = z if future_z is None else future_z
         ic_domain_state = _maybe_build_imagined_domain_state(
             imagined_domain_state_builder,
             domain_state,
+            action_tensor,
             critic_latent,
             0,
         )
         ic_latent = critic_latent if imagined_domain_state_builder is not None and future_z is not None else z
-        ic = self.intrinsic_cost(ic_latent, action, ic_domain_state)
+        ic = self.intrinsic_cost(ic_latent, action_tensor, ic_domain_state)
         tc = self.trainable_critic(critic_latent, ctx_tokens)
         total = ic + ((self.gamma**max(1, int(horizon))) * tc)
         return {"ic": ic, "tc": tc, "total": total}
@@ -327,12 +338,13 @@ class CostModule(nn.Module):
     def score_candidates(
         self,
         z: torch.Tensor,
-        actions: torch.Tensor,
+        actions: torch.Tensor | ActionPath,
         ctx_tokens: torch.Tensor,
         domain_state: dict[str, Any],
         future_z: torch.Tensor | None = None,
         future_trajectory: torch.Tensor | None = None,
-        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor, int], dict[str, Any]] | None = None,
+        uncertainty: torch.Tensor | None = None,
+        imagined_domain_state_builder: Callable[[dict[str, Any], torch.Tensor | None, torch.Tensor, int], dict[str, Any]] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Score a batch of candidate actions.
 
@@ -347,12 +359,13 @@ class CostModule(nn.Module):
         Returns:
             Dict with ``ic``, ``tc``, and ``total`` as [B, K].
         """
-        if actions.dim() == 2:
+        action_tensor = coerce_action_path(actions).as_tensor()
+        if action_tensor.dim() == 2:
             return {
                 key: value.unsqueeze(1)
                 for key, value in self.forward(
                     z=z,
-                    action=actions,
+                    action=action_tensor,
                     ctx_tokens=ctx_tokens,
                     domain_state=domain_state,
                     future_z=future_z,
@@ -361,18 +374,20 @@ class CostModule(nn.Module):
                 ).items()
             }
 
-        if actions.dim() == 4:
-            _, (batch_size, num_candidates, path_length) = _flatten_path_tensor(actions)
+        if action_tensor.dim() == 4:
+            _, (batch_size, num_candidates, path_length) = _flatten_path_tensor(action_tensor)
             if future_trajectory is None:
                 raise ValueError("future_trajectory is required when scoring action paths.")
             repeated_domain_state = _repeat_domain_state(domain_state, num_candidates)
             path_costs = []
+            step_domain_state = repeated_domain_state
             for step_idx in range(path_length):
-                flat_actions = actions[:, :, step_idx, :].reshape(batch_size * num_candidates, -1)
+                flat_actions = action_tensor[:, :, step_idx, :].reshape(batch_size * num_candidates, -1)
                 flat_future = future_trajectory[:, :, step_idx, :].reshape(batch_size * num_candidates, -1)
                 step_domain_state = _maybe_build_imagined_domain_state(
                     imagined_domain_state_builder,
-                    repeated_domain_state,
+                    step_domain_state,
+                    flat_actions,
                     flat_future,
                     step_idx,
                 )
@@ -408,10 +423,13 @@ class CostModule(nn.Module):
                 flat_ctx,
             ).view(batch_size, num_candidates)
             tail_discount = self.gamma**path_length
-            return {"ic": ic, "tc": tc, "total": ic + (tail_discount * tc)}
+            total = ic + (tail_discount * tc)
+            if uncertainty is not None:
+                total = total + (self.uncertainty_penalty_weight * uncertainty.mean(dim=-1))
+            return {"ic": ic, "tc": tc, "total": total}
 
-        batch_size, num_candidates, _ = actions.shape
-        flat_actions = actions.reshape(batch_size * num_candidates, -1)
+        batch_size, num_candidates, _ = action_tensor.shape
+        flat_actions = action_tensor.reshape(batch_size * num_candidates, -1)
         flat_z = (
             z.unsqueeze(1)
             .expand(-1, num_candidates, -1)
@@ -433,10 +451,14 @@ class CostModule(nn.Module):
         ic_domain_state = _maybe_build_imagined_domain_state(
             imagined_domain_state_builder,
             repeated_domain_state,
+            flat_actions,
             flat_future,
             0,
         )
         ic_latent = flat_future if imagined_domain_state_builder is not None else flat_z
         ic = self.intrinsic_cost(ic_latent, flat_actions, ic_domain_state).view(batch_size, num_candidates)
         tc = self.trainable_critic(flat_future, flat_ctx).view(batch_size, num_candidates)
-        return {"ic": ic, "tc": tc, "total": ic + (self.gamma * tc)}
+        total = ic + (self.gamma * tc)
+        if uncertainty is not None:
+            total = total + (self.uncertainty_penalty_weight * uncertainty.mean(dim=-1))
+        return {"ic": ic, "tc": tc, "total": total}

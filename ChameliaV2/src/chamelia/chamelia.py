@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.chamelia.actor import Actor
+from src.chamelia.action_spec import ActionKind
 from src.chamelia.cognitive.clustering import DomainIndex
 from src.chamelia.cognitive.latent_action import LatentActionEncoder
 from src.chamelia.cognitive.mamba_world_model import MambaActionConditionedWorldModel
@@ -18,11 +19,13 @@ from src.chamelia.cognitive.planning import (
     MCTSSearch,
     ReasoningStep,
     ThinkerOutput,
+    ThoughtTrace,
 )
 from src.chamelia.cognitive.procedural import (
     ProceduralMemory as CognitiveProceduralMemory,
     RetrievedSkill,
 )
+from src.chamelia.cognitive.semantic import SemanticMemory
 from src.chamelia.cognitive.representation import (
     ContrastiveSparseRepresentation,
     InformationOrderedBottleneck,
@@ -70,6 +73,7 @@ class Chamelia(nn.Module):
         memory: LatentMemory,
         domain: AbstractDomain,
         procedural_memory: CognitiveProceduralMemory | None = None,
+        semantic_memory: SemanticMemory | None = None,
         high_level_planner: HighLevelPlanner | None = None,
         mcts_search: MCTSSearch | None = None,
         domain_index: DomainIndex | None = None,
@@ -115,6 +119,7 @@ class Chamelia(nn.Module):
         self.cost = cost
         self.memory = memory
         self.procedural_memory = procedural_memory
+        self.semantic_memory = semantic_memory
         self.latent_action_encoder = latent_action_encoder
         self.iob_encoder = iob_encoder
         self.csr_encoder = csr_encoder
@@ -628,6 +633,38 @@ class Chamelia(nn.Module):
             padded[batch_idx, : tensor.shape[0]] = tensor
         return padded
 
+    def _retrieve_semantic_tokens(self, z: torch.Tensor) -> torch.Tensor | None:
+        if self.semantic_memory is None:
+            return None
+        per_sample: list[torch.Tensor] = []
+        max_items = 0
+        for batch_idx in range(z.shape[0]):
+            tokens = self.semantic_memory.retrieval_tokens(
+                z[batch_idx].detach().cpu(),
+                domain_name=self.domain.domain_name,
+                k=min(4, self.actor.num_candidates),
+            )
+            if tokens is None:
+                per_sample.append(torch.zeros(0, z.shape[-1], dtype=z.dtype))
+                continue
+            tokens = tokens.to(device=z.device, dtype=z.dtype)
+            per_sample.append(tokens)
+            max_items = max(max_items, int(tokens.shape[0]))
+        if max_items == 0:
+            return None
+        stacked = torch.zeros(
+            z.shape[0],
+            max_items,
+            z.shape[-1],
+            device=z.device,
+            dtype=z.dtype,
+        )
+        for batch_idx, tokens in enumerate(per_sample):
+            if tokens.numel() == 0:
+                continue
+            stacked[batch_idx, : tokens.shape[0]] = tokens
+        return stacked
+
     def _run_system1_skill(
         self,
         *,
@@ -748,6 +785,7 @@ class Chamelia(nn.Module):
             z=z,
             ctx_tokens=ctx_tokens,
             domain_state=domain_state,
+            thought_trace=ThoughtTrace(),
             goal_z=goal_z,
             retrieved_postures=retrieved_postures,
             retrieved_posture_scores=retrieved_posture_scores,
@@ -832,11 +870,18 @@ class Chamelia(nn.Module):
                     "planner_source": "mcts",
                     "reused_tree": result.reused_tree,
                 },
+                thought_trace=result.thought_trace,
             ),
             "planner_source": "mcts",
             "mcts_trace": tree_trace,
             "planner_diagnostics": planner_diagnostics,
             "skill_trace": tuple(item.record.skill_id for item in retrieved_skills[:1]),
+            "thought_trace": result.thought_trace,
+            "candidate_uncertainty": (
+                result.candidate_uncertainty.detach()
+                if result.candidate_uncertainty is not None
+                else None
+            ),
         }
 
     def forward(
@@ -897,6 +942,7 @@ class Chamelia(nn.Module):
         retrieval_relevance_scores = retrieval_bundle["relevance_scores"]
         retrieval_relevance_weights = retrieval_bundle["relevance_weights"]
         retrieval_relevance_features = retrieval_bundle["relevance_features"]
+        semantic_tokens = self._retrieve_semantic_tokens(z)
 
         ctx_tokens = self.configurator(
             hjepa_outputs={"target_features_per_level": level_feats},
@@ -910,6 +956,7 @@ class Chamelia(nn.Module):
                 if retrieved_episode_scores is not None
                 else None
             ),
+            semantic_tokens=semantic_tokens,
         )
         planner_cluster_ids: list[int | None] = [None] * z.shape[0]
         planner_skill_traces: list[tuple[int, ...] | None] = [None] * z.shape[0]
@@ -917,6 +964,7 @@ class Chamelia(nn.Module):
         planner_diagnostics: list[dict[str, Any] | None] = [None] * z.shape[0]
         thinker_output: ThinkerOutput | None = None
         reasoning_trace: list[dict[str, torch.Tensor]] = []
+        thought_trace = ThoughtTrace()
         goal_latents: torch.Tensor | None = None
         if self.planner_backend == "mcts" and self.mcts_search is not None:
             goal_latents = self._resolve_goal_latents(z, domain_state)
@@ -1041,7 +1089,11 @@ class Chamelia(nn.Module):
                 [result["selected_action"].to(z.device) for result in planner_results],
                 dim=0,
             )
-            action = self.domain.decode_action(action_vec)
+            action = (
+                self.domain.decode_action(action_vec)
+                if self.geometry is None or self.geometry.action_spec.kind == ActionKind.CONTINUOUS
+                else self.domain.decode_action_object(action_vec)
+            )
             cost_out = {
                 "ic": torch.tensor(
                     [
@@ -1111,6 +1163,7 @@ class Chamelia(nn.Module):
                     self.actor.path_length,
                     self.actor.action_dim,
                 ),
+                thought_tokens=None,
             )
             candidate_paths = proposal["candidate_paths"]
             candidate_actions = proposal["candidate_actions"]
@@ -1123,6 +1176,26 @@ class Chamelia(nn.Module):
             rollout = None
             candidate_costs = None
             for round_idx in range(max(1, self.reasoning_steps if actor_mode == "mode2" else 1)):
+                if round_idx > 0:
+                    ctx_tokens = self.configurator(
+                        hjepa_outputs={"target_features_per_level": level_feats},
+                        memory_tokens=(
+                            retrieved_episode_summaries.to(z.device)
+                            if retrieved_episode_summaries is not None
+                            else None
+                        ),
+                        memory_scores=(
+                            retrieved_episode_scores.to(z.device)
+                            if retrieved_episode_scores is not None
+                            else None
+                        ),
+                        thought_tokens=(
+                            thought_trace.as_tensor().unsqueeze(0).expand(z.shape[0], -1, -1)
+                            if thought_trace.as_tensor() is not None
+                            else None
+                        ),
+                        semantic_tokens=semantic_tokens,
+                    )
                 rollout = self.world_model(
                     z=z,
                     actions=candidate_paths,
@@ -1138,7 +1211,23 @@ class Chamelia(nn.Module):
                     domain_state=domain_state,
                     future_z=rollout["terminal_latents"],
                     future_trajectory=rollout["trajectory"],
+                    uncertainty=rollout.get("uncertainty"),
                     imagined_domain_state_builder=self.domain.build_imagined_domain_state,
+                )
+                current_thought_token = self.actor.thought_head(
+                    reasoning_states.mean(dim=1) + z
+                ).mean(dim=0)
+                reflect_logits = self.actor.reflect_head(current_thought_token).squeeze(-1)
+                reflect_cost = (
+                    self.mcts_search.reflect_cost_base + (round_idx * self.mcts_search.reflect_cost_step)
+                    if self.mcts_search is not None
+                    else 0.05 + (0.05 * round_idx)
+                )
+                reasoning_trace.append(
+                    {
+                        "thought_token": current_thought_token.detach(),
+                        "reflect_cost": candidate_costs["total"].new_tensor([float(reflect_cost)]),
+                    }
                 )
                 reasoning_trace.append(
                     {
@@ -1146,6 +1235,38 @@ class Chamelia(nn.Module):
                         "candidate_tc": candidate_costs["tc"].detach(),
                     }
                 )
+                best_action_cost = float(candidate_costs["total"].min().item())
+                if (
+                    actor_mode == "mode2"
+                    and round_idx + 1 < self.reasoning_steps
+                    and float(reflect_cost - torch.sigmoid(reflect_logits).mean().item()) < best_action_cost
+                ):
+                    thought_trace = thought_trace.append(current_thought_token)
+                    proposal = self.actor.propose(
+                        z,
+                        ctx_tokens,
+                        retrieved_postures=(
+                            retrieved_postures.to(z.device)
+                            if retrieved_postures is not None
+                            else None
+                        ),
+                        retrieved_posture_scores=(
+                            retrieved_posture_scores.to(z.device)
+                            if retrieved_posture_scores is not None
+                            else None
+                        ),
+                        simple_baseline_path=self.domain.build_simple_baseline_path(
+                            domain_state,
+                            self.actor.path_length,
+                            self.actor.action_dim,
+                        ),
+                        thought_tokens=thought_trace.as_tensor().unsqueeze(0).expand(z.shape[0], -1, -1),
+                    )
+                    candidate_paths = proposal["candidate_paths"]
+                    candidate_actions = proposal["candidate_actions"]
+                    candidate_postures = proposal["candidate_postures"]
+                    reasoning_states = proposal["reasoning_states"]
+                    continue
                 if actor_mode != "mode2" or round_idx + 1 >= self.reasoning_steps:
                     break
                 next_retrieved_episode_summaries = retrieved_episode_summaries
@@ -1242,12 +1363,36 @@ class Chamelia(nn.Module):
             selected_path = _select_candidate_tensor(candidate_paths, selected_candidate_idx)
             selected_posture = _select_candidate_tensor(candidate_postures, selected_candidate_idx)
             action_vec = _select_candidate_tensor(candidate_actions, selected_candidate_idx)
-            action = self.domain.decode_action(action_vec)
+            action = (
+                self.domain.decode_action(action_vec)
+                if self.geometry is None or self.geometry.action_spec.kind == ActionKind.CONTINUOUS
+                else self.domain.decode_action_object(action_vec)
+            )
             cost_out = {
                 "ic": _select_candidate_tensor(candidate_costs["ic"], selected_candidate_idx),
                 "tc": _select_candidate_tensor(candidate_costs["tc"], selected_candidate_idx),
                 "total": _select_candidate_tensor(candidate_costs["total"], selected_candidate_idx),
             }
+            if thinker_output is None:
+                reasoning_chain = FrozenReasoningChain(
+                    steps=(
+                        ReasoningStep(
+                            state=z[0].detach(),
+                            candidate_paths=candidate_paths[0].detach(),
+                            candidate_costs=candidate_costs["total"][0].detach(),
+                            selected_path=selected_path[0].detach(),
+                            source="flat",
+                            depth=0,
+                        ),
+                    )
+                )
+                thinker_output = ThinkerOutput(
+                    reasoning_chain=reasoning_chain,
+                    action_vec=action_vec.detach(),
+                    selected_path=selected_path.detach(),
+                    metadata={"planner_source": "flat"},
+                    thought_trace=thought_trace,
+                )
 
         decision_step = self._step_counter
         outputs = {
@@ -1291,6 +1436,8 @@ class Chamelia(nn.Module):
             "rollout": rollout,
             "reasoning_trace": reasoning_trace,
             "thinker_output": thinker_output,
+            "thought_trace": thought_trace,
+            "semantic_tokens": semantic_tokens,
             "planner_backend": self.planner_backend,
             "world_model_backend": self.world_model_backend,
             "planner_cluster_ids": planner_cluster_ids,

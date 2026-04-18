@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 from collections import deque
 from dataclasses import dataclass, field
+import hashlib
 import math
+import os
 import random
 import threading
 import time
@@ -23,6 +25,7 @@ from src.chamelia.cognitive.procedural import (
     SKILL_LIFECYCLE_ACTIVE,
     SKILL_LIFECYCLE_PROVISIONAL,
 )
+from src.chamelia.cognitive.semantic import SemanticMemory
 
 try:
     import stitch_core
@@ -1345,26 +1348,47 @@ class GemmaAutoDocWorker:
         self,
         *,
         model_id: str = "google/gemma-4-E2B-it",
+        model_path: str | None = None,
+        cache_dir: str | None = None,
         device_map: str = "auto",
         max_new_tokens: int = 128,
         generator: Any | None = None,
     ) -> None:
-        self.model_id = model_id
+        env_model_id = os.environ.get("CHAMELIA_GEMMA_MODEL_ID")
+        env_model_path = os.environ.get("CHAMELIA_GEMMA_MODEL_PATH")
+        env_cache_dir = os.environ.get("CHAMELIA_GEMMA_CACHE_DIR")
+        self.model_id = env_model_id or model_id
+        self.model_path = env_model_path or model_path
+        self.cache_dir = env_cache_dir or cache_dir
         self.device_map = device_map
         self.max_new_tokens = max_new_tokens
         self._generator = generator
         self._tokenizer = None
         self._model = None
 
+    def _resolve_model_source(self) -> tuple[str, bool]:
+        source = self.model_path or self.model_id
+        local_only = bool(self.model_path and os.path.exists(self.model_path))
+        return source, local_only
+
     def _load(self) -> None:
         if self._generator is not None or self._model is not None:
             return
         if AutoTokenizer is None or AutoModelForCausalLM is None:
             raise RuntimeError("transformers is required for the Gemma AutoDoc worker.")
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        source, local_only = self._resolve_model_source()
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        load_kwargs: dict[str, Any] = {
+            "cache_dir": self.cache_dir,
+            "local_files_only": local_only,
+        }
+        if token:
+            load_kwargs["token"] = token
+        self._tokenizer = AutoTokenizer.from_pretrained(source, **load_kwargs)
         self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_id,
+            source,
             device_map=self.device_map,
+            **load_kwargs,
         )
 
     def _prompt(self, candidate: LatentSkillCandidate, ordinal: int) -> str:
@@ -1443,19 +1467,26 @@ class SleepCoordinator:
         latent_action_encoder: LatentActionEncoder,
         world_model: Any,
         cost_module: Any,
+        configurator: Any | None = None,
+        actor: Any | None = None,
         domain_index: DomainIndex | None = None,
+        semantic_memory: SemanticMemory | None = None,
         sleep_interval_steps: int = 32,
         autodoc_worker: GemmaAutoDocWorker | None = None,
         fasttrack_return_threshold: float = 0.5,
         fasttrack_surprise_threshold: float = 0.35,
         promotion_margin: float = 1.0e-4,
+        adapter_ema: float = 0.5,
     ) -> None:
         self.episodic_memory = episodic_memory
         self.procedural_memory = procedural_memory
         self.latent_action_encoder = latent_action_encoder
         self.world_model = world_model
         self.cost_module = cost_module
+        self.configurator = configurator
+        self.actor = actor
         self.domain_index = domain_index
+        self.semantic_memory = semantic_memory
         self.sleep_interval_steps = sleep_interval_steps
         self.decomposer = LOVEDecomposer()
         self.compressor = StitchCompressor()
@@ -1466,6 +1497,7 @@ class SleepCoordinator:
         self.fasttrack_return_threshold = float(fasttrack_return_threshold)
         self.fasttrack_surprise_threshold = float(fasttrack_surprise_threshold)
         self.promotion_margin = float(promotion_margin)
+        self.adapter_ema = max(0.0, min(1.0, float(adapter_ema)))
         self._pending = threading.Event()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
@@ -1506,6 +1538,104 @@ class SleepCoordinator:
 
     def _gather_records(self) -> list[Any]:
         return list(self.episodic_memory.records[: self.episodic_memory.size])
+
+    def _snapshot_modules(self) -> dict[str, Any]:
+        snapshots: dict[str, Any] = {}
+        for name, module in (
+            ("configurator", self.configurator),
+            ("actor", self.actor),
+            ("world_model", self.world_model),
+        ):
+            if module is None:
+                continue
+            snapshots[name] = copy.deepcopy(module).cpu()
+        return snapshots
+
+    def _cycle_digest(self, records: list[Any]) -> str:
+        digest = hashlib.sha256()
+        for record in records:
+            digest.update(str(int(getattr(record, "record_id", 0))).encode("utf-8"))
+        return digest.hexdigest()
+
+    def _blend_adapter_updates(
+        self,
+        *,
+        cluster_id: int,
+        reference_modules: dict[str, Any],
+        records: list[Any],
+    ) -> None:
+        if (
+            self.domain_index is None
+            or self.domain_index.adapter_bank is None
+            or not records
+            or not reference_modules
+        ):
+            return
+        cycle_digest = self._cycle_digest(records)
+        if self.domain_index.storage.has_adapter_update_log(cluster_id, cycle_digest):
+            return
+        adapter_bank = self.domain_index.adapter_bank
+        current_model = nn.Module()
+        if self.configurator is not None:
+            current_model.add_module("configurator", self.configurator)
+        if self.actor is not None:
+            current_model.add_module("actor", self.actor)
+        current_model.add_module("world_model", self.world_model)
+        reference_model = nn.Module()
+        if "configurator" in reference_modules:
+            reference_model.add_module("configurator", reference_modules["configurator"])
+        if "actor" in reference_modules:
+            reference_model.add_module("actor", reference_modules["actor"])
+        if "world_model" in reference_modules:
+            reference_model.add_module("world_model", reference_modules["world_model"])
+        adapter_bank.ensure_cluster(cluster_id)
+        previous = copy.deepcopy(adapter_bank.adapters.get(int(cluster_id), {}))
+        adapter_bank.snapshot_from_difference(
+            cluster_id=cluster_id,
+            reference_model=reference_model,
+            tuned_model=current_model,
+        )
+        for name, adapter in adapter_bank.adapters[int(cluster_id)].items():
+            prior = previous.get(name)
+            if prior is None:
+                continue
+            adapter.in_proj_a = (self.adapter_ema * prior.in_proj_a) + ((1.0 - self.adapter_ema) * adapter.in_proj_a)
+            adapter.in_proj_b = (self.adapter_ema * prior.in_proj_b) + ((1.0 - self.adapter_ema) * adapter.in_proj_b)
+            adapter.out_proj_a = (self.adapter_ema * prior.out_proj_a) + ((1.0 - self.adapter_ema) * adapter.out_proj_a)
+            adapter.out_proj_b = (self.adapter_ema * prior.out_proj_b) + ((1.0 - self.adapter_ema) * adapter.out_proj_b)
+        cluster = self.domain_index.clusters.get(int(cluster_id))
+        if cluster is not None:
+            self.domain_index.storage.upsert_cluster(
+                cluster_id=cluster.cluster_id,
+                domain_name=cluster.domain_name,
+                centroid=cluster.centroid,
+                count=cluster.count,
+                trigger_weights=cluster.trigger_weights,
+                adapter_payload=adapter_bank.serialize_cluster(cluster.cluster_id),
+            )
+        self.domain_index.storage.insert_adapter_update_log(cluster_id, cycle_digest)
+
+    def _consolidate_beliefs(self, records: list[Any]) -> None:
+        if self.semantic_memory is None or not records:
+            return
+        grouped: dict[tuple[str, int | None], list[Any]] = {}
+        for record in records:
+            key = (str(getattr(record, "domain_name", "")), getattr(record, "domain_cluster_id", None))
+            grouped.setdefault(key, []).append(record)
+        for (domain_name, _cluster_id), group in grouped.items():
+            if len(group) < 2:
+                continue
+            embeddings = torch.stack([record.key.detach().float().cpu() for record in group], dim=0)
+            belief_embedding = F.normalize(embeddings.mean(dim=0), dim=-1)
+            provenance = {int(getattr(record, "record_id", 0)) for record in group}
+            description = f"Sleep-consolidated belief from {len(group)} episode(s)."
+            self.semantic_memory.add_or_update_belief(
+                embedding=belief_embedding,
+                domain_name=domain_name,
+                provenance=provenance,
+                description=description,
+                corroborated=True,
+            )
 
     def reranker_example_count(self) -> int:
         return len(self._reranker_examples)
@@ -1764,6 +1894,7 @@ class SleepCoordinator:
     def run_cycle(self) -> SleepCycleReport:
         started = time.time()
         records = self._gather_records()
+        snapshots = self._snapshot_modules()
         segments = self.compressor.compress(self.decomposer.decompose(records))
         dream_segments = self.dream.extract(records)
         rsd_candidates = self.rsd.propose(
@@ -1879,6 +2010,19 @@ class SleepCoordinator:
                     "metadata": getattr(record, "metadata", None),
                 },
             )
+        cluster_counts: dict[int, int] = {}
+        for record in records:
+            cluster_id = getattr(record, "domain_cluster_id", None)
+            if cluster_id is None:
+                continue
+            cluster_counts[int(cluster_id)] = cluster_counts.get(int(cluster_id), 0) + 1
+        for cluster_id in cluster_counts:
+            self._blend_adapter_updates(
+                cluster_id=cluster_id,
+                reference_modules=snapshots,
+                records=[record for record in records if getattr(record, "domain_cluster_id", None) == cluster_id],
+            )
+        self._consolidate_beliefs(records)
         self.procedural_memory.save()
         elapsed = time.time() - started
         return SleepCycleReport(

@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.chamelia.action_spec import ActionKind, ActionPath, ActionSpec, coerce_action_path
+
 if TYPE_CHECKING:
     from src.chamelia.session_geometry import SessionGeometry
 
@@ -114,12 +116,15 @@ class MambaActionConditionedWorldModel(nn.Module):
         d_state: int = 64,
         d_conv: int = 4,
         expand: int = 2,
+        ensemble_size: int = 4,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
+        self.action_spec = ActionSpec.continuous(action_dim)
         self.posture_dim = posture_dim
         self.max_horizon = max_horizon
+        self.ensemble_size = max(1, int(ensemble_size))
         self.state_proj = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim))
         # LazyLinear defers in_features (= A) to the first forward pass.
         # posture_proj uses a regular Linear because P is known at construction.
@@ -144,10 +149,15 @@ class MambaActionConditionedWorldModel(nn.Module):
         )
         self.backend = self.sequence_model[0].backend if self.sequence_model else "fallback_ssm"
         self.summary_norm = nn.LayerNorm(embed_dim)
-        self.transition_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
+        self.transition_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.GELU(),
+                    nn.Linear(embed_dim, embed_dim),
+                )
+                for _ in range(self.ensemble_size)
+            ]
         )
         self.posture_transition = nn.Sequential(
             nn.Linear(embed_dim * 2, embed_dim),
@@ -155,6 +165,28 @@ class MambaActionConditionedWorldModel(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         self.state_norm = nn.LayerNorm(embed_dim)
+
+    def _build_action_proj(
+        self,
+        action_spec: ActionSpec,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> nn.Module:
+        if action_spec.kind == ActionKind.DISCRETE:
+            return nn.Embedding(action_spec.primary_width, self.embed_dim).to(device=device)
+        return nn.Sequential(
+            nn.Linear(action_spec.primary_width, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+        ).to(device=device, dtype=dtype)
+
+    def _project_actions(self, step_action: torch.Tensor) -> torch.Tensor:
+        if self.action_spec.kind == ActionKind.DISCRETE:
+            ids = step_action.long()
+            if ids.dim() > 1 and ids.shape[-1] == 1:
+                ids = ids.squeeze(-1)
+            return self.action_proj(ids)
+        return self.action_proj(step_action)
 
     def bind_geometry(self, geometry: "SessionGeometry") -> None:
         """Bind or rebind the action projection to a concrete action dimension.
@@ -170,9 +202,12 @@ class MambaActionConditionedWorldModel(nn.Module):
         Returns:
             None.
         """
-        A = geometry.A
-        is_lazy = isinstance(self.action_proj[0], nn.LazyLinear)
-        if not is_lazy and self.action_dim == A:
+        action_spec = geometry.action_spec
+        A = action_spec.primary_width
+        is_lazy = isinstance(self.action_proj, nn.Sequential) and isinstance(
+            self.action_proj[0], nn.LazyLinear
+        )
+        if not is_lazy and self.action_dim == A and self.action_spec == action_spec:
             return
 
         try:
@@ -182,16 +217,14 @@ class MambaActionConditionedWorldModel(nn.Module):
             device = torch.device("cpu")
             dtype = torch.float32
 
-        self.action_proj = nn.Sequential(
-            nn.Linear(A, self.embed_dim),
-            nn.LayerNorm(self.embed_dim),
-        ).to(device=device, dtype=dtype)
+        self.action_proj = self._build_action_proj(action_spec, device=device, dtype=dtype)
         self.action_dim = A
+        self.action_spec = action_spec
 
     def forward(
         self,
         z: torch.Tensor,
-        actions: torch.Tensor,
+        actions: torch.Tensor | ActionPath,
         ctx_tokens: torch.Tensor,
         candidate_postures: torch.Tensor | None = None,
         reasoning_states: torch.Tensor | None = None,
@@ -203,15 +236,17 @@ class MambaActionConditionedWorldModel(nn.Module):
             raise ValueError(
                 f"horizon={horizon} exceeds max_horizon={self.max_horizon}."
             )
-        if actions.dim() == 2:
-            actions = actions.unsqueeze(1).unsqueeze(2)
-        elif actions.dim() == 3:
-            actions = actions.unsqueeze(2)
-        elif actions.dim() != 4:
+        action_path = coerce_action_path(actions, self.action_spec)
+        actions_tensor = action_path.as_tensor()
+        if actions_tensor.dim() == 2:
+            actions_tensor = actions_tensor.unsqueeze(1).unsqueeze(2)
+        elif actions_tensor.dim() == 3:
+            actions_tensor = actions_tensor.unsqueeze(2)
+        elif actions_tensor.dim() != 4:
             raise ValueError(
-                f"actions must have shape [B, A], [B, K, A], or [B, K, P, A], got {tuple(actions.shape)}."
+                "actions must have shape [B, A], [B, K, A], or [B, K, P, A]."
             )
-        batch_size, num_candidates, path_length, _ = actions.shape
+        batch_size, num_candidates, path_length, _ = actions_tensor.shape
         if path_length > self.max_horizon:
             raise ValueError(
                 f"path_length={path_length} exceeds max_horizon={self.max_horizon}."
@@ -242,8 +277,8 @@ class MambaActionConditionedWorldModel(nn.Module):
         token_sequence: list[torch.Tensor] = []
         posture_tokens: list[torch.Tensor | None] = []
         for step_idx in range(path_length):
-            step_action = actions[:, :, step_idx, :].reshape(-1, actions.shape[-1])
-            token = self.state_proj(current) + self.action_proj(step_action) + ctx_summary
+            step_action = actions_tensor[:, :, step_idx, :].reshape(-1, actions_tensor.shape[-1])
+            token = self.state_proj(current) + self._project_actions(step_action) + ctx_summary
             token = token + self.time_embed(
                 torch.full((token.shape[0],), step_idx, device=token.device, dtype=torch.long)
             )
@@ -261,8 +296,11 @@ class MambaActionConditionedWorldModel(nn.Module):
         modeled = sequence
         for layer in self.sequence_model:
             modeled = layer(modeled)
-        deltas = self.transition_head(self.summary_norm(modeled))
+        summary = self.summary_norm(modeled)
+        ensemble_deltas = torch.stack([head(summary) for head in self.transition_heads], dim=0)
+        deltas = ensemble_deltas.mean(dim=0)
         trajectory = []
+        uncertainty_steps = ensemble_deltas.std(dim=0, unbiased=False).mean(dim=-1)
         state = current
         for step_idx in range(path_length):
             delta = deltas[:, step_idx, :]
@@ -280,6 +318,14 @@ class MambaActionConditionedWorldModel(nn.Module):
             "summary_tokens": self.summary_norm(modeled.mean(dim=1)).view(
                 batch_size,
                 num_candidates,
+                self.embed_dim,
+            ),
+            "uncertainty": uncertainty_steps.view(batch_size, num_candidates, path_length),
+            "ensemble_deltas": ensemble_deltas.view(
+                self.ensemble_size,
+                batch_size,
+                num_candidates,
+                path_length,
                 self.embed_dim,
             ),
         }
@@ -303,7 +349,27 @@ class MambaActionConditionedWorldModel(nn.Module):
         predicted = outputs["terminal_latents"]
         if predicted.dim() == 3 and predicted.shape[1] == 1:
             predicted = predicted[:, 0, :]
-        return F.smooth_l1_loss(predicted, z_tH.detach())
+        base_loss = F.smooth_l1_loss(predicted, z_tH.detach())
+        diversity_loss = self.compute_diversity_loss(outputs["ensemble_deltas"])
+        return base_loss + (0.05 * diversity_loss)
+
+    def compute_diversity_loss(self, ensemble_deltas: torch.Tensor) -> torch.Tensor:
+        """Penalize collapsed ensemble transition heads."""
+        if ensemble_deltas.shape[0] < 2:
+            return ensemble_deltas.new_zeros(())
+        flattened = ensemble_deltas.reshape(ensemble_deltas.shape[0], -1)
+        normalized = F.normalize(flattened, dim=-1)
+        similarity = normalized @ normalized.transpose(0, 1)
+        pair_mask = torch.triu(
+            torch.ones(
+                similarity.shape[0],
+                similarity.shape[1],
+                dtype=torch.bool,
+                device=similarity.device,
+            ),
+            diagonal=1,
+        )
+        return F.relu(similarity[pair_mask] - 0.25).mean()
 
     def compute_trajectory_loss(
         self,

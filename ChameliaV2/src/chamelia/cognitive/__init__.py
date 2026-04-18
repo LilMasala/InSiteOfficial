@@ -27,12 +27,14 @@ from src.chamelia.cognitive.planning import (
     MCTSSearch,
     Talker,
     ThinkerOutput,
+    ThoughtTrace,
 )
 from src.chamelia.cognitive.procedural import (
     ProceduralMemory,
     RetrievedSkill,
     SkillRecord,
 )
+from src.chamelia.cognitive.semantic import BeliefRecord, SemanticMemory
 from src.chamelia.cognitive.representation import (
     ContrastiveSparseRepresentation,
     InformationOrderedBottleneck,
@@ -61,6 +63,8 @@ __all__ = [
     "ProceduralMemory",
     "RetrievedSkill",
     "SkillRecord",
+    "BeliefRecord",
+    "SemanticMemory",
     "BackendAssessment",
     "assess_vector_backends",
     "LatentActionEncoder",
@@ -73,6 +77,7 @@ __all__ = [
     "HighLevelPlanner",
     "MCTSSearch",
     "ThinkerOutput",
+    "ThoughtTrace",
     "Talker",
     "VectorQuantizer",
     "InformationOrderedBottleneck",

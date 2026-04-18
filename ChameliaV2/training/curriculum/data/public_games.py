@@ -180,6 +180,12 @@ def _record_to_sequence(record: dict, *, vocab_size: int, seq_len: int) -> dict 
         annotation["best_move_token"] = torch.tensor(
             token_id_for_text(best_move.strip(), vocab_size), dtype=torch.long
         )
+        if isinstance(record.get("fen"), str) and record["fen"].strip():
+            annotation["fen"] = record["fen"].strip()
+        if record.get("turn") is not None:
+            annotation["turn"] = str(record["turn"])
+        if record.get("source") is not None:
+            annotation["source"] = str(record["source"])
         return {"items": items, "regime": regime, "annotation": annotation}
 
     for key in ("actions", "trajectory", "events"):

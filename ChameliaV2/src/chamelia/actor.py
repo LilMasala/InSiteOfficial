@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.chamelia.action_spec import ActionKind, ActionPath, ActionSpec
+
 if TYPE_CHECKING:
     from src.chamelia.session_geometry import SessionGeometry
 
@@ -103,6 +105,7 @@ class Actor(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
+        self.action_spec = ActionSpec.continuous(action_dim)
         self.num_ctx_tokens = num_ctx_tokens
         self.num_candidates = num_candidates
         self.path_length = path_length
@@ -185,7 +188,27 @@ class Actor(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim // 2, action_dim * path_length),
         )
+        self.discrete_action_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, action_dim * path_length),
+        )
+        self.generative_action_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, action_dim * path_length),
+        )
         self.refinement_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, action_dim * path_length),
+        )
+        self.discrete_refinement_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, action_dim * path_length),
+        )
+        self.generative_refinement_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.GELU(),
             nn.Linear(embed_dim // 2, action_dim * path_length),
@@ -196,6 +219,16 @@ class Actor(nn.Module):
             nn.Linear(embed_dim // 2, 1),
         )
         self.mode_1_policy = nn.Linear(embed_dim, action_dim)
+        self.thought_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.reflect_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 1),
+        )
 
     def bind_geometry(self, geometry: "SessionGeometry") -> None:
         """Rebind action-dimension-dependent heads from a SessionGeometry.
@@ -232,11 +265,12 @@ class Actor(nn.Module):
                 "The posture bottleneck is fixed at construction time."
             )
 
-        A = geometry.A
+        action_spec = geometry.action_spec
+        A = action_spec.primary_width
         H = geometry.H
 
         # Idempotent guard: skip rebuild if nothing action-relevant changed.
-        if self.action_dim == A and self.path_length == H:
+        if self.action_dim == A and self.path_length == H and self.action_spec == action_spec:
             return
 
         D = self.embed_dim
@@ -253,8 +287,28 @@ class Actor(nn.Module):
             nn.GELU(),
             nn.Linear(D // 2, A * H),
         ).to(device=device, dtype=dtype)
+        self.discrete_action_head = nn.Sequential(
+            nn.Linear(D, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, A * H),
+        ).to(device=device, dtype=dtype)
+        self.generative_action_head = nn.Sequential(
+            nn.Linear(D, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, A * H),
+        ).to(device=device, dtype=dtype)
 
         self.refinement_head = nn.Sequential(
+            nn.Linear(D, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, A * H),
+        ).to(device=device, dtype=dtype)
+        self.discrete_refinement_head = nn.Sequential(
+            nn.Linear(D, D // 2),
+            nn.GELU(),
+            nn.Linear(D // 2, A * H),
+        ).to(device=device, dtype=dtype)
+        self.generative_refinement_head = nn.Sequential(
             nn.Linear(D, D // 2),
             nn.GELU(),
             nn.Linear(D // 2, A * H),
@@ -276,6 +330,41 @@ class Actor(nn.Module):
             nn.init.trunc_normal_(self.step_posture_embeddings, std=0.02)
 
         self.action_dim = A
+        self.action_spec = action_spec
+
+    def _active_action_head(self) -> nn.Sequential:
+        if self.action_spec.kind == ActionKind.DISCRETE:
+            return self.discrete_action_head
+        if self.action_spec.kind == ActionKind.GENERATIVE:
+            return self.generative_action_head
+        return self.action_head
+
+    def _active_refinement_head(self) -> nn.Sequential:
+        if self.action_spec.kind == ActionKind.DISCRETE:
+            return self.discrete_refinement_head
+        if self.action_spec.kind == ActionKind.GENERATIVE:
+            return self.generative_refinement_head
+        return self.refinement_head
+
+    def _candidate_action_path(
+        self,
+        candidate_paths: torch.Tensor,
+        *,
+        candidate_logits: torch.Tensor | None = None,
+    ) -> ActionPath:
+        if self.action_spec.kind == ActionKind.DISCRETE:
+            discrete_ids = candidate_paths.squeeze(-1).round().long()
+            return ActionPath(
+                action_spec=self.action_spec,
+                discrete_ids=discrete_ids,
+                discrete_logits=candidate_logits,
+            )
+        if self.action_spec.kind == ActionKind.GENERATIVE:
+            return ActionPath(
+                action_spec=self.action_spec,
+                generative_chunks=candidate_paths,
+            )
+        return ActionPath(action_spec=self.action_spec, continuous=candidate_paths)
 
     def _encode_state(self, z: torch.Tensor) -> torch.Tensor:
         """Encode the current latent state into a planning token."""
@@ -463,6 +552,7 @@ class Actor(nn.Module):
         retrieved_postures: torch.Tensor | None = None,
         retrieved_posture_scores: torch.Tensor | None = None,
         simple_baseline_path: torch.Tensor | None = None,
+        thought_tokens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Generate candidate actions and candidate planning states."""
         batch_size = z.shape[0]
@@ -501,17 +591,31 @@ class Actor(nn.Module):
             key=ctx,
             value=ctx,
         )[0]
+        if thought_tokens is not None and thought_tokens.numel() > 0:
+            thought_context = thought_tokens
+            if thought_context.dim() == 2:
+                thought_context = thought_context.unsqueeze(1)
+            reasoning = reasoning + self.cross_attn_to_reasoning(
+                query=reasoning,
+                key=thought_context,
+                value=thought_context,
+            )[0]
         for layer in self.candidate_layers:
             reasoning = layer(reasoning)
         reasoning_states = self.norm_reasoning(reasoning)
-        reasoning_paths = self.action_head(reasoning_states).view(
+        action_logits = self._active_action_head()(reasoning_states).view(
             batch_size,
             self.num_candidates,
             self.path_length,
             self.action_dim,
         )
         posture_paths = self._posture_path_bias(candidate_postures)
-        candidate_paths = reasoning_paths + posture_paths
+        if self.action_spec.kind == ActionKind.DISCRETE:
+            discrete_logits = action_logits + posture_paths
+            candidate_paths = discrete_logits.argmax(dim=-1, keepdim=True).float()
+        else:
+            discrete_logits = None
+            candidate_paths = action_logits + posture_paths
         candidate_paths, candidate_postures, reasoning_states = self._enforce_simple_baseline(
             candidate_paths,
             candidate_postures,
@@ -519,17 +623,26 @@ class Actor(nn.Module):
             state,
             simple_baseline_path=simple_baseline_path,
         )
+        candidate_action_paths = self._candidate_action_path(
+            candidate_paths,
+            candidate_logits=discrete_logits,
+        )
         candidate_actions = candidate_paths[:, :, 0, :]
+        thought_token = self.thought_head(reasoning_states.mean(dim=1) + state.squeeze(1))
+        reflect_logits = self.reflect_head(thought_token).squeeze(-1)
         return {
             "candidate_postures": candidate_postures,
             "reasoning_states": reasoning_states,
             "candidate_states": reasoning_states,
             "candidate_paths": candidate_paths,
+            "candidate_action_paths": candidate_action_paths,
             "candidate_actions": candidate_actions,
             "candidate_selection_logits": self._selection_logits(
                 candidate_postures,
                 reasoning_states,
             ),
+            "thought_token": thought_token,
+            "reflect_logits": reflect_logits,
         }
 
     def refine(
@@ -584,7 +697,7 @@ class Actor(nn.Module):
         for layer in self.candidate_layers:
             refined = layer(refined)
         refined = self.norm_out(refined)
-        path_delta = self.refinement_head(refined).view(
+        path_delta = self._active_refinement_head()(refined).view(
             refined.shape[0],
             refined.shape[1],
             self.path_length,
@@ -592,6 +705,8 @@ class Actor(nn.Module):
         )
         updated_posture_paths = self._posture_path_bias(candidate_postures)
         candidate_paths = candidate_paths + path_delta + (updated_posture_paths - previous_posture_paths)
+        if self.action_spec.kind == ActionKind.DISCRETE:
+            candidate_paths = candidate_paths.argmax(dim=-1, keepdim=True).float()
         candidate_paths, candidate_postures, refined = self._enforce_simple_baseline(
             candidate_paths,
             candidate_postures,

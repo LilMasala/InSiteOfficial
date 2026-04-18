@@ -8,11 +8,13 @@ import random
 
 import pytest
 import torch
+import chess
 
 from src.chamelia.cognitive.mamba_world_model import MambaActionConditionedWorldModel
 from src.chamelia.memory import EpisodeRecord, LatentMemory
-from src.chamelia.plugins import CartPoleDomain, Connect4Domain
-from src.chamelia.tokenizers import StateVectorTokenizer
+from src.chamelia.plugins import CartPoleDomain, ChessDomain, Connect4Domain
+from src.chamelia.plugins.chess import _action_from_move, _action_to_move
+from src.chamelia.tokenizers import ChessTokenizer, StateVectorTokenizer
 from training.orchestrator.core import ReplayWindow, _move_nested_to_device
 from training.orchestrator import (
     DomainPhaseConfig,
@@ -58,6 +60,14 @@ def test_interactive_domain_single_observation_tokenization() -> None:
     greedy_action = connect4.baseline_action("greedy", board_obs, board_info)
     assert int(greedy_action.item()) == 3
 
+    chess_domain = ChessDomain(embed_dim=16, opponent_level=0)
+    chess_obs, chess_info = chess_domain.reset(seed=123)
+    tokenized_chess = chess_domain.tokenize_observation(chess_obs)
+    assert tokenized_chess.tokens.shape == (1, 64, 16)
+    chess_legal = chess_domain.legal_action_mask(chess_obs, chess_info)
+    assert chess_legal is not None
+    assert int(chess_legal.sum().item()) == 20
+
 
 def test_domain_baselines_and_imagined_states_are_not_constant() -> None:
     cartpole = CartPoleDomain(embed_dim=16)
@@ -74,9 +84,175 @@ def test_domain_baselines_and_imagined_states_are_not_constant() -> None:
     assert connect_state["board"].shape == (1, 6, 7)
     assert connect_state["current_player"].shape == (1,)
     assert connect_state["legal_actions_mask"].shape == (1, 7)
-    imagined = connect4.build_imagined_domain_state(connect_state, torch.randn(3, 16), step_idx=0)
+    imagined = connect4.build_imagined_domain_state(connect_state, None, torch.randn(3, 16), step_idx=0)
     assert imagined["legal_actions_mask"].shape == (3, 7)
     assert imagined["winning_actions"].shape == (3, 7)
+
+
+def test_chess_tokenizer_projects_alpha_zero_planes() -> None:
+    tokenizer = ChessTokenizer(embed_dim=16)
+    batch = tokenizer.collate([torch.zeros(8, 8, 111), torch.ones(8, 8, 111)])
+    tokenized = tokenizer(batch)
+    assert tokenized.tokens.shape == (2, 64, 16)
+    assert tokenized.position_ids.shape == (2, 64)
+    assert tokenized.padding_mask is not None
+    assert tokenized.padding_mask.shape == (2, 64)
+
+
+def test_chess_domain_move_roundtrip_and_legal_mask() -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0)
+    observation, info = domain.reset(seed=0)
+    state = domain.build_domain_state(observation, info)
+    legal_mask = state["legal_actions_mask"][0]
+    move = chess.Move.from_uci("e2e4")
+    action = _action_from_move(move)
+    assert bool(legal_mask[action].item()) is True
+    assert _action_to_move(chess.Board(), action).uci() == "e2e4"
+
+
+def test_chess_domain_invalid_move_is_terminal_loss() -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0)
+    observation, info = domain.reset(seed=0)
+    invalid_action = torch.tensor([0], dtype=torch.long)
+    next_observation, reward, terminated, truncated, next_info = domain.step(invalid_action)
+    assert next_observation["observation"].shape == (8, 8, 111)
+    assert reward == -1.0
+    assert terminated is True
+    assert truncated is False
+    assert next_info["invalid_action"] is True
+    assert next_info["winner"] == 2
+
+
+def test_chess_domain_exact_step_and_imagined_rollout_update_board() -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0)
+    observation, info = domain.reset(seed=0)
+    action_id = _action_from_move(chess.Move.from_uci("e2e4"))
+    action_logits = torch.full((1, domain.get_action_dim()), -6.0)
+    action_logits[0, action_id] = 6.0
+
+    state = domain.build_domain_state(observation, info)
+    imagined = domain.build_imagined_domain_state(
+        state,
+        action_logits,
+        torch.zeros(1, 16),
+        0,
+    )
+    outcome = domain.simulate_path_outcome(action_logits.unsqueeze(1), state)
+
+    assert imagined["board_observation"].shape == (1, 8, 8, 111)
+    assert imagined["legal_actions_mask"].shape == (1, domain.get_action_dim())
+    assert imagined["move_count"][0].item() >= 1.0
+    assert outcome is not None
+    assert outcome["outcome_observation"].shape == (1, 8, 8, 111)
+    assert outcome["realized_intrinsic_cost"].shape == (1,)
+
+
+def test_chess_domain_terminal_flags_from_fen_positions() -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0)
+    checkmate_board = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")
+    checkmate_obs = {
+        "observation": torch.zeros(8, 8, 111),
+        "fen": checkmate_board.fen(),
+        "history_block": torch.zeros(8, 8, 104),
+    }
+    checkmate_state = domain.build_domain_state(checkmate_obs, None)
+    assert float(checkmate_state["is_checkmate"][0].item()) == 1.0
+
+    draw_board = chess.Board("8/8/8/8/8/8/6k1/7K w - - 0 1")
+    draw_obs = {
+        "observation": torch.zeros(8, 8, 111),
+        "fen": draw_board.fen(),
+        "history_block": torch.zeros(8, 8, 104),
+    }
+    draw_state = domain.build_domain_state(draw_obs, None)
+    assert float(draw_state["is_draw"][0].item()) == 1.0
+
+
+def test_chess_domain_config_fields_and_self_play_gate() -> None:
+    domain = ChessDomain(
+        embed_dim=16,
+        opponent_level=0,
+        self_play_unlock_threshold=0.9,
+        chess_data_root="/tmp/chess-data",
+        stockfish_path="/definitely/not/used/by/runtime",
+        move_vocabulary_source="alphazero_4672",
+    )
+    assert domain.chess_data_root == "/tmp/chess-data"
+    assert domain.stockfish_path == "/definitely/not/used/by/runtime"
+    assert domain.move_vocabulary_source == "alphazero_4672"
+    assert domain.maybe_enable_self_play(
+        {
+            "puzzle_solve_rate": 0.95,
+            "invalid_rate": 0.0,
+            "blunder_rate": 0.1,
+            "win_rate": 0.6,
+            "draw_rate": 0.1,
+        }
+    )
+    blocked = ChessDomain(embed_dim=16, opponent_level=0, self_play_unlock_threshold=0.9)
+    assert blocked.maybe_enable_self_play(
+        {
+            "puzzle_solve_rate": 0.95,
+            "invalid_rate": 0.0,
+            "blunder_rate": 0.35,
+            "win_rate": 0.8,
+            "draw_rate": 0.0,
+        }
+    ) is False
+
+
+def test_chess_domain_runtime_does_not_depend_on_stockfish_path() -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0, stockfish_path="/missing/stockfish")
+    observation, info = domain.reset(seed=0)
+    action = domain.baseline_action("simple", observation, info)
+    next_observation, reward, terminated, truncated, next_info = domain.step(action)
+    assert next_observation["observation"].shape == (8, 8, 111)
+    assert isinstance(float(reward), float)
+    assert isinstance(bool(terminated), bool)
+    assert isinstance(bool(truncated), bool)
+    assert "winner" in next_info
+
+
+def test_orchestrator_can_build_chess_adapter_and_model(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "chess_build")
+    config.domains = [
+        DomainRunConfig(
+            name="chess",
+            family="state_vector_hjepa",
+            adapter_kwargs={"opponent_level": 0},
+            bootstrap_random_episodes=1,
+            bootstrap_simple_episodes=1,
+            bootstrap_pretrain_steps=1,
+            bootstrap_replay_warmup_steps=1,
+            bootstrap_batch_size=1,
+            max_episode_steps=4,
+            optimizer_interval=1,
+            sleep_interval_episodes=1,
+            checkpoint_interval_episodes=1,
+            evaluation_episodes=1,
+            world_model_backend="mamba",
+            mcts_simulations=1,
+            mcts_depth=1,
+            mcts_rollout_horizon=1,
+            baselines=("random", "simple"),
+            phases={"core_control": DomainPhaseConfig(episodes=1)},
+        )
+    ]
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    model = orchestrator._build_model(config.domains[0], adapter)
+    observation, info = adapter.reset(seed=0)
+    tokenized = adapter.tokenize_observation(observation)
+    outputs = model(
+        tokens=tokenized.tokens.to(orchestrator.device),
+        mask=torch.zeros(tokenized.tokens.shape[:2], dtype=torch.float32, device=orchestrator.device),
+        domain_state=_move_nested_to_device(adapter.build_domain_state(observation, info), orchestrator.device),
+        actor_mode="mode2",
+        store_to_memory=False,
+    )
+
+    assert isinstance(adapter, ChessDomain)
+    assert outputs["action"].shape == (1,)
 
 
 def test_replay_and_latent_memory_roundtrip() -> None:

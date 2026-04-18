@@ -9,6 +9,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from src.chamelia.action_spec import ActionKind, ActionPath, ActionSpec
 from src.chamelia.tokenizers import AbstractTokenizer
 
 
@@ -30,6 +31,10 @@ class AbstractDomain(ABC):
         Returns:
             Integer action dimension A.
         """
+
+    def get_action_spec(self) -> ActionSpec:
+        """Return the richer action-space contract for the active domain."""
+        return ActionSpec.continuous(self.get_action_dim())
 
     @abstractmethod
     def decode_action(self, action_vec: torch.Tensor) -> Any:
@@ -59,6 +64,26 @@ class AbstractDomain(ABC):
         if action_path.dim() == 2:
             return self.decode_action(action_path[0, :].unsqueeze(0))
         return self.decode_action(action_path)
+
+    def decode_action_object(self, action: torch.Tensor | ActionPath) -> Any:
+        """Decode either a legacy tensor or a structured action object."""
+        if isinstance(action, ActionPath):
+            if action.action_spec.kind == ActionKind.CONTINUOUS:
+                return self.decode_action(action.as_tensor())
+            return action
+        return self.decode_action(action)
+
+    def decode_action_path_object(self, action_path: torch.Tensor | ActionPath) -> Any:
+        """Decode either a legacy tensor path or a structured action path."""
+        if isinstance(action_path, ActionPath):
+            if action_path.action_spec.kind == ActionKind.CONTINUOUS:
+                return self.decode_action_path(action_path.as_tensor())
+            return action_path
+        return self.decode_action_path(action_path)
+
+    def encode_generated_action(self, generated_tokens: torch.Tensor) -> torch.Tensor:
+        """Optionally map generated tokens back into a planner-facing latent chunk."""
+        return generated_tokens.float()
 
     @abstractmethod
     def get_intrinsic_cost_fns(self) -> list[tuple[Callable, float]]:
@@ -134,6 +159,7 @@ class AbstractDomain(ABC):
     def build_imagined_domain_state(
         self,
         current_domain_state: dict[str, Any],
+        action: torch.Tensor | None,
         future_z: torch.Tensor,
         step_idx: int,
     ) -> dict[str, Any]:
@@ -141,6 +167,7 @@ class AbstractDomain(ABC):
 
         Args:
             current_domain_state: Current batched domain state payload.
+            action: Optional action tensor aligned with the imagined step.
             future_z: Predicted latent for the imagined future step.
             step_idx: Zero-based rollout step index.
 
@@ -149,6 +176,7 @@ class AbstractDomain(ABC):
 
         Default behavior preserves the current domain state unchanged.
         """
+        _ = action
         _ = future_z
         _ = step_idx
         return current_domain_state
