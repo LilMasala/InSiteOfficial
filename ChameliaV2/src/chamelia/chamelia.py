@@ -302,6 +302,161 @@ class Chamelia(nn.Module):
         """
         return hjepa_outputs["target_features"][:, 0, :]
 
+    def _encode_phase(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        input_kind: str = "auto",
+    ) -> dict[str, Any]:
+        """Run the shared encoder phase used by forward and the bridge runtime."""
+        hjepa_out = forward_hjepa(self.hjepa, tokens, mask, input_kind=input_kind)
+        return {
+            "hjepa_out": hjepa_out,
+            "z": self._get_scene_summary(hjepa_out),
+            "level_feats": self._extract_level_features(hjepa_out),
+        }
+
+    def _retrieve_phase(
+        self,
+        z: torch.Tensor,
+        *,
+        query_posture: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Run the shared retrieval phase used by forward and the bridge runtime."""
+        retrieved_keys, episodes = self.memory.retrieve(z)
+        bundle = self._rerank_retrieved_memory(
+            query_key=z,
+            episodes=episodes,
+            retrieved_keys=retrieved_keys,
+            query_posture=query_posture,
+        )
+        return {
+            "retrieved_keys": retrieved_keys,
+            "episodes": episodes,
+            "bundle": bundle,
+            "trace_round": {
+                "query_key": z,
+                "query_posture": query_posture,
+                "retrieved_keys": retrieved_keys,
+                "bundle": bundle,
+            },
+        }
+
+    def _configure_phase(
+        self,
+        *,
+        level_feats: list[torch.Tensor],
+        retrieval_bundle: dict[str, torch.Tensor | None],
+        thought_tokens: torch.Tensor | None = None,
+        semantic_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the shared configuration phase used by forward and the bridge runtime."""
+        episode_summaries = retrieval_bundle["episode_summaries"]
+        episode_scores = retrieval_bundle["episode_scores"]
+        return self.configurator(
+            hjepa_outputs={"target_features_per_level": level_feats},
+            memory_tokens=(
+                episode_summaries if episode_summaries is not None else None
+            ),
+            memory_scores=episode_scores if episode_scores is not None else None,
+            thought_tokens=thought_tokens,
+            semantic_tokens=semantic_tokens,
+        )
+
+    def _propose_phase(
+        self,
+        *,
+        z: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        domain_state: dict[str, Any],
+        actor_mode: str,
+        retrieved_postures: torch.Tensor | None = None,
+        retrieved_posture_scores: torch.Tensor | None = None,
+        thought_tokens: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run the shared proposal phase for flat-planner candidate generation."""
+        simple_baseline_path = (
+            self.domain.build_simple_baseline_path(
+                domain_state,
+                self.actor.path_length,
+                self.actor.action_dim,
+            )
+            if domain_state
+            else None
+        )
+        if actor_mode == "mode1":
+            candidate_actions = self.actor(z, ctx_tokens, mode="mode1").unsqueeze(1)
+            candidate_paths = candidate_actions.unsqueeze(2)
+            candidate_postures = torch.zeros(
+                z.shape[0],
+                1,
+                self.actor.posture_dim,
+                device=z.device,
+                dtype=z.dtype,
+            )
+            reasoning_states = z.unsqueeze(1)
+        else:
+            proposal = self.actor.propose(
+                z,
+                ctx_tokens,
+                retrieved_postures=retrieved_postures,
+                retrieved_posture_scores=retrieved_posture_scores,
+                simple_baseline_path=simple_baseline_path,
+                thought_tokens=thought_tokens,
+            )
+            candidate_paths = proposal["candidate_paths"]
+            candidate_actions = proposal["candidate_actions"]
+            candidate_postures = proposal["candidate_postures"]
+            reasoning_states = proposal["reasoning_states"]
+        return {
+            "candidate_paths": candidate_paths,
+            "candidate_actions": candidate_actions,
+            "candidate_postures": candidate_postures,
+            "reasoning_states": reasoning_states,
+        }
+
+    def _rollout_phase(
+        self,
+        *,
+        z: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        candidate_paths: torch.Tensor,
+        candidate_postures: torch.Tensor | None,
+        reasoning_states: torch.Tensor | None,
+        horizon: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Run the shared world-model rollout phase."""
+        return self.world_model(
+            z=z,
+            actions=candidate_paths,
+            ctx_tokens=ctx_tokens,
+            candidate_postures=candidate_postures,
+            reasoning_states=reasoning_states,
+            horizon=self.rollout_horizon if horizon is None else horizon,
+        )
+
+    def _critic_phase(
+        self,
+        *,
+        z: torch.Tensor,
+        ctx_tokens: torch.Tensor,
+        domain_state: dict[str, Any],
+        candidate_paths: torch.Tensor,
+        rollout: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Run the shared critic phase used by forward and the bridge runtime."""
+        return self.cost.score_candidates(
+            z=z,
+            actions=candidate_paths,
+            ctx_tokens=ctx_tokens,
+            domain_state=domain_state,
+            future_z=rollout["terminal_latents"],
+            future_trajectory=rollout["trajectory"],
+            uncertainty=rollout.get("uncertainty"),
+            imagined_domain_state_builder=self.domain.build_imagined_domain_state,
+        )
+
     def _rerank_retrieved_memory(
         self,
         query_key: torch.Tensor,
@@ -915,24 +1070,14 @@ class Chamelia(nn.Module):
                 - z: [B, D]
                 - hjepa_out: raw HJEPA output dict
         """
-        hjepa_out = forward_hjepa(self.hjepa, tokens, mask, input_kind=input_kind)
-        z = self._get_scene_summary(hjepa_out)
-        level_feats = self._extract_level_features(hjepa_out)
+        encoded = self._encode_phase(tokens, mask, input_kind=input_kind)
+        hjepa_out = encoded["hjepa_out"]
+        z = encoded["z"]
+        level_feats = encoded["level_feats"]
 
-        retrieved_keys, episodes = self.memory.retrieve(z)
-        retrieval_bundle = self._rerank_retrieved_memory(
-            query_key=z,
-            episodes=episodes,
-            retrieved_keys=retrieved_keys,
-        )
-        retrieval_trace_rounds: list[dict[str, Any]] = [
-            {
-                "query_key": z,
-                "query_posture": None,
-                "retrieved_keys": retrieved_keys,
-                "bundle": retrieval_bundle,
-            }
-        ]
+        retrieval = self._retrieve_phase(z)
+        retrieval_bundle = retrieval["bundle"]
+        retrieval_trace_rounds: list[dict[str, Any]] = [retrieval["trace_round"]]
         retrieved_episode_summaries = retrieval_bundle["episode_summaries"]
         retrieved_episode_scores = retrieval_bundle["episode_scores"]
         retrieved_postures = retrieval_bundle["postures"]
@@ -944,18 +1089,9 @@ class Chamelia(nn.Module):
         retrieval_relevance_features = retrieval_bundle["relevance_features"]
         semantic_tokens = self._retrieve_semantic_tokens(z)
 
-        ctx_tokens = self.configurator(
-            hjepa_outputs={"target_features_per_level": level_feats},
-            memory_tokens=(
-                retrieved_episode_summaries.to(z.device)
-                if retrieved_episode_summaries is not None
-                else None
-            ),
-            memory_scores=(
-                retrieved_episode_scores.to(z.device)
-                if retrieved_episode_scores is not None
-                else None
-            ),
+        ctx_tokens = self._configure_phase(
+            level_feats=level_feats,
+            retrieval_bundle=retrieval_bundle,
             semantic_tokens=semantic_tokens,
         )
         planner_cluster_ids: list[int | None] = [None] * z.shape[0]
@@ -1134,36 +1270,24 @@ class Chamelia(nn.Module):
             if len(planner_results) == 1:
                 thinker_output = planner_results[0]["thinker_output"]
         elif actor_mode == "mode1":
-            candidate_actions = self.actor(z, ctx_tokens, mode="mode1").unsqueeze(1)
-            candidate_paths = candidate_actions.unsqueeze(2)
-            candidate_postures = torch.zeros(
-                z.shape[0],
-                1,
-                self.actor.posture_dim,
-                device=z.device,
-                dtype=z.dtype,
+            proposal = self._propose_phase(
+                z=z,
+                ctx_tokens=ctx_tokens,
+                domain_state=domain_state,
+                actor_mode="mode1",
             )
-            reasoning_states = z.unsqueeze(1)
+            candidate_paths = proposal["candidate_paths"]
+            candidate_actions = proposal["candidate_actions"]
+            candidate_postures = proposal["candidate_postures"]
+            reasoning_states = proposal["reasoning_states"]
         else:
-            proposal = self.actor.propose(
-                z,
-                ctx_tokens,
-                retrieved_postures=(
-                    retrieved_postures.to(z.device)
-                    if retrieved_postures is not None
-                    else None
-                ),
-                retrieved_posture_scores=(
-                    retrieved_posture_scores.to(z.device)
-                    if retrieved_posture_scores is not None
-                    else None
-                ),
-                simple_baseline_path=self.domain.build_simple_baseline_path(
-                    domain_state,
-                    self.actor.path_length,
-                    self.actor.action_dim,
-                ),
-                thought_tokens=None,
+            proposal = self._propose_phase(
+                z=z,
+                ctx_tokens=ctx_tokens,
+                domain_state=domain_state,
+                actor_mode="mode2",
+                retrieved_postures=retrieved_postures,
+                retrieved_posture_scores=retrieved_posture_scores,
             )
             candidate_paths = proposal["candidate_paths"]
             candidate_actions = proposal["candidate_actions"]
@@ -1177,18 +1301,12 @@ class Chamelia(nn.Module):
             candidate_costs = None
             for round_idx in range(max(1, self.reasoning_steps if actor_mode == "mode2" else 1)):
                 if round_idx > 0:
-                    ctx_tokens = self.configurator(
-                        hjepa_outputs={"target_features_per_level": level_feats},
-                        memory_tokens=(
-                            retrieved_episode_summaries.to(z.device)
-                            if retrieved_episode_summaries is not None
-                            else None
-                        ),
-                        memory_scores=(
-                            retrieved_episode_scores.to(z.device)
-                            if retrieved_episode_scores is not None
-                            else None
-                        ),
+                    ctx_tokens = self._configure_phase(
+                        level_feats=level_feats,
+                        retrieval_bundle={
+                            "episode_summaries": retrieved_episode_summaries,
+                            "episode_scores": retrieved_episode_scores,
+                        },
                         thought_tokens=(
                             thought_trace.as_tensor().unsqueeze(0).expand(z.shape[0], -1, -1)
                             if thought_trace.as_tensor() is not None
@@ -1196,23 +1314,19 @@ class Chamelia(nn.Module):
                         ),
                         semantic_tokens=semantic_tokens,
                     )
-                rollout = self.world_model(
+                rollout = self._rollout_phase(
                     z=z,
-                    actions=candidate_paths,
                     ctx_tokens=ctx_tokens,
+                    candidate_paths=candidate_paths,
                     candidate_postures=candidate_postures,
                     reasoning_states=reasoning_states,
-                    horizon=self.rollout_horizon,
                 )
-                candidate_costs = self.cost.score_candidates(
+                candidate_costs = self._critic_phase(
                     z=z,
-                    actions=candidate_paths,
                     ctx_tokens=ctx_tokens,
                     domain_state=domain_state,
-                    future_z=rollout["terminal_latents"],
-                    future_trajectory=rollout["trajectory"],
-                    uncertainty=rollout.get("uncertainty"),
-                    imagined_domain_state_builder=self.domain.build_imagined_domain_state,
+                    candidate_paths=candidate_paths,
+                    rollout=rollout,
                 )
                 current_thought_token = self.actor.thought_head(
                     reasoning_states.mean(dim=1) + z
@@ -1242,24 +1356,13 @@ class Chamelia(nn.Module):
                     and float(reflect_cost - torch.sigmoid(reflect_logits).mean().item()) < best_action_cost
                 ):
                     thought_trace = thought_trace.append(current_thought_token)
-                    proposal = self.actor.propose(
-                        z,
-                        ctx_tokens,
-                        retrieved_postures=(
-                            retrieved_postures.to(z.device)
-                            if retrieved_postures is not None
-                            else None
-                        ),
-                        retrieved_posture_scores=(
-                            retrieved_posture_scores.to(z.device)
-                            if retrieved_posture_scores is not None
-                            else None
-                        ),
-                        simple_baseline_path=self.domain.build_simple_baseline_path(
-                            domain_state,
-                            self.actor.path_length,
-                            self.actor.action_dim,
-                        ),
+                    proposal = self._propose_phase(
+                        z=z,
+                        ctx_tokens=ctx_tokens,
+                        domain_state=domain_state,
+                        actor_mode="mode2",
+                        retrieved_postures=retrieved_postures,
+                        retrieved_posture_scores=retrieved_posture_scores,
                         thought_tokens=thought_trace.as_tensor().unsqueeze(0).expand(z.shape[0], -1, -1),
                     )
                     candidate_paths = proposal["candidate_paths"]
@@ -1284,23 +1387,12 @@ class Chamelia(nn.Module):
                     posture_query = (
                         candidate_postures[:, 1:, :].detach() * posture_weights.unsqueeze(-1)
                     ).sum(dim=1)
-                    refreshed_keys, refreshed_episodes = self.memory.retrieve(
+                    refreshed = self._retrieve_phase(
                         z,
-                    )
-                    refreshed_bundle = self._rerank_retrieved_memory(
-                        query_key=z,
-                        episodes=refreshed_episodes,
-                        retrieved_keys=refreshed_keys,
                         query_posture=posture_query,
                     )
-                    retrieval_trace_rounds.append(
-                        {
-                            "query_key": z,
-                            "query_posture": posture_query,
-                            "retrieved_keys": refreshed_keys,
-                            "bundle": refreshed_bundle,
-                        }
-                    )
+                    refreshed_bundle = refreshed["bundle"]
+                    retrieval_trace_rounds.append(refreshed["trace_round"])
                     next_retrieved_episode_summaries = refreshed_bundle["episode_summaries"]
                     next_retrieved_episode_scores = refreshed_bundle["episode_scores"]
                     next_retrieved_postures = refreshed_bundle["postures"]

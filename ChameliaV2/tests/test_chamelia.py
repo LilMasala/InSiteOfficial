@@ -367,6 +367,128 @@ def test_chamelia_pipeline_shapes() -> None:
     assert critic_loss.dim() == 0
 
 
+def test_chamelia_forward_matches_shared_phase_pipeline() -> None:
+    """The in-process forward path should compose the same six phases as the bridge runtime."""
+    torch.manual_seed(0)
+
+    embed_dim = 64
+    num_ctx_tokens = 4
+    action_dim = 8
+
+    domain = DummyDomain(embed_dim=embed_dim, action_dim=action_dim)
+    DomainRegistry.register(domain)
+    cost_fns, weights = zip(*domain.get_intrinsic_cost_fns(), strict=False)
+
+    model = Chamelia(
+        hjepa=DummyHJEPA(embed_dim=embed_dim),
+        configurator=Configurator(
+            embed_dim=embed_dim,
+            num_ctx_tokens=num_ctx_tokens,
+            num_heads=4,
+            num_layers=2,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            memory_read_k=4,
+        ),
+        actor=Actor(
+            embed_dim=embed_dim,
+            action_dim=action_dim,
+            num_heads=4,
+            num_layers=2,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            num_ctx_tokens=num_ctx_tokens,
+        ),
+        cost=CostModule(
+            intrinsic_cost=IntrinsicCost(list(cost_fns), list(weights)),
+            trainable_critic=TrainableCritic(
+                embed_dim=embed_dim,
+                num_heads=4,
+                num_layers=2,
+                mlp_ratio=2.0,
+                dropout=0.0,
+                num_ctx_tokens=num_ctx_tokens,
+                horizon=5,
+            ),
+        ),
+        memory=LatentMemory(
+            embed_dim=embed_dim,
+            max_episodes=32,
+            retrieval_k=4,
+            device="cpu",
+        ),
+        domain=domain,
+        embed_dim=embed_dim,
+        action_dim=action_dim,
+        num_ctx_tokens=num_ctx_tokens,
+        rollout_horizon=2,
+        reasoning_steps=1,
+    )
+    model.eval()
+
+    tokens = torch.randn(2, 16, embed_dim)
+    mask = torch.zeros(2, 16)
+    observation = torch.randint(0, 8, (2, 16))
+    domain_state = domain.get_domain_state(observation)
+
+    forward_out = model(
+        tokens,
+        mask,
+        domain_state,
+        actor_mode="mode2",
+        store_to_memory=False,
+        input_kind="embedded_tokens",
+        advance_step=False,
+    )
+
+    encoded = model._encode_phase(tokens, mask, input_kind="embedded_tokens")
+    retrieval = model._retrieve_phase(encoded["z"])
+    bundle = retrieval["bundle"]
+    ctx_tokens = model._configure_phase(
+        level_feats=encoded["level_feats"],
+        retrieval_bundle=bundle,
+        semantic_tokens=model._retrieve_semantic_tokens(encoded["z"]),
+    )
+    proposal = model._propose_phase(
+        z=encoded["z"],
+        ctx_tokens=ctx_tokens,
+        domain_state=domain_state,
+        actor_mode="mode2",
+        retrieved_postures=bundle["postures"],
+        retrieved_posture_scores=bundle["posture_scores"],
+    )
+    rollout = model._rollout_phase(
+        z=encoded["z"],
+        ctx_tokens=ctx_tokens,
+        candidate_paths=proposal["candidate_paths"],
+        candidate_postures=proposal["candidate_postures"],
+        reasoning_states=proposal["reasoning_states"],
+    )
+    candidate_costs = model._critic_phase(
+        z=encoded["z"],
+        ctx_tokens=ctx_tokens,
+        domain_state=domain_state,
+        candidate_paths=proposal["candidate_paths"],
+        rollout=rollout,
+    )
+    selected_idx = candidate_costs["total"].argmin(dim=1)
+    selected_actions = proposal["candidate_actions"].gather(
+        1,
+        selected_idx.view(-1, 1, 1).expand(-1, 1, proposal["candidate_actions"].shape[-1]),
+    ).squeeze(1)
+
+    assert torch.allclose(encoded["z"], forward_out["z"])
+    assert torch.allclose(ctx_tokens, forward_out["ctx_tokens"])
+    assert torch.allclose(proposal["candidate_paths"], forward_out["candidate_paths"])
+    assert torch.allclose(candidate_costs["total"], forward_out["candidate_costs"]["total"])
+    assert torch.equal(selected_idx, forward_out["selected_candidate_idx"])
+    assert torch.allclose(selected_actions, forward_out["action_vec"])
+    assert torch.allclose(
+        candidate_costs["total"].gather(1, selected_idx.unsqueeze(1)).squeeze(1),
+        forward_out["cost"]["total"],
+    )
+
+
 def test_trainable_critic_supports_signed_future_costs() -> None:
     """TC should represent signed cost-to-go, including good futures with negative cost."""
     torch.manual_seed(0)

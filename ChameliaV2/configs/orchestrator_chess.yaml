@@ -1,0 +1,87 @@
+seed: 42
+device: cuda
+run_dir: checkpoints/orchestrator_chess
+num_ctx_tokens: 16
+rollout_horizon: 4
+reasoning_steps: 2
+replay_capacity: 20000
+
+family_backbones:
+  board_token_hjepa:
+    encoder_type: vit_tiny_patch16_224
+    embed_dim: 192
+    predictor_depth: 3
+    predictor_num_heads: 3
+    predictor_mlp_ratio: 2.0
+    num_hierarchies: 3
+    sequence_mode: true
+    use_vq: true
+    vq_codebook_size: 256
+
+memory:
+  max_episodes: 10000
+  retrieval_k: 8
+  device: cpu
+  use_iob: true
+  iob_dim: 128
+  iob_widths: [32, 64, 128]
+  retrieval_train_interval: 8
+
+procedural:
+  use_faiss: false
+  use_lancedb: true
+  use_csr: true
+  csr_dim: 512
+  csr_active_dims: 48
+  use_isotropic_storage: true
+  num_tokens: 16
+  codebook_size: 128
+  lora_rank: 8
+
+sleep:
+  interval_steps: 32
+
+logging:
+  representation_loss: combined
+  num_candidates: 6
+  path_length: 4
+
+domains:
+  - name: chess
+    family: board_token_hjepa
+    adapter_kwargs:
+      opponent_level: 1
+      opponent_max_branching: 12
+      chess_data_root: data/curriculum/stage3/chess/lichess
+      move_vocabulary_source: alphazero_4672
+      self_play_unlock_threshold: 0.90
+    bootstrap_random_episodes: 16
+    bootstrap_teacher_episodes: 0
+    bootstrap_simple_episodes: 128
+    bootstrap_pretrain_steps: 128
+    bootstrap_replay_warmup_steps: 128
+    bootstrap_batch_size: 8
+    mask_ratio: 0.15
+    max_episode_steps: 80
+    optimizer_interval: 1
+    sleep_interval_episodes: 32
+    checkpoint_interval_episodes: 32
+    evaluation_episodes: 8
+    planner_backend: mcts
+    world_model_backend: mamba
+    baselines: [random, simple]
+    mcts_simulations: 16
+    mcts_depth: 3
+    mcts_rollout_horizon: 4
+    primary_metric: win_rate
+    primary_mode: max
+    phases:
+      core_control:
+        episodes: 64
+        use_memory: true
+        use_sleep: true
+        train_hjepa: true
+        behavior_cloning_weight: 0.20
+        critic_loss_weight: 2.0
+        exploration_epsilon_start: 0.30
+        exploration_epsilon_end: 0.05

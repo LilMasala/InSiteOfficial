@@ -59,6 +59,12 @@ def _coord_to_square(col: int, row: int) -> int:
     return chess.square(col, row)
 
 
+def _coord_to_square_safe(col: int, row: int) -> int | None:
+    if 0 <= col < 8 and 0 <= row < 8:
+        return chess.square(col, row)
+    return None
+
+
 def _mirror_move(move: chess.Move) -> chess.Move:
     return chess.Move(
         chess.square_mirror(move.from_square),
@@ -109,30 +115,40 @@ def _action_from_move(move: chess.Move) -> int:
 
 
 def _action_to_move(board: chess.Board, action: int) -> chess.Move:
+    if int(action) < 0 or int(action) >= CHESS_ACTION_DIM:
+        return chess.Move.null()
     base_board = board if board.turn == chess.WHITE else board.mirror()
     col = int(action) // (8 * _PLANE_STRIDE)
     row = (int(action) // _PLANE_STRIDE) % 8
     plane = int(action) % _PLANE_STRIDE
-    from_square = _coord_to_square(col, row)
+    from_square = _coord_to_square_safe(col, row)
+    if from_square is None:
+        return chess.Move.null()
 
     if plane < _QUEEN_MOVE_PLANES:
         magnitude = plane // len(_QUEEN_DIRECTIONS) + 1
         direction = _QUEEN_DIRECTIONS[plane % len(_QUEEN_DIRECTIONS)]
-        to_square = _coord_to_square(col + (direction[0] * magnitude), row + (direction[1] * magnitude))
+        to_square = _coord_to_square_safe(col + (direction[0] * magnitude), row + (direction[1] * magnitude))
+        if to_square is None:
+            return chess.Move.null()
         move = chess.Move(from_square, to_square)
         piece = base_board.piece_at(from_square)
         if piece is not None and piece.piece_type == chess.PAWN and chess.square_rank(to_square) == 7:
             move.promotion = chess.QUEEN
     elif plane < _UNDERPROMOTION_OFFSET:
         knight_dir = _KNIGHT_DIRECTIONS[plane - _KNIGHT_MOVE_OFFSET]
-        to_square = _coord_to_square(col + knight_dir[0], row + knight_dir[1])
+        to_square = _coord_to_square_safe(col + knight_dir[0], row + knight_dir[1])
+        if to_square is None:
+            return chess.Move.null()
         move = chess.Move(from_square, to_square)
     else:
         under_plane = plane - _UNDERPROMOTION_OFFSET
         direction_index = under_plane // len(_UNDERPROMOTION_PIECES)
         piece_index = under_plane % len(_UNDERPROMOTION_PIECES)
         dx = direction_index - 1
-        to_square = _coord_to_square(col + dx, row + 1)
+        to_square = _coord_to_square_safe(col + dx, row + 1)
+        if to_square is None:
+            return chess.Move.null()
         move = chess.Move(from_square, to_square, promotion=_UNDERPROMOTION_PIECES[piece_index])
 
     return move if board.turn == chess.WHITE else _mirror_move(move)
@@ -262,6 +278,25 @@ def _hanging_value(board: chess.Board, color: chess.Color) -> float:
         if attacked and not defended:
             total += _PIECE_VALUES.get(piece.piece_type, 0.0)
     return total
+
+
+def _normalize_fen_batch(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+        normalized: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                normalized.append(item)
+            elif isinstance(item, Iterable) and not isinstance(item, (bytes, bytearray)):
+                item_list = list(item)
+                if len(item_list) != 1:
+                    raise ValueError("Nested chess FEN batches must contain exactly one FEN per entry.")
+                normalized.append(str(item_list[0]))
+            else:
+                normalized.append(str(item))
+        return normalized
+    raise ValueError("Chess FEN payload must be a string or iterable of strings.")
 
 
 class ChessDomain(InteractiveDomainAdapter):
@@ -569,8 +604,9 @@ class ChessDomain(InteractiveDomainAdapter):
         step_idx: int,
     ) -> dict[str, Any]:
         _ = future_z
-        batch_size = len(current_domain_state["fen"])
-        boards = [chess.Board(fen) for fen in current_domain_state["fen"]]
+        fens = _normalize_fen_batch(current_domain_state["fen"])
+        batch_size = len(fens)
+        boards = [chess.Board(fen) for fen in fens]
         history_tensor = current_domain_state["history_block"]
         history_blocks = [history_tensor[idx].detach().cpu().clone() for idx in range(batch_size)]
         rollout = self._empty_rollout_features(batch_size)
@@ -620,9 +656,10 @@ class ChessDomain(InteractiveDomainAdapter):
     ) -> torch.Tensor | None:
         if action_dim != CHESS_ACTION_DIM:
             return None
-        batch_size = len(domain_state["fen"])
+        fens = _normalize_fen_batch(domain_state["fen"])
+        batch_size = len(fens)
         logits = torch.full((batch_size, path_length, action_dim), -8.0, dtype=torch.float32)
-        for batch_idx, fen in enumerate(domain_state["fen"]):
+        for batch_idx, fen in enumerate(fens):
             board = chess.Board(fen)
             history_block = domain_state["history_block"][batch_idx].detach().cpu().clone()
             for step_idx in range(path_length):

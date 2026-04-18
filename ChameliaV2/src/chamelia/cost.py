@@ -145,9 +145,15 @@ class IntrinsicCost(nn.Module):
         Returns:
             Intrinsic cost tensor of shape [B].
         """
+        target_device = z.device
+        target_dtype = z.dtype
         costs = []
         for fn, weight in zip(self.cost_fns, self.weights):
             c = fn(z, action, domain_state)
+            if not torch.is_tensor(c):
+                c = torch.as_tensor(c, device=target_device, dtype=target_dtype)
+            else:
+                c = c.to(device=target_device, dtype=target_dtype)
             costs.append(weight * c)
         return torch.stack(costs, dim=0).sum(dim=0)
 

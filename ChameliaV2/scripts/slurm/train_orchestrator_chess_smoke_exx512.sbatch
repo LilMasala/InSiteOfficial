@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=chamelia-orchestrator-mwgpu256
-#SBATCH --partition=mwgpu256
+#SBATCH --job-name=chamelia-chess-smoke
+#SBATCH --partition=exx512
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=logs/slurm/%x-%j.out
 #SBATCH --error=logs/slurm/%x-%j.err
 
@@ -62,8 +62,8 @@ if [[ -n "${CONDA_PREFIX:-}" ]]; then
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
-RUN_TAG="${RUN_TAG:-orchestrator-mwgpu256-$(date +%Y%m%dT%H%M%S)}"
-ORCHESTRATOR_CONFIG="${ORCHESTRATOR_CONFIG:-${ROOT_DIR}/configs/orchestrator_foundation.yaml}"
+RUN_TAG="${RUN_TAG:-chess-smoke-$(date +%Y%m%dT%H%M%S)}"
+ORCHESTRATOR_CONFIG="${ORCHESTRATOR_CONFIG:-${ROOT_DIR}/configs/orchestrator_chess_smoke.yaml}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${ROOT_DIR}/checkpoints/${RUN_TAG}}"
 DEFAULT_SCRATCH_BASE="/sanscratch/${USER}/chamelia"
 if [[ ! -d "/sanscratch" ]]; then
@@ -72,11 +72,10 @@ fi
 SCRATCH_DIR="${SCRATCH_DIR:-${DEFAULT_SCRATCH_BASE}/${RUN_TAG}}"
 DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-42}"
-DOMAINS="${DOMAINS:-cartpole,connect4}"
 
 mkdir -p "${SCRATCH_DIR}"
 
-echo "Starting mwgpu256 orchestrator run"
+echo "Starting chess smoke orchestrator run"
 echo "  root:           ${ROOT_DIR}"
 echo "  python:         ${PYTHON_BIN}"
 echo "  config:         ${ORCHESTRATOR_CONFIG}"
@@ -85,7 +84,6 @@ echo "  device:         ${DEVICE}"
 echo "  seed:           ${SEED}"
 echo "  scratch dir:    ${SCRATCH_DIR}"
 echo "  checkpoint dir: ${CHECKPOINT_DIR}"
-echo "  domains:        ${DOMAINS:-<config default>}"
 echo "  node:           $(hostname)"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -98,14 +96,8 @@ TRAIN_CMD=(
   --device "${DEVICE}"
   --run-dir "${SCRATCH_DIR}"
   --seed "${SEED}"
+  --domain chess
 )
-
-if [[ -n "${DOMAINS}" ]]; then
-  IFS=',' read -r -a DOMAIN_LIST <<< "${DOMAINS}"
-  for DOMAIN in "${DOMAIN_LIST[@]}"; do
-    TRAIN_CMD+=(--domain "${DOMAIN}")
-  done
-fi
 
 printf '  train cmd:      '
 printf '%q ' "${TRAIN_CMD[@]}"

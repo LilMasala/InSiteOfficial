@@ -1,0 +1,86 @@
+seed: 42
+device: cuda
+run_dir: checkpoints/orchestrator_chess_smoke
+num_ctx_tokens: 8
+rollout_horizon: 2
+reasoning_steps: 1
+replay_capacity: 4096
+
+family_backbones:
+  board_token_hjepa:
+    encoder_type: vit_tiny_patch16_224
+    embed_dim: 192
+    predictor_depth: 2
+    predictor_num_heads: 3
+    predictor_mlp_ratio: 2.0
+    num_hierarchies: 2
+    sequence_mode: true
+    use_vq: false
+
+memory:
+  max_episodes: 2048
+  retrieval_k: 4
+  device: cpu
+  use_iob: true
+  iob_dim: 96
+  iob_widths: [24, 48, 96]
+  retrieval_train_interval: 4
+
+procedural:
+  use_faiss: false
+  use_lancedb: true
+  use_csr: true
+  csr_dim: 256
+  csr_active_dims: 32
+  use_isotropic_storage: true
+  num_tokens: 8
+  codebook_size: 64
+  lora_rank: 8
+
+sleep:
+  interval_steps: 8
+
+logging:
+  representation_loss: hjepa
+  num_candidates: 4
+  path_length: 2
+
+domains:
+  - name: chess
+    family: board_token_hjepa
+    adapter_kwargs:
+      opponent_level: 0
+      opponent_max_branching: 8
+      chess_data_root: data/curriculum/stage3/chess/lichess
+      move_vocabulary_source: alphazero_4672
+      self_play_unlock_threshold: 0.90
+    bootstrap_random_episodes: 4
+    bootstrap_teacher_episodes: 0
+    bootstrap_simple_episodes: 16
+    bootstrap_pretrain_steps: 16
+    bootstrap_replay_warmup_steps: 16
+    bootstrap_batch_size: 4
+    mask_ratio: 0.15
+    max_episode_steps: 48
+    optimizer_interval: 1
+    sleep_interval_episodes: 8
+    checkpoint_interval_episodes: 8
+    evaluation_episodes: 4
+    planner_backend: mcts
+    world_model_backend: mamba
+    baselines: [random, simple]
+    mcts_simulations: 8
+    mcts_depth: 2
+    mcts_rollout_horizon: 2
+    primary_metric: win_rate
+    primary_mode: max
+    phases:
+      core_control:
+        episodes: 12
+        use_memory: true
+        use_sleep: false
+        train_hjepa: false
+        behavior_cloning_weight: 0.20
+        critic_loss_weight: 1.5
+        exploration_epsilon_start: 0.25
+        exploration_epsilon_end: 0.05

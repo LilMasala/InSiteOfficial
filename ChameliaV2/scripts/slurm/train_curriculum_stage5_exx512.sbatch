@@ -24,6 +24,11 @@ if [[ -n "${CUDA_MODULE:-}" ]] && command -v module >/dev/null 2>&1; then
   module load "$CUDA_MODULE"
 fi
 
+if [[ -f "${HOME}/.profile" ]]; then
+  # shellcheck disable=SC1090
+  source "${HOME}/.profile"
+fi
+
 if [[ -f "${HOME}/.bashrc" ]]; then
   # shellcheck disable=SC1090
   source "${HOME}/.bashrc"
@@ -52,6 +57,9 @@ export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 
 RUN_TAG="${RUN_TAG:-stage5-$(date +%Y%m%dT%H%M%S)}"
 MODEL_VERSION="${MODEL_VERSION:-${RUN_TAG}}"

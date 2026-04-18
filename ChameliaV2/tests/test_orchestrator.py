@@ -123,6 +123,37 @@ def test_chess_domain_invalid_move_is_terminal_loss() -> None:
     assert next_info["winner"] == 2
 
 
+def test_chess_action_decoder_returns_null_for_offboard_action() -> None:
+    assert _action_to_move(chess.Board(), 0) == chess.Move.null()
+
+
+def test_chess_domain_handles_nested_fen_batches_for_replay_paths() -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0)
+    observation, info = domain.reset(seed=0)
+    state = domain.build_domain_state(observation, info)
+    replay_like_state = {
+        **state,
+        "fen": [[state["fen"][0]]],
+        "history_block": state["history_block"][:1],
+    }
+
+    baseline = domain.build_simple_baseline_path(
+        replay_like_state,
+        path_length=2,
+        action_dim=domain.get_action_dim(),
+    )
+    imagined = domain.build_imagined_domain_state(
+        replay_like_state,
+        torch.zeros(1, domain.get_action_dim()),
+        torch.zeros(1, 16),
+        0,
+    )
+
+    assert baseline is not None
+    assert baseline.shape == (1, 2, domain.get_action_dim())
+    assert imagined["board_observation"].shape == (1, 8, 8, 111)
+
+
 def test_chess_domain_exact_step_and_imagined_rollout_update_board() -> None:
     domain = ChessDomain(embed_dim=16, opponent_level=0)
     observation, info = domain.reset(seed=0)

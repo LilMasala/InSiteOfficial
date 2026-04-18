@@ -14,7 +14,6 @@ from src.chamelia.actor import Actor
 from src.chamelia.chamelia import Chamelia
 from src.chamelia.configurator import Configurator
 from src.chamelia.cost import CostModule, IntrinsicCost, TrainableCritic
-from src.chamelia.hjepa_adapter import forward_hjepa
 from src.chamelia.memory import LatentMemory
 from src.chamelia.memory import EpisodeRecord, RetrievalTraceStep
 from src.chamelia.plugins import ChessDomain, DomainRegistry, InSiteBridgeDomain, ProteinDTIDomain
@@ -502,9 +501,9 @@ def encode_session(
         hjepa_input_kind = input_kind
 
     with torch.no_grad():
-        hjepa_out = forward_hjepa(model.hjepa, tokens_tensor, mask_tensor, input_kind=hjepa_input_kind)
-        z = model._get_scene_summary(hjepa_out)
-        level_feats = model._extract_level_features(hjepa_out)
+        encoded = model._encode_phase(tokens_tensor, mask_tensor, input_kind=hjepa_input_kind)
+        z = encoded["z"]
+        level_feats = encoded["level_feats"]
 
     return {
         "bridge_version": "v1",
@@ -536,13 +535,9 @@ def retrieve_session(
     posture = _maybe_float_tensor(query_posture, device, min_dim=2)
 
     with torch.no_grad():
-        retrieved_keys, episodes = model.memory.retrieve(z)
-        bundle = model._rerank_retrieved_memory(
-            query_key=z,
-            episodes=episodes,
-            retrieved_keys=retrieved_keys,
-            query_posture=posture,
-        )
+        retrieval = model._retrieve_phase(z, query_posture=posture)
+        retrieved_keys = retrieval["retrieved_keys"]
+        bundle = retrieval["bundle"]
 
     return {
         "bridge_version": "v1",
@@ -713,10 +708,12 @@ def configure_session(
     memory_scores = _maybe_float_tensor(retrieved_memory.get("retrieved_episode_scores"), device, min_dim=2)
 
     with torch.no_grad():
-        ctx_tokens = model.configurator(
-            hjepa_outputs={"target_features_per_level": [level0, level1, level2]},
-            memory_tokens=memory_tokens,
-            memory_scores=memory_scores,
+        ctx_tokens = model._configure_phase(
+            level_feats=[level0, level1, level2],
+            retrieval_bundle={
+                "episode_summaries": memory_tokens,
+                "episode_scores": memory_scores,
+            },
         )
 
     return {
@@ -755,9 +752,11 @@ def propose_session(
         )
 
     with torch.no_grad():
-        proposal = model.actor.propose(
+        proposal = model._propose_phase(
             z=z,
             ctx_tokens=ctx_tokens,
+            domain_state={},
+            actor_mode="mode2",
             retrieved_postures=(
                 retrieved_postures if mode_profile.use_retrieved_postures else None
             ),
@@ -814,10 +813,10 @@ def rollout_session(
     )
 
     with torch.no_grad():
-        rollout = model.world_model(
+        rollout = model._rollout_phase(
             z=z,
-            actions=candidate_paths,
             ctx_tokens=ctx_tokens,
+            candidate_paths=candidate_paths,
             candidate_postures=candidate_postures,
             reasoning_states=reasoning_states,
             horizon=rollout_horizon,
@@ -860,13 +859,15 @@ def critic_session(
     }
 
     with torch.no_grad():
-        scores = model.cost.score_candidates(
+        scores = model._critic_phase(
             z=z,
-            actions=candidate_paths,
             ctx_tokens=ctx_tokens,
             domain_state=domain_state_tensorized,
-            future_z=terminal_latents,
-            future_trajectory=trajectory,
+            candidate_paths=candidate_paths,
+            rollout={
+                "terminal_latents": terminal_latents,
+                "trajectory": trajectory,
+            },
         )
 
     return {
