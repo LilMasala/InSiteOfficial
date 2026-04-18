@@ -64,9 +64,9 @@ domains:
     mask_ratio: 0.15
     max_episode_steps: 80
     optimizer_interval: 1
-    sleep_interval_episodes: 32
-    checkpoint_interval_episodes: 32
-    evaluation_episodes: 8
+    sleep_interval_episodes: 64
+    checkpoint_interval_episodes: 64
+    evaluation_episodes: 16
     planner_backend: mcts
     world_model_backend: mamba
     baselines: [random, simple]
@@ -77,11 +77,29 @@ domains:
     primary_mode: max
     phases:
       core_control:
-        episodes: 64
-        use_memory: true
-        use_sleep: true
-        train_hjepa: true
+        episodes: 256
+        use_memory: false
+        use_sleep: false
+        train_hjepa: false
         behavior_cloning_weight: 0.20
         critic_loss_weight: 2.0
         exploration_epsilon_start: 0.30
         exploration_epsilon_end: 0.05
+      episodic_memory:
+        episodes: 256
+        use_memory: true
+        use_sleep: false
+        train_hjepa: false
+        behavior_cloning_weight: 0.15
+        critic_loss_weight: 2.0
+        exploration_epsilon_start: 0.20
+        exploration_epsilon_end: 0.03
+      sleep:
+        episodes: 512
+        use_memory: true
+        use_sleep: true
+        train_hjepa: false
+        behavior_cloning_weight: 0.10
+        critic_loss_weight: 2.0
+        exploration_epsilon_start: 0.12
+        exploration_epsilon_end: 0.02
