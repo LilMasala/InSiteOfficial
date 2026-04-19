@@ -474,6 +474,15 @@ class DomainRunConfig:
     bootstrap_random_episodes: int = 16
     bootstrap_teacher_episodes: int = 0
     bootstrap_simple_episodes: int = 8
+    bootstrap_curriculum_samples: int = 0
+    bootstrap_curriculum_buckets: tuple[str, ...] = (
+        "openings",
+        "puzzles",
+        "endgames",
+        "middlegames",
+        "short_games",
+        "full_games",
+    )
     bootstrap_pretrain_steps: int = 64
     bootstrap_replay_warmup_steps: int = 64
     bootstrap_batch_size: int = 16
@@ -545,6 +554,21 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 bootstrap_random_episodes=int(entry.get("bootstrap_random_episodes", 16)),
                 bootstrap_teacher_episodes=int(entry.get("bootstrap_teacher_episodes", 0)),
                 bootstrap_simple_episodes=int(entry.get("bootstrap_simple_episodes", 8)),
+                bootstrap_curriculum_samples=int(entry.get("bootstrap_curriculum_samples", 0)),
+                bootstrap_curriculum_buckets=tuple(
+                    str(item)
+                    for item in entry.get(
+                        "bootstrap_curriculum_buckets",
+                        (
+                            "openings",
+                            "puzzles",
+                            "endgames",
+                            "middlegames",
+                            "short_games",
+                            "full_games",
+                        ),
+                    )
+                ),
                 bootstrap_pretrain_steps=int(entry.get("bootstrap_pretrain_steps", 64)),
                 bootstrap_replay_warmup_steps=int(entry.get("bootstrap_replay_warmup_steps", 64)),
                 bootstrap_batch_size=int(entry.get("bootstrap_batch_size", 16)),
@@ -1267,12 +1291,116 @@ class UnifiedTrainingOrchestrator:
             return None
         return target / target.sum()
 
+    def _collect_chess_curriculum_bootstrap(
+        self,
+        adapter: InteractiveDomainAdapter,
+        domain_cfg: DomainRunConfig,
+    ) -> list[BootstrapTransition]:
+        """Turn normalized chess curriculum rows into one-ply supervised bootstrap transitions."""
+        sample_count = int(domain_cfg.bootstrap_curriculum_samples)
+        if sample_count <= 0 or not isinstance(adapter, ChessDomain):
+            return []
+        data_root = getattr(adapter, "chess_data_root", None)
+        if not data_root:
+            return []
+
+        import chess
+
+        from src.chamelia.plugins.chess import (
+            _HISTORY_PLANES,
+            _action_from_move,
+            _hanging_value,
+            _material_value,
+            _mirror_move,
+            _observation_from_board,
+        )
+        from training.curriculum.data.chess_curriculum import load_normalized_chess_records
+
+        buckets = tuple(domain_cfg.bootstrap_curriculum_buckets)
+        per_bucket = max(1, (sample_count + max(1, len(buckets)) - 1) // max(1, len(buckets)))
+        grouped = load_normalized_chess_records(data_root, max_samples_per_bucket=per_bucket)
+        transitions: list[BootstrapTransition] = []
+        episode_id = 100_000
+        for bucket in buckets:
+            for record in grouped.get(bucket, {}).get("train", []):
+                if len(transitions) >= sample_count:
+                    return transitions
+                board = chess.Board(record.fen)
+                history_block = torch.zeros(8, 8, _HISTORY_PLANES, dtype=torch.float32)
+                observation_tensor, history_block = _observation_from_board(board, history_block)
+                try:
+                    move = chess.Move.from_uci(record.best_move)
+                except ValueError:
+                    continue
+                if move not in board.legal_moves:
+                    continue
+                material_before = _material_value(board, chess.WHITE)
+                action_id = int(_action_from_move(move if board.turn == chess.WHITE else _mirror_move(move)))
+                current_observation = {
+                    "observation": observation_tensor,
+                    "fen": board.fen(),
+                    "history_block": history_block.clone(),
+                    "moves": tuple(record.context_moves),
+                    "turn": "white" if board.turn == chess.WHITE else "black",
+                }
+                current_info = {
+                    "winner": 0,
+                    "result": "*",
+                    "invalid_action": False,
+                    "draw": False,
+                    "phase": record.phase,
+                    "source": record.source,
+                    "bucket": record.bucket,
+                    "best_move": record.best_move,
+                    "motif_tags": tuple(record.motif_tags),
+                    "opening_tags": tuple(record.opening_tags),
+                }
+                board.push(move)
+                next_observation_tensor, next_history_block = _observation_from_board(board, history_block)
+                result = board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "*"
+                winner = 1 if result == "1-0" else (2 if result == "0-1" else 0)
+                next_info = {
+                    **current_info,
+                    "winner": winner,
+                    "result": result,
+                    "draw": result == "1/2-1/2",
+                    "material_delta": _material_value(board, chess.WHITE) - material_before,
+                    "hanging_value": _hanging_value(board, chess.WHITE),
+                    "fen": board.fen(),
+                }
+                next_observation = {
+                    "observation": next_observation_tensor,
+                    "fen": board.fen(),
+                    "history_block": next_history_block.clone(),
+                    "moves": tuple(record.context_moves) + (record.best_move,),
+                    "turn": "white" if board.turn == chess.WHITE else "black",
+                }
+                transitions.append(
+                    BootstrapTransition(
+                        domain_id=domain_cfg.name,
+                        episode_id=episode_id,
+                        step_idx=0,
+                        source=f"bootstrap_curriculum_{bucket}",
+                        observation=current_observation,
+                        info=current_info,
+                        action=torch.tensor([action_id], dtype=torch.long),
+                        next_observation=next_observation,
+                        next_info=next_info,
+                        reward=1.0 if winner == 1 else 0.0,
+                        cost=float(record.candidate_blunder_losses_cp[0] if record.candidate_blunder_losses_cp else 0.0)
+                        / 100.0,
+                        done=board.is_game_over(claim_draw=True),
+                    )
+                )
+                episode_id += 1
+        return transitions
+
     def _collect_bootstrap_trajectories(
         self,
         adapter: InteractiveDomainAdapter,
         domain_cfg: DomainRunConfig,
     ) -> list[BootstrapTransition]:
-        transitions: list[BootstrapTransition] = []
+        transitions: list[BootstrapTransition] = self._collect_chess_curriculum_bootstrap(adapter, domain_cfg)
         episode_specs = (
             ("teacher", int(domain_cfg.bootstrap_teacher_episodes)),
             ("simple", int(domain_cfg.bootstrap_simple_episodes)),

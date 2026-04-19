@@ -28,7 +28,7 @@ curriculum:
     stage3_games:
       domains: ["chess", "go", "poker", "gridworld"]
       chess:
-        stockfish_path: "/usr/local/bin/stockfish"
+        stockfish_path: "external/stockfish/stockfish14-cluster-x86-64"
         depth_schedule: [5, 10, 15, 20, 20, 20]
         elo_target_per_level: [500, 1000, 1500, 2000, 2500, "stockfish_d20"]
       max_episodes_per_level: 2000000

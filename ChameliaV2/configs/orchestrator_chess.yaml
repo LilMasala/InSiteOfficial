@@ -53,11 +53,14 @@ domains:
       opponent_level: 1
       opponent_max_branching: 12
       chess_data_root: data/curriculum/stage3/chess/lichess
+      stockfish_path: external/stockfish/stockfish14-cluster-x86-64
       move_vocabulary_source: alphazero_4672
       self_play_unlock_threshold: 0.90
     bootstrap_random_episodes: 16
     bootstrap_teacher_episodes: 0
     bootstrap_simple_episodes: 128
+    bootstrap_curriculum_samples: 2048
+    bootstrap_curriculum_buckets: [openings, puzzles, endgames, middlegames, short_games, full_games]
     bootstrap_pretrain_steps: 128
     bootstrap_replay_warmup_steps: 128
     bootstrap_batch_size: 8

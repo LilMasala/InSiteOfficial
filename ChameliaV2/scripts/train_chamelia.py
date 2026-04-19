@@ -332,6 +332,10 @@ def build_stage_domains(
         import_module("training.curriculum.domains.stage3_games"),
         "GamesCurriculumDomain",
     )
+    ChessCurriculumDomain = getattr(
+        import_module("training.curriculum.domains.stage3_chess"),
+        "ChessCurriculumDomain",
+    )
     CollaborativeCurriculumDomain = getattr(
         import_module("training.curriculum.domains.stage4_collaborative"),
         "CollaborativeCurriculumDomain",
@@ -383,16 +387,28 @@ def build_stage_domains(
 
     stage3_cfg = cfg["stage3_games"]
     _stage3_seq_lens = {"chess": 128, "go": 128, "poker": 64, "gridworld": 64}
-    stage3_domains = [
-        GamesCurriculumDomain(
-            domain_variant=domain_name,
-            batch_size=_domain_batch_size(stage3_cfg, 8),
-            seq_len=_stage3_seq_lens.get(domain_name, 128),
-            data_root=data_root,
+    stage3_domains = []
+    for domain_name in stage3_cfg["domains"]:
+        if selected_domains and domain_name not in selected_domains:
+            continue
+        if domain_name == "chess":
+            stage3_domains.append(
+                ChessCurriculumDomain(
+                    batch_size=_domain_batch_size(stage3_cfg, 8),
+                    seq_len=_stage3_seq_lens.get(domain_name, 128),
+                    data_root=data_root,
+                    curriculum_config=dict(stage3_cfg.get("chess", {})),
+                )
+            )
+            continue
+        stage3_domains.append(
+            GamesCurriculumDomain(
+                domain_variant=domain_name,
+                batch_size=_domain_batch_size(stage3_cfg, 8),
+                seq_len=_stage3_seq_lens.get(domain_name, 128),
+                data_root=data_root,
+            )
         )
-        for domain_name in stage3_cfg["domains"]
-        if not selected_domains or domain_name in selected_domains
-    ]
     stage_specs.append((3, "stage3_games", stage3_domains))
 
     stage4_cfg = cfg["stage4_collaborative"]

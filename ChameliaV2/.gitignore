@@ -157,6 +157,9 @@ wandb/
 /data/
 # datasets/
 
+# Downloaded chess engines and source bundles
+/external/stockfish/
+
 # Temporary files
 *.tmp
 *.bak

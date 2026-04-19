@@ -286,6 +286,51 @@ def test_orchestrator_can_build_chess_adapter_and_model(tmp_path: Path) -> None:
     assert outputs["action"].shape == (1,)
 
 
+def test_orchestrator_seeds_chess_curriculum_bootstrap(tmp_path: Path) -> None:
+    chess_root = tmp_path / "stage3" / "chess" / "lichess"
+    chess_root.mkdir(parents=True)
+    row = {
+        "fen": chess.STARTING_FEN,
+        "best_move": "e2e4",
+        "candidate_moves": ["e2e4", "d2d4"],
+        "candidate_scores_cp": [30.0, 20.0],
+        "candidate_blunder_losses_cp": [0.0, 10.0],
+        "phase": "opening",
+        "source": "opening_book",
+    }
+    (chess_root / "train.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    (chess_root / "validation.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    config = _tiny_orchestrator_config(tmp_path / "chess_curriculum")
+    config.domains = [
+        DomainRunConfig(
+            name="chess",
+            family="state_vector_hjepa",
+            adapter_kwargs={"opponent_level": 0, "chess_data_root": str(chess_root)},
+            bootstrap_random_episodes=0,
+            bootstrap_simple_episodes=0,
+            bootstrap_curriculum_samples=1,
+            bootstrap_curriculum_buckets=("openings",),
+            bootstrap_pretrain_steps=1,
+            bootstrap_replay_warmup_steps=1,
+            bootstrap_batch_size=1,
+            max_episode_steps=4,
+            evaluation_episodes=1,
+            world_model_backend="mamba",
+            mcts_simulations=1,
+            mcts_depth=1,
+            mcts_rollout_horizon=1,
+            phases={"core_control": DomainPhaseConfig(episodes=1)},
+        )
+    ]
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    transitions = orchestrator._collect_bootstrap_trajectories(adapter, config.domains[0])
+    assert len(transitions) == 1
+    assert transitions[0].source == "bootstrap_curriculum_openings"
+    assert int(transitions[0].action.item()) == _action_from_move(chess.Move.from_uci("e2e4"))
+    assert transitions[0].next_observation["fen"] != chess.STARTING_FEN
+
+
 def test_replay_and_latent_memory_roundtrip() -> None:
     """Replay records and episodic-memory snapshots should round-trip cleanly."""
     replay = TransitionReplayBuffer(capacity=8)

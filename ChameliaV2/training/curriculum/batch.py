@@ -94,7 +94,7 @@ class ChameliaStepBatch:
 
     def __post_init__(self) -> None:
         """Validate the normalized model-step batch."""
-        if self.input_kind not in {"image", "token_ids", "embedded_tokens"}:
+        if self.input_kind not in {"image", "token_ids", "embedded_tokens", "domain_observation"}:
             raise ValueError(f"Unsupported input_kind '{self.input_kind}'.")
         if self.input_mask.dim() != 2:
             raise ValueError(

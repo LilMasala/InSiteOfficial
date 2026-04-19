@@ -248,6 +248,9 @@ class CurriculumStageRunner:
                 raise ValueError(
                     f"Domain '{domain.domain_name()}' does not yet provide a runtime Chamelia plugin."
                 )
+            tokenizer = runtime_domain.get_tokenizer()
+            if isinstance(tokenizer, torch.nn.Module):
+                tokenizer.to(self.device)
             self._runtime_domains[key] = runtime_domain
             self.model.set_domain(runtime_domain)
             self._ensure_optimizer_tracks_model()
@@ -277,15 +280,21 @@ class CurriculumStageRunner:
         tokens = batch.tokens
         embedded_tokens = batch.embedded_tokens
         if tokens is not None:
-            masked_tokens, mask = domain.get_masking_strategy(domain.cost.current_level).apply(
-                tokens,
-                domain.cost.current_level,
-            )
+            if tokens.dim() == 2:
+                masked_tokens, mask = domain.get_masking_strategy(domain.cost.current_level).apply(
+                    tokens,
+                    domain.cost.current_level,
+                )
+                input_kind = "token_ids"
+            else:
+                masked_tokens = tokens
+                mask = batch.input_mask
+                input_kind = "domain_observation"
             return ChameliaStepBatch(
                 domain_name=batch.domain_name,
                 model_inputs=masked_tokens,
                 input_mask=mask.to(self.device),
-                input_kind="token_ids",
+                input_kind=input_kind,
                 targets=batch.targets,
                 domain_state=batch.domain_state,
                 metadata=batch.metadata,
@@ -322,6 +331,10 @@ class CurriculumStageRunner:
         self.model.set_domain(runtime_domain)
         if step_batch.input_kind == "token_ids":
             tokenized = runtime_domain.get_tokenizer()(step_batch.model_inputs.long())
+            model_inputs = tokenized.tokens
+            input_kind = "embedded_tokens"
+        elif step_batch.input_kind == "domain_observation":
+            tokenized = runtime_domain.get_tokenizer()(step_batch.model_inputs.float())
             model_inputs = tokenized.tokens
             input_kind = "embedded_tokens"
         else:
