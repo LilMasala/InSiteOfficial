@@ -1627,9 +1627,8 @@ def test_cartpole_forward_exposes_planner_diagnostics(tmp_path: Path) -> None:
 
 
 def test_cartpole_benchmark_config_loads_with_learning_first_defaults() -> None:
-    config = load_orchestrator_config(
-        "/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/configs/orchestrator_cartpole_benchmark.yaml"
-    )
+    repo_root = Path(__file__).resolve().parents[1]
+    config = load_orchestrator_config(repo_root / "configs" / "orchestrator_cartpole_benchmark.yaml")
     assert config.router_top_k == 2
     assert config.surprise_replay_alpha > 0.0
     assert len(config.domains) == 1
@@ -1639,9 +1638,8 @@ def test_cartpole_benchmark_config_loads_with_learning_first_defaults() -> None:
 
 
 def test_chess_orchestrator_config_enables_legality_curriculum() -> None:
-    config = load_orchestrator_config(
-        "/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/configs/orchestrator_chess.yaml"
-    )
+    repo_root = Path(__file__).resolve().parents[1]
+    config = load_orchestrator_config(repo_root / "configs" / "orchestrator_chess.yaml")
     domain = config.domains[0]
 
     assert domain.name == "chess"
