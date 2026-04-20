@@ -62,6 +62,8 @@ domains:
     bootstrap_random_episodes: 16
     bootstrap_teacher_episodes: 0
     bootstrap_simple_episodes: 128
+    bootstrap_legality_samples: 2048
+    bootstrap_legality_stages: [piece_drills, blocked_piece_drills, king_safety, short_games]
     bootstrap_curriculum_samples: 2048
     bootstrap_curriculum_buckets: [openings, puzzles, endgames, middlegames, short_games, full_games]
     bootstrap_pretrain_steps: 128

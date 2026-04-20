@@ -474,6 +474,13 @@ class DomainRunConfig:
     bootstrap_random_episodes: int = 16
     bootstrap_teacher_episodes: int = 0
     bootstrap_simple_episodes: int = 8
+    bootstrap_legality_samples: int = 0
+    bootstrap_legality_stages: tuple[str, ...] = (
+        "piece_drills",
+        "blocked_piece_drills",
+        "king_safety",
+        "short_games",
+    )
     bootstrap_curriculum_samples: int = 0
     bootstrap_curriculum_buckets: tuple[str, ...] = (
         "openings",
@@ -554,6 +561,19 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 bootstrap_random_episodes=int(entry.get("bootstrap_random_episodes", 16)),
                 bootstrap_teacher_episodes=int(entry.get("bootstrap_teacher_episodes", 0)),
                 bootstrap_simple_episodes=int(entry.get("bootstrap_simple_episodes", 8)),
+                bootstrap_legality_samples=int(entry.get("bootstrap_legality_samples", 0)),
+                bootstrap_legality_stages=tuple(
+                    str(item)
+                    for item in entry.get(
+                        "bootstrap_legality_stages",
+                        (
+                            "piece_drills",
+                            "blocked_piece_drills",
+                            "king_safety",
+                            "short_games",
+                        ),
+                    )
+                ),
                 bootstrap_curriculum_samples=int(entry.get("bootstrap_curriculum_samples", 0)),
                 bootstrap_curriculum_buckets=tuple(
                     str(item)
@@ -1320,6 +1340,252 @@ class UnifiedTrainingOrchestrator:
             return None
         return target / target.sum()
 
+    def _chess_bootstrap_transition_from_board(
+        self,
+        *,
+        board: Any,
+        move: Any,
+        domain_cfg: DomainRunConfig,
+        source: str,
+        episode_id: int,
+        step_idx: int = 0,
+    ) -> BootstrapTransition | None:
+        import chess
+
+        from src.chamelia.plugins.chess import (
+            _HISTORY_PLANES,
+            _action_from_move,
+            _decode_phase_label,
+            _hanging_value,
+            _material_value,
+            _mirror_move,
+            _observation_from_board,
+            _phase_index,
+        )
+
+        if move not in board.legal_moves:
+            return None
+        history_block = torch.zeros(8, 8, _HISTORY_PLANES, dtype=torch.float32)
+        observation_tensor, history_block = _observation_from_board(board, history_block)
+        material_before = _material_value(board, chess.WHITE)
+        action_id = int(_action_from_move(move if board.turn == chess.WHITE else _mirror_move(move)))
+        moves_before = tuple(item.uci() for item in board.move_stack)
+        current_observation = {
+            "observation": observation_tensor,
+            "fen": board.fen(),
+            "history_block": history_block.clone(),
+            "moves": moves_before,
+            "turn": "white" if board.turn == chess.WHITE else "black",
+        }
+        current_info = {
+            "winner": 0,
+            "result": "*",
+            "invalid_action": False,
+            "draw": False,
+            "phase": _decode_phase_label(_phase_index(board)),
+            "source": source,
+        }
+
+        next_board = board.copy(stack=True)
+        next_board.push(move)
+        next_observation_tensor, next_history_block = _observation_from_board(next_board, history_block)
+        result = next_board.result(claim_draw=True) if next_board.is_game_over(claim_draw=True) else "*"
+        winner = 1 if result == "1-0" else (2 if result == "0-1" else 0)
+        next_info = {
+            **current_info,
+            "winner": winner,
+            "result": result,
+            "draw": result == "1/2-1/2",
+            "material_delta": _material_value(next_board, chess.WHITE) - material_before,
+            "hanging_value": _hanging_value(next_board, chess.WHITE),
+            "fen": next_board.fen(),
+        }
+        next_observation = {
+            "observation": next_observation_tensor,
+            "fen": next_board.fen(),
+            "history_block": next_history_block.clone(),
+            "moves": tuple(item.uci() for item in next_board.move_stack),
+            "turn": "white" if next_board.turn == chess.WHITE else "black",
+        }
+        return BootstrapTransition(
+            domain_id=domain_cfg.name,
+            episode_id=episode_id,
+            step_idx=step_idx,
+            source=source,
+            observation=current_observation,
+            info=current_info,
+            action=torch.tensor([action_id], dtype=torch.long),
+            next_observation=next_observation,
+            next_info=next_info,
+            reward=1.0 if winner == 1 else 0.0,
+            cost=0.0,
+            done=next_board.is_game_over(claim_draw=True),
+        )
+
+    def _collect_chess_legality_bootstrap(
+        self,
+        adapter: InteractiveDomainAdapter,
+        domain_cfg: DomainRunConfig,
+    ) -> list[BootstrapTransition]:
+        sample_count = int(domain_cfg.bootstrap_legality_samples)
+        if sample_count <= 0 or not isinstance(adapter, ChessDomain):
+            return []
+
+        import chess
+
+        rng = random.Random(self.config.seed + 40_000)
+        stages = tuple(domain_cfg.bootstrap_legality_stages)
+        per_stage = max(1, (sample_count + max(1, len(stages)) - 1) // max(1, len(stages)))
+        transitions: list[BootstrapTransition] = []
+        episode_id = 50_000
+
+        def empty_board() -> Any:
+            board = chess.Board(None)
+            board.turn = chess.WHITE
+            board.castling_rights = 0
+            board.ep_square = None
+            board.halfmove_clock = 0
+            board.fullmove_number = 1
+            return board
+
+        def place_kings(board: Any, *, white: int = chess.E1, black: int = chess.E8) -> None:
+            board.set_piece_at(white, chess.Piece(chess.KING, chess.WHITE))
+            board.set_piece_at(black, chess.Piece(chess.KING, chess.BLACK))
+
+        def random_empty_square(board: Any, *, excluded: set[int] | None = None) -> int:
+            blocked = set(excluded or set())
+            blocked.update(board.piece_map().keys())
+            choices = [square for square in chess.SQUARES if square not in blocked]
+            return rng.choice(choices)
+
+        def is_usable_board(board: Any) -> bool:
+            return int(board.status()) == int(chess.STATUS_VALID)
+
+        def legal_target(board: Any, *, from_square: int | None = None) -> Any | None:
+            if not is_usable_board(board):
+                return None
+            moves = list(board.legal_moves)
+            if from_square is not None:
+                focused = [move for move in moves if move.from_square == from_square]
+                if focused:
+                    moves = focused
+            if not moves:
+                return None
+            captures = [move for move in moves if board.is_capture(move)]
+            checks = [move for move in moves if board.gives_check(move)]
+            pool = checks or captures or moves
+            return rng.choice(pool)
+
+        def add_transition(board: Any, move: Any, source: str) -> None:
+            nonlocal episode_id
+            if len(transitions) >= sample_count:
+                return
+            transition = self._chess_bootstrap_transition_from_board(
+                board=board,
+                move=move,
+                domain_cfg=domain_cfg,
+                source=source,
+                episode_id=episode_id,
+            )
+            if transition is not None:
+                transitions.append(transition)
+                episode_id += 1
+
+        def stage_piece_drills(limit: int) -> None:
+            piece_types = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+            attempts = 0
+            start_len = len(transitions)
+            while len(transitions) - start_len < limit and attempts < limit * 40:
+                attempts += 1
+                board = empty_board()
+                place_kings(board)
+                piece_type = rng.choice(piece_types)
+                if piece_type == chess.PAWN:
+                    files = list(range(8))
+                    ranks = list(range(1, 6))
+                    square = chess.square(rng.choice(files), rng.choice(ranks))
+                    if board.piece_at(square) is not None:
+                        continue
+                else:
+                    square = random_empty_square(board)
+                board.set_piece_at(square, chess.Piece(piece_type, chess.WHITE))
+                move = legal_target(board, from_square=square)
+                if move is not None:
+                    add_transition(board, move, "bootstrap_legality_piece_drills")
+
+        def stage_blocked_piece_drills(limit: int) -> None:
+            piece_types = (chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KNIGHT, chess.PAWN)
+            blocker_types = (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK)
+            attempts = 0
+            start_len = len(transitions)
+            while len(transitions) - start_len < limit and attempts < limit * 60:
+                attempts += 1
+                board = empty_board()
+                place_kings(board)
+                piece_type = rng.choice(piece_types)
+                square = random_empty_square(board)
+                if piece_type == chess.PAWN and chess.square_rank(square) in {0, 7}:
+                    continue
+                board.set_piece_at(square, chess.Piece(piece_type, chess.WHITE))
+                for _ in range(rng.randint(2, 6)):
+                    blocker_square = random_empty_square(board)
+                    color = chess.WHITE if rng.random() < 0.45 else chess.BLACK
+                    board.set_piece_at(
+                        blocker_square,
+                        chess.Piece(rng.choice(blocker_types), color),
+                    )
+                if board.is_check():
+                    continue
+                move = legal_target(board, from_square=square)
+                if move is not None:
+                    add_transition(board, move, "bootstrap_legality_blocked_piece_drills")
+
+        def stage_king_safety(limit: int) -> None:
+            templates = (
+                "k3r3/8/8/8/8/8/8/4K3 w - - 0 1",
+                "k3r3/8/8/8/8/8/4R3/4K3 w - - 0 1",
+                "k7/8/8/8/8/5n2/8/4K3 w - - 0 1",
+                "k7/8/8/8/b7/8/3N4/4K3 w - - 0 1",
+                "k7/8/8/8/8/8/4Q3/4K2r w - - 0 1",
+            )
+            attempts = 0
+            start_len = len(transitions)
+            while len(transitions) - start_len < limit and attempts < limit * 20:
+                attempts += 1
+                board = chess.Board(rng.choice(templates))
+                move = legal_target(board)
+                if move is not None:
+                    add_transition(board, move, "bootstrap_legality_king_safety")
+
+        def stage_short_games(limit: int) -> None:
+            attempts = 0
+            start_len = len(transitions)
+            while len(transitions) - start_len < limit and attempts < limit * 40:
+                attempts += 1
+                board = chess.Board()
+                for _ in range(rng.randint(2, 18)):
+                    moves = list(board.legal_moves)
+                    if not moves or board.is_game_over(claim_draw=True):
+                        break
+                    board.push(rng.choice(moves))
+                if board.is_game_over(claim_draw=True):
+                    continue
+                move = legal_target(board)
+                if move is not None:
+                    add_transition(board, move, "bootstrap_legality_short_games")
+
+        generators = {
+            "piece_drills": stage_piece_drills,
+            "blocked_piece_drills": stage_blocked_piece_drills,
+            "king_safety": stage_king_safety,
+            "short_games": stage_short_games,
+        }
+        for stage in stages:
+            generator = generators.get(stage)
+            if generator is not None and len(transitions) < sample_count:
+                generator(per_stage)
+        return transitions[:sample_count]
+
     def _collect_chess_curriculum_bootstrap(
         self,
         adapter: InteractiveDomainAdapter,
@@ -1429,7 +1695,8 @@ class UnifiedTrainingOrchestrator:
         adapter: InteractiveDomainAdapter,
         domain_cfg: DomainRunConfig,
     ) -> list[BootstrapTransition]:
-        transitions: list[BootstrapTransition] = self._collect_chess_curriculum_bootstrap(adapter, domain_cfg)
+        transitions: list[BootstrapTransition] = self._collect_chess_legality_bootstrap(adapter, domain_cfg)
+        transitions.extend(self._collect_chess_curriculum_bootstrap(adapter, domain_cfg))
         episode_specs = (
             ("teacher", int(domain_cfg.bootstrap_teacher_episodes)),
             ("simple", int(domain_cfg.bootstrap_simple_episodes)),
@@ -3620,6 +3887,8 @@ class UnifiedTrainingOrchestrator:
                 f"[{domain_cfg.name}] bootstrap_random_episodes={domain_cfg.bootstrap_random_episodes} "
                 f"bootstrap_teacher_episodes={domain_cfg.bootstrap_teacher_episodes} "
                 f"bootstrap_simple_episodes={domain_cfg.bootstrap_simple_episodes} "
+                f"bootstrap_legality_samples={domain_cfg.bootstrap_legality_samples} "
+                f"bootstrap_curriculum_samples={domain_cfg.bootstrap_curriculum_samples} "
                 f"bootstrap_pretrain_steps={domain_cfg.bootstrap_pretrain_steps} "
                 f"bootstrap_replay_warmup_steps={domain_cfg.bootstrap_replay_warmup_steps}",
                 flush=True,

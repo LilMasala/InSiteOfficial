@@ -389,6 +389,55 @@ def test_orchestrator_seeds_chess_curriculum_bootstrap(tmp_path: Path) -> None:
     assert transitions[0].next_observation["fen"] != chess.STARTING_FEN
 
 
+def test_orchestrator_seeds_chess_legality_bootstrap(tmp_path: Path) -> None:
+    config = _tiny_orchestrator_config(tmp_path / "chess_legality")
+    config.domains = [
+        DomainRunConfig(
+            name="chess",
+            family="state_vector_hjepa",
+            adapter_kwargs={"opponent_level": 0},
+            bootstrap_random_episodes=0,
+            bootstrap_simple_episodes=0,
+            bootstrap_legality_samples=8,
+            bootstrap_legality_stages=(
+                "piece_drills",
+                "blocked_piece_drills",
+                "king_safety",
+                "short_games",
+            ),
+            bootstrap_curriculum_samples=0,
+            bootstrap_pretrain_steps=1,
+            bootstrap_replay_warmup_steps=1,
+            bootstrap_batch_size=1,
+            max_episode_steps=4,
+            evaluation_episodes=1,
+            world_model_backend="mamba",
+            mcts_simulations=1,
+            mcts_depth=1,
+            mcts_rollout_horizon=1,
+            phases={"core_control": DomainPhaseConfig(episodes=1)},
+        )
+    ]
+    orchestrator = UnifiedTrainingOrchestrator(config)
+    adapter = orchestrator._build_adapter(config.domains[0])
+    transitions = orchestrator._collect_bootstrap_trajectories(adapter, config.domains[0])
+    sources = {transition.source for transition in transitions}
+
+    assert len(transitions) == 8
+    assert {
+        "bootstrap_legality_piece_drills",
+        "bootstrap_legality_blocked_piece_drills",
+        "bootstrap_legality_king_safety",
+        "bootstrap_legality_short_games",
+    }.issubset(sources)
+    for transition in transitions:
+        board = chess.Board(transition.observation["fen"])
+        move = _action_to_move(board, int(transition.action.item()))
+        assert move in board.legal_moves
+        assert transition.info["invalid_action"] is False
+        assert transition.next_observation["fen"] != transition.observation["fen"]
+
+
 def test_replay_and_latent_memory_roundtrip() -> None:
     """Replay records and episodic-memory snapshots should round-trip cleanly."""
     replay = TransitionReplayBuffer(capacity=8)
@@ -1587,3 +1636,20 @@ def test_cartpole_benchmark_config_loads_with_learning_first_defaults() -> None:
     assert config.domains[0].name == "cartpole"
     assert config.domains[0].bootstrap_teacher_episodes == 49
     assert config.domains[0].evaluation_episodes == 100
+
+
+def test_chess_orchestrator_config_enables_legality_curriculum() -> None:
+    config = load_orchestrator_config(
+        "/Users/anandparikh/Desktop/InSiteOfficial/ChameliaV2/configs/orchestrator_chess.yaml"
+    )
+    domain = config.domains[0]
+
+    assert domain.name == "chess"
+    assert domain.bootstrap_legality_samples == 2048
+    assert domain.bootstrap_legality_stages == (
+        "piece_drills",
+        "blocked_piece_drills",
+        "king_safety",
+        "short_games",
+    )
+    assert domain.bootstrap_curriculum_samples == 2048
