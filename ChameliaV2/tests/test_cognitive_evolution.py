@@ -15,6 +15,7 @@ from src.chamelia.cognitive.planning import (
     Talker,
     ThinkerOutput,
     ThoughtTrace,
+    apply_root_legal_action_mask,
 )
 from src.chamelia.cognitive.semantic import SemanticMemory
 from src.chamelia.configurator import Configurator
@@ -88,6 +89,26 @@ def test_actor_supports_discrete_action_specs_and_thought_tokens() -> None:
     assert proposal["candidate_action_paths"].action_spec.kind == ActionKind.DISCRETE
     assert proposal["thought_token"].shape == (2, 16)
     assert proposal["reflect_logits"].shape == (2,)
+
+
+def test_root_legal_action_mask_constrains_only_executable_step() -> None:
+    candidate_paths = torch.zeros(1, 3, 2, 5)
+    candidate_paths[0, 0, 0, 0] = 5.0
+    candidate_paths[0, 1, 0, 2] = 5.0
+    candidate_paths[0, 2, 0, 4] = 5.0
+    candidate_paths[0, :, 1, 0] = 3.0
+    candidate_paths[0, :, 1, 4] = 7.0
+    legal_mask = torch.tensor([[False, True, True, False, False]])
+
+    constrained, diagnostics = apply_root_legal_action_mask(
+        candidate_paths,
+        {"legal_actions_mask": legal_mask},
+    )
+
+    assert diagnostics is not None
+    assert diagnostics["root_illegal_candidate_count"] == 2
+    assert constrained[0, :, 0, :].argmax(dim=-1).tolist() == [2, 2, 2]
+    assert torch.equal(constrained[0, :, 1, :], candidate_paths[0, :, 1, :])
 
 
 def test_world_models_emit_uncertainty_for_discrete_actions() -> None:

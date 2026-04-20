@@ -720,6 +720,35 @@ class UnifiedTrainingOrchestrator:
         with self._diagnostic_path(domain_name, phase_name).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
 
+    @staticmethod
+    def _observation_moves(observation: Any) -> list[str]:
+        if not isinstance(observation, dict):
+            return []
+        moves = observation.get("moves")
+        if isinstance(moves, (list, tuple)):
+            return [str(move) for move in moves]
+        return []
+
+    @staticmethod
+    def _observation_fen(observation: Any) -> str | None:
+        if isinstance(observation, dict) and observation.get("fen") is not None:
+            return str(observation["fen"])
+        return None
+
+    @staticmethod
+    def _action_log_id(action: Any) -> int | None:
+        if torch.is_tensor(action):
+            detached = action.detach().cpu().reshape(-1)
+            if detached.numel() == 0:
+                return None
+            if detached.numel() == 1:
+                return int(detached[0].item())
+            return int(detached.argmax().item())
+        try:
+            return int(action)
+        except (TypeError, ValueError):
+            return None
+
     def _gradient_norm(self, model: Chamelia) -> float:
         total = 0.0
         for param in model.parameters():
@@ -2995,6 +3024,7 @@ class UnifiedTrainingOrchestrator:
             observation, info = adapter.reset(seed=self.config.seed + episode_idx)
             episode_reward = 0.0
             winner = 0
+            episode_game_steps: list[dict[str, Any]] = []
             last_execution_metadata = {
                 "execution_source": "model",
                 "effective_epsilon": 0.0,
@@ -3101,6 +3131,8 @@ class UnifiedTrainingOrchestrator:
                 chosen_action = (
                     executed_action[0] if torch.is_tensor(executed_action) else executed_action
                 )
+                fen_before = self._observation_fen(observation)
+                moves_before = self._observation_moves(observation)
                 next_observation, reward, terminated, truncated, info = adapter.step(chosen_action)
                 next_tokens, next_z = self._encode_latent(model, adapter, next_observation)
                 realized_cost = adapter.compute_realized_cost(
@@ -3199,6 +3231,44 @@ class UnifiedTrainingOrchestrator:
                     "surprise_priority": surprise_priority,
                     "promotion_source": promotion_source,
                 }
+                moves_after = self._observation_moves(next_observation)
+                if fen_before is not None or moves_after:
+                    selected_candidate_idx = outputs.get("selected_candidate_idx")
+                    selected_idx = None
+                    if torch.is_tensor(selected_candidate_idx) and selected_candidate_idx.numel() > 0:
+                        selected_idx = int(
+                            selected_candidate_idx.detach().cpu().reshape(-1)[0].item()
+                        )
+                    new_moves = (
+                        moves_after[len(moves_before):]
+                        if len(moves_after) >= len(moves_before)
+                        else moves_after
+                    )
+                    episode_game_steps.append(
+                        {
+                            "step_idx": int(step_idx),
+                            "fen_before": fen_before,
+                            "fen_after": self._observation_fen(next_observation),
+                            "action_id": self._action_log_id(chosen_action),
+                            "moves": new_moves,
+                            "moves_after": moves_after,
+                            "opponent_action": (
+                                None
+                                if info.get("opponent_action") is None
+                                else str(info.get("opponent_action"))
+                            ),
+                            "reward": float(reward),
+                            "realized_cost": float(realized_cost),
+                            "terminated": bool(terminated),
+                            "truncated": bool(truncated),
+                            "result": str(info.get("result", "*")),
+                            "winner": int(info.get("winner", 0)),
+                            "execution_source": execution_source,
+                            "selected_candidate_idx": selected_idx,
+                            "effective_epsilon": float(effective_epsilon),
+                            "exploration_taken": bool(exploration_taken),
+                        }
+                    )
                 skill_trace = tuple(outputs.get("skill_traces", [()])[0] or ())
                 if skill_trace and model.procedural_memory is not None:
                     if any(
@@ -3271,6 +3341,16 @@ class UnifiedTrainingOrchestrator:
                     ),
                     flush=True,
                 )
+                if episode_game_steps:
+                    final_moves = episode_game_steps[-1]["moves_after"]
+                    shown_moves = " ".join(final_moves[:40])
+                    if len(final_moves) > 40:
+                        shown_moves += " ..."
+                    print(
+                        f"[{domain_cfg.name}][{phase_name}] game episode={episode_idx}/{phase_cfg.episodes} "
+                        f"result={episode_game_steps[-1]['result']} winner={winner} moves={shown_moves}",
+                        flush=True,
+                    )
                 self._append_diagnostic_event(
                     domain_name=domain_cfg.name,
                     phase_name=phase_name,
@@ -3305,6 +3385,22 @@ class UnifiedTrainingOrchestrator:
                         "elite_rollback_count": int(rollback_count),
                         **last_execution_metadata,
                         **output_summary,
+                    },
+                )
+            if episode_game_steps:
+                self._append_diagnostic_event(
+                    domain_name=domain_cfg.name,
+                    phase_name=phase_name,
+                    kind="episode_game",
+                    payload={
+                        "episode_idx": episode_idx,
+                        "episode_reward": float(episode_reward),
+                        "episode_length": int(step_idx + 1),
+                        "winner": winner,
+                        "result": episode_game_steps[-1]["result"],
+                        "moves": episode_game_steps[-1]["moves_after"],
+                        "final_fen": episode_game_steps[-1]["fen_after"],
+                        "steps": episode_game_steps,
                     },
                 )
             if phase_cfg.use_sleep and episode_idx % max(1, domain_cfg.sleep_interval_episodes) == 0 and model.sleep_coordinator is not None:

@@ -178,6 +178,30 @@ def test_chess_domain_exact_step_and_imagined_rollout_update_board() -> None:
     assert outcome["realized_intrinsic_cost"].shape == (1,)
 
 
+def test_chess_imagined_rollout_does_not_search_opponent(monkeypatch: pytest.MonkeyPatch) -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0)
+    domain.set_eval_opponent_depth(4)
+    observation, info = domain.reset(seed=0)
+    action_id = _action_from_move(chess.Move.from_uci("e2e4"))
+    action_logits = torch.full((1, domain.get_action_dim()), -6.0)
+    action_logits[0, action_id] = 6.0
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("imagined rollout must not use opponent search")
+
+    monkeypatch.setattr(domain, "_choose_opponent_move", fail_if_called)
+
+    imagined = domain.build_imagined_domain_state(
+        domain.build_domain_state(observation, info),
+        action_logits,
+        torch.zeros(1, 16),
+        0,
+    )
+
+    assert imagined["move_count"][0].item() == 1.0
+    assert imagined["fen"][0].split()[1] == "b"
+
+
 def test_chess_domain_terminal_flags_from_fen_positions() -> None:
     domain = ChessDomain(embed_dim=16, opponent_level=0)
     checkmate_board = chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")

@@ -630,10 +630,6 @@ class ChessDomain(InteractiveDomainAdapter):
                 rollout["realized_check_bonus"][batch_idx] = 0.25
             if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_draw():
                 rollout["realized_draw_penalty"][batch_idx] = 3.0
-            else:
-                opponent_reply = self._choose_opponent_move(board)
-                if opponent_reply is not None:
-                    board.push(opponent_reply)
             material_after = _material_value(board, chess.WHITE)
             rollout["realized_capture_gain"][batch_idx] = min(2.0, capture_gain * 0.1)
             rollout["realized_material_loss"][batch_idx] = max(0.0, material_before - material_after)

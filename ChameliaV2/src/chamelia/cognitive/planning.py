@@ -224,6 +224,7 @@ class MCTSNode:
     candidate_trajectories: torch.Tensor | None = None
     candidate_uncertainty: torch.Tensor | None = None
     thought_token: torch.Tensor | None = None
+    constraint_diagnostics: dict[str, Any] | None = None
     is_reflect: bool = False
     children: list["MCTSNode"] = field(default_factory=list)
 
@@ -238,6 +239,55 @@ class MCTSNode:
             return float("inf")
         bonus = exploration_weight * ((parent_visits + 1) ** 0.5) / (1.0 + self.visit_count)
         return (-self.mean_cost) + bonus
+
+
+def apply_root_legal_action_mask(
+    candidate_paths: torch.Tensor,
+    domain_state: dict[str, Any],
+    *,
+    legal_logit: float = 8.0,
+    illegal_logit: float = -8.0,
+) -> tuple[torch.Tensor, dict[str, Any] | None]:
+    """Constrain only the executable root action to the current legal-action mask."""
+    legal_mask = domain_state.get("legal_actions_mask")
+    if not torch.is_tensor(legal_mask) or candidate_paths.dim() != 4:
+        return candidate_paths, None
+    legal_view = (
+        legal_mask.reshape(1, -1)
+        if legal_mask.dim() == 1
+        else legal_mask.reshape(legal_mask.shape[0], -1)
+    )
+    if candidate_paths.shape[-1] != int(legal_view.shape[-1]):
+        return candidate_paths, None
+    legal = legal_view.to(device=candidate_paths.device).bool()
+    if legal.shape[0] == 1 and candidate_paths.shape[0] > 1:
+        legal = legal.expand(candidate_paths.shape[0], -1)
+    if legal.shape[0] != candidate_paths.shape[0] or not bool(legal.any(dim=-1).all().item()):
+        return candidate_paths, None
+
+    root_scores = candidate_paths[:, :, 0, :]
+    proposed_ids = root_scores.argmax(dim=-1)
+    proposed_legal = legal.gather(1, proposed_ids).bool()
+    masked_scores = root_scores.masked_fill(~legal.unsqueeze(1), torch.finfo(root_scores.dtype).min)
+    selected_ids = masked_scores.argmax(dim=-1)
+
+    constrained_root = torch.full_like(root_scores, float(illegal_logit))
+    constrained_root.scatter_(-1, selected_ids.unsqueeze(-1), float(legal_logit))
+    constrained = candidate_paths.clone()
+    constrained[:, :, 0, :] = constrained_root
+
+    diagnostics = {
+        "root_legal_mask_applied": True,
+        "root_illegal_candidate_count": int((~proposed_legal).sum().item()),
+        "root_legal_candidate_count": int(proposed_legal.sum().item()),
+        "root_legal_action_count": (
+            int(legal[0].sum().item())
+            if legal.shape[0] == 1
+            else [int(row.sum().item()) for row in legal]
+        ),
+        "root_selected_legal_actions": selected_ids.detach().cpu().reshape(-1).tolist(),
+    }
+    return constrained, diagnostics
 
 
 @dataclass(frozen=True)
@@ -406,6 +456,10 @@ class MCTSSearch:
             ),
         )
         candidate_paths = proposal["candidate_paths"]
+        candidate_paths, constraint_diagnostics = apply_root_legal_action_mask(
+            candidate_paths,
+            domain_state,
+        )
         candidate_postures = proposal["candidate_postures"]
         reasoning_states = proposal["reasoning_states"]
         thought_token = proposal["thought_token"][0].detach()
@@ -476,6 +530,7 @@ class MCTSSearch:
         node.candidate_trajectories = rollout["trajectory"][0].detach()
         node.candidate_uncertainty = rollout.get("uncertainty", None)
         node.thought_token = thought_token
+        node.constraint_diagnostics = constraint_diagnostics
         node.expanded = True
         node.children = []
         for idx in range(candidate_paths.shape[1]):
@@ -705,6 +760,8 @@ class MCTSSearch:
         tree_trace["reasoning_round"] = reasoning_round
         tree_trace["thought_trace_len"] = len(active_trace.tokens)
         tree_trace["root_candidate_costs"] = [float(value) for value in root.candidate_costs.tolist()]
+        if root.constraint_diagnostics is not None:
+            tree_trace["constraint_diagnostics"] = root.constraint_diagnostics
         if root.candidate_ic is not None:
             tree_trace["root_candidate_ic"] = [float(value) for value in root.candidate_ic.tolist()]
         if root.candidate_tc is not None:
