@@ -123,6 +123,40 @@ def test_chess_domain_invalid_move_is_terminal_loss() -> None:
     assert next_info["winner"] == 2
 
 
+def test_chess_domain_invalid_move_retry_keeps_same_board() -> None:
+    domain = ChessDomain(
+        embed_dim=16,
+        opponent_level=0,
+        invalid_move_mode="retry",
+        invalid_move_penalty=-0.25,
+        max_invalid_retries=2,
+    )
+    observation, _info = domain.reset(seed=0)
+    invalid_action = torch.tensor([0], dtype=torch.long)
+
+    retry_observation, reward, terminated, truncated, retry_info = domain.step(invalid_action)
+
+    assert retry_observation["fen"] == observation["fen"]
+    assert retry_observation["moves"] == observation["moves"]
+    assert reward == -0.25
+    assert terminated is False
+    assert truncated is False
+    assert retry_info["invalid_action"] is True
+    assert retry_info["invalid_retry"] is True
+    assert retry_info["retry_exhausted"] is False
+    assert retry_info["invalid_retries"] == 1
+
+    domain.step(invalid_action)
+    terminal_observation, terminal_reward, terminal, _truncated, terminal_info = domain.step(invalid_action)
+
+    assert terminal_observation["fen"] == observation["fen"]
+    assert terminal_reward == -1.0
+    assert terminal is True
+    assert terminal_info["invalid_action"] is True
+    assert terminal_info["retry_exhausted"] is True
+    assert terminal_info["invalid_retries"] == 3
+
+
 def test_chess_action_decoder_returns_null_for_offboard_action() -> None:
     assert _action_to_move(chess.Board(), 0) == chess.Move.null()
 

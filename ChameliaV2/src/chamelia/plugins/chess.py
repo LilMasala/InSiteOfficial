@@ -315,6 +315,9 @@ class ChessDomain(InteractiveDomainAdapter):
         chess_data_root: str | None = None,
         stockfish_path: str | None = None,
         move_vocabulary_source: str = "alphazero_4672",
+        invalid_move_mode: str = "terminal",
+        invalid_move_penalty: float = -1.0,
+        max_invalid_retries: int = 0,
     ) -> None:
         self._tokenizer = ChessTokenizer(embed_dim=embed_dim, num_planes=CHESS_OBSERVATION_PLANES, domain_name="chess")
         self._eval_opponent_depth: int | None = None
@@ -324,11 +327,15 @@ class ChessDomain(InteractiveDomainAdapter):
         self.chess_data_root = chess_data_root
         self.stockfish_path = stockfish_path
         self.move_vocabulary_source = move_vocabulary_source
+        self.invalid_move_mode = str(invalid_move_mode).lower()
+        self.invalid_move_penalty = float(invalid_move_penalty)
+        self.max_invalid_retries = max(0, int(max_invalid_retries))
         self.self_play_enabled = False
         self._board = chess.Board()
         self._history_block = torch.zeros(8, 8, _HISTORY_PLANES, dtype=torch.float32)
         self._done = False
         self._last_terminal_info: dict[str, Any] = {}
+        self._invalid_retries = 0
 
     def get_tokenizer(self) -> ChessTokenizer:
         return self._tokenizer
@@ -719,6 +726,7 @@ class ChessDomain(InteractiveDomainAdapter):
         self._board = chess.Board()
         self._done = False
         self._last_terminal_info = {}
+        self._invalid_retries = 0
         current = _board_planes(self._board)
         self._history_block = torch.cat(
             [current, torch.zeros(8, 8, _HISTORY_PLANES - _CURRENT_BOARD_PLANES, dtype=torch.float32)],
@@ -750,12 +758,36 @@ class ChessDomain(InteractiveDomainAdapter):
         material_before = _material_value(self._board, chess.WHITE)
         chosen_move = _action_to_move(self._board, action_id)
         if chosen_move not in self._board.legal_moves:
+            self._invalid_retries += 1
+            if (
+                self.invalid_move_mode == "retry"
+                and self._invalid_retries <= self.max_invalid_retries
+            ):
+                info = self._result_info(self._board, invalid=True)
+                info.update(
+                    {
+                        "invalid_retry": True,
+                        "invalid_retries": self._invalid_retries,
+                        "retry_exhausted": False,
+                        "phase": _decode_phase_label(_phase_index(self._board)),
+                    }
+                )
+                return self._observe(), self.invalid_move_penalty, False, False, info
             self._done = True
             self._last_terminal_info = self._result_info(self._board, invalid=True)
+            self._last_terminal_info.update(
+                {
+                    "invalid_retry": self.invalid_move_mode == "retry",
+                    "invalid_retries": self._invalid_retries,
+                    "retry_exhausted": self.invalid_move_mode == "retry",
+                    "phase": _decode_phase_label(_phase_index(self._board)),
+                }
+            )
             observation = self._observe()
             return observation, -1.0, True, False, self._last_terminal_info
 
         self._board.push(chosen_move)
+        self._invalid_retries = 0
         opponent_move = None
         if not self._board.is_game_over(claim_draw=True):
             opponent_move = self._choose_opponent_move(self._board)

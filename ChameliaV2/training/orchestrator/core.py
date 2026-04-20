@@ -3025,6 +3025,7 @@ class UnifiedTrainingOrchestrator:
             episode_reward = 0.0
             winner = 0
             episode_game_steps: list[dict[str, Any]] = []
+            episode_invalid_attempts = 0
             last_execution_metadata = {
                 "execution_source": "model",
                 "effective_epsilon": 0.0,
@@ -3134,6 +3135,8 @@ class UnifiedTrainingOrchestrator:
                 fen_before = self._observation_fen(observation)
                 moves_before = self._observation_moves(observation)
                 next_observation, reward, terminated, truncated, info = adapter.step(chosen_action)
+                if bool(info.get("invalid_action", False)):
+                    episode_invalid_attempts += 1
                 next_tokens, next_z = self._encode_latent(model, adapter, next_observation)
                 realized_cost = adapter.compute_realized_cost(
                     next_observation,
@@ -3263,6 +3266,10 @@ class UnifiedTrainingOrchestrator:
                             "truncated": bool(truncated),
                             "result": str(info.get("result", "*")),
                             "winner": int(info.get("winner", 0)),
+                            "invalid_action": bool(info.get("invalid_action", False)),
+                            "invalid_retry": bool(info.get("invalid_retry", False)),
+                            "invalid_retries": int(info.get("invalid_retries", 0)),
+                            "retry_exhausted": bool(info.get("retry_exhausted", False)),
                             "execution_source": execution_source,
                             "selected_candidate_idx": selected_idx,
                             "effective_epsilon": float(effective_epsilon),
@@ -3348,7 +3355,8 @@ class UnifiedTrainingOrchestrator:
                         shown_moves += " ..."
                     print(
                         f"[{domain_cfg.name}][{phase_name}] game episode={episode_idx}/{phase_cfg.episodes} "
-                        f"result={episode_game_steps[-1]['result']} winner={winner} moves={shown_moves}",
+                        f"result={episode_game_steps[-1]['result']} winner={winner} "
+                        f"invalid_attempts={episode_invalid_attempts} moves={shown_moves}",
                         flush=True,
                     )
                 self._append_diagnostic_event(
@@ -3398,6 +3406,7 @@ class UnifiedTrainingOrchestrator:
                         "episode_length": int(step_idx + 1),
                         "winner": winner,
                         "result": episode_game_steps[-1]["result"],
+                        "invalid_attempts": int(episode_invalid_attempts),
                         "moves": episode_game_steps[-1]["moves_after"],
                         "final_fen": episode_game_steps[-1]["fen_after"],
                         "steps": episode_game_steps,
