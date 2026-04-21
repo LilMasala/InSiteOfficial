@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
+import shutil
 from typing import Any
 
 import chess
+import chess.engine
 import torch
 import torch.nn as nn
 
@@ -314,6 +317,14 @@ class ChessDomain(InteractiveDomainAdapter):
         self_play_unlock_threshold: float = 0.90,
         chess_data_root: str | None = None,
         stockfish_path: str | None = None,
+        opponent_backend: str = "builtin",
+        stockfish_depth: int | None = None,
+        stockfish_nodes: int = 2000,
+        stockfish_skill_level: int | None = None,
+        stockfish_uci_elo: int | None = None,
+        stockfish_threads: int = 1,
+        stockfish_hash_mb: int = 64,
+        stockfish_strict: bool = False,
         move_vocabulary_source: str = "alphazero_4672",
         invalid_move_mode: str = "terminal",
         invalid_move_penalty: float = -1.0,
@@ -326,6 +337,15 @@ class ChessDomain(InteractiveDomainAdapter):
         self.self_play_unlock_threshold = float(self_play_unlock_threshold)
         self.chess_data_root = chess_data_root
         self.stockfish_path = stockfish_path
+        self.opponent_backend = str(opponent_backend).lower()
+        self.stockfish_depth = None if stockfish_depth is None else max(0, int(stockfish_depth))
+        self.stockfish_nodes = max(1, int(stockfish_nodes))
+        self.stockfish_skill_level = None if stockfish_skill_level is None else max(0, min(20, int(stockfish_skill_level)))
+        self.stockfish_uci_elo = None if stockfish_uci_elo is None else int(stockfish_uci_elo)
+        self.stockfish_threads = max(1, int(stockfish_threads))
+        self.stockfish_hash_mb = max(1, int(stockfish_hash_mb))
+        self.stockfish_strict = bool(stockfish_strict)
+        self._stockfish_engine: chess.engine.SimpleEngine | None = None
         self.move_vocabulary_source = move_vocabulary_source
         self.invalid_move_mode = str(invalid_move_mode).lower()
         self.invalid_move_penalty = float(invalid_move_penalty)
@@ -456,7 +476,13 @@ class ChessDomain(InteractiveDomainAdapter):
                 break
         return value
 
-    def _best_move(self, board: chess.Board, *, maximizing_white: bool, depth: int) -> chess.Move | None:
+    def _best_move(
+        self,
+        board: chess.Board,
+        *,
+        maximizing_white: bool,
+        depth: int,
+    ) -> chess.Move | None:
         legal_moves = list(board.legal_moves)
         if not legal_moves:
             return None
@@ -476,14 +502,65 @@ class ChessDomain(InteractiveDomainAdapter):
                 best_move = move
         return best_move
 
-    def _choose_opponent_move(self, board: chess.Board) -> chess.Move | None:
+    def _choose_builtin_opponent_move(self, board: chess.Board, *, depth: int | None = None) -> chess.Move | None:
         legal_moves = list(board.legal_moves)
         if not legal_moves:
             return None
-        depth = self._eval_opponent_depth if self._eval_opponent_depth is not None else self._opponent_level
-        if depth <= 0:
+        search_depth = self._eval_opponent_depth if depth is None and self._eval_opponent_depth is not None else depth
+        if search_depth is None:
+            search_depth = self._opponent_level
+        if int(search_depth) <= 0:
             return legal_moves[0]
-        return self._best_move(board, maximizing_white=False, depth=depth)
+        return self._best_move(board, maximizing_white=False, depth=int(search_depth))
+
+    def _stockfish_available(self) -> bool:
+        if not self.stockfish_path:
+            return False
+        return shutil.which(self.stockfish_path) is not None or Path(self.stockfish_path).expanduser().exists()
+
+    def _stockfish_limit(self) -> chess.engine.Limit:
+        depth = self._eval_opponent_depth if self._eval_opponent_depth is not None else self.stockfish_depth
+        if depth is not None and int(depth) > 0:
+            return chess.engine.Limit(depth=int(depth))
+        return chess.engine.Limit(nodes=self.stockfish_nodes)
+
+    def _ensure_stockfish_engine(self) -> chess.engine.SimpleEngine | None:
+        if self._stockfish_engine is not None:
+            return self._stockfish_engine
+        if not self._stockfish_available():
+            if self.stockfish_strict:
+                raise FileNotFoundError(
+                    f"Stockfish opponent requested but stockfish_path is unavailable: {self.stockfish_path!r}"
+                )
+            return None
+        self._stockfish_engine = chess.engine.SimpleEngine.popen_uci(str(self.stockfish_path))
+        config: dict[str, int | bool] = {
+            "Threads": self.stockfish_threads,
+            "Hash": self.stockfish_hash_mb,
+        }
+        if self.stockfish_uci_elo is not None:
+            config.update({"UCI_LimitStrength": True, "UCI_Elo": self.stockfish_uci_elo})
+        elif self.stockfish_skill_level is not None:
+            config["Skill Level"] = self.stockfish_skill_level
+        self._stockfish_engine.configure(config)
+        return self._stockfish_engine
+
+    def _choose_stockfish_opponent_move(self, board: chess.Board) -> chess.Move | None:
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            return None
+        engine = self._ensure_stockfish_engine()
+        if engine is None:
+            return None
+        result = engine.play(board, self._stockfish_limit())
+        return result.move if result.move in legal_moves else legal_moves[0]
+
+    def _choose_opponent_move(self, board: chess.Board) -> chess.Move | None:
+        if self.opponent_backend == "stockfish":
+            move = self._choose_stockfish_opponent_move(board)
+            if move is not None:
+                return move
+        return self._choose_builtin_opponent_move(board)
 
     def _choose_simple_move(self, board: chess.Board) -> chess.Move | None:
         legal_moves = list(board.legal_moves)
@@ -675,7 +752,7 @@ class ChessDomain(InteractiveDomainAdapter):
                 board.push(move)
                 if board.is_game_over(claim_draw=True):
                     break
-                opponent_reply = self._choose_opponent_move(board)
+                opponent_reply = self._choose_builtin_opponent_move(board)
                 if opponent_reply is not None:
                     board.push(opponent_reply)
                 _, history_block = _observation_from_board(board, history_block)
@@ -750,6 +827,11 @@ class ChessDomain(InteractiveDomainAdapter):
 
     def set_eval_opponent_depth(self, depth: int | None) -> None:
         self._eval_opponent_depth = None if depth is None else max(0, int(depth))
+
+    def close(self) -> None:
+        if self._stockfish_engine is not None:
+            self._stockfish_engine.quit()
+            self._stockfish_engine = None
 
     def step(self, action: Any) -> tuple[Any, float, bool, bool, dict[str, Any]]:
         if self._done:

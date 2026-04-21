@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -300,6 +301,65 @@ def test_chess_domain_runtime_does_not_depend_on_stockfish_path() -> None:
     assert isinstance(bool(terminated), bool)
     assert isinstance(bool(truncated), bool)
     assert "winner" in next_info
+
+
+def test_chess_domain_uses_stockfish_for_live_opponent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stockfish_path = tmp_path / "stockfish"
+    stockfish_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    stockfish_path.chmod(0o755)
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.configs: list[dict[str, object]] = []
+            self.limits: list[chess.engine.Limit] = []
+            self.closed = False
+
+        def configure(self, config: dict[str, object]) -> None:
+            self.configs.append(config)
+
+        def play(self, board: chess.Board, limit: chess.engine.Limit) -> SimpleNamespace:
+            self.limits.append(limit)
+            assert board.turn == chess.BLACK
+            return SimpleNamespace(move=chess.Move.from_uci("e7e5"))
+
+        def quit(self) -> None:
+            self.closed = True
+
+    fake_engine = FakeEngine()
+    monkeypatch.setattr(
+        chess.engine.SimpleEngine,
+        "popen_uci",
+        staticmethod(lambda _path: fake_engine),
+    )
+    domain = ChessDomain(
+        embed_dim=16,
+        opponent_level=0,
+        stockfish_path=str(stockfish_path),
+        opponent_backend="stockfish",
+        stockfish_depth=2,
+        stockfish_strict=True,
+    )
+
+    observation, _info = domain.reset(seed=0)
+    action = torch.tensor([_action_from_move(chess.Move.from_uci("e2e4"))])
+    next_observation, _reward, _terminated, _truncated, next_info = domain.step(action)
+
+    assert next_info["opponent_action"] == "e7e5"
+    assert next_observation["moves"][-2:] == ("e2e4", "e7e5")
+    assert fake_engine.configs[-1]["Threads"] == 1
+    assert fake_engine.configs[-1]["Hash"] == 64
+    assert fake_engine.limits[-1].depth == 2
+
+    domain.set_eval_opponent_depth(4)
+    observation, _info = domain.reset(seed=0)
+    domain.step(action)
+    assert fake_engine.limits[-1].depth == 4
+
+    domain.close()
+    assert fake_engine.closed is True
 
 
 def test_orchestrator_can_build_chess_adapter_and_model(tmp_path: Path) -> None:
@@ -1643,6 +1703,11 @@ def test_chess_orchestrator_config_enables_legality_curriculum() -> None:
     domain = config.domains[0]
 
     assert domain.name == "chess"
+    assert domain.adapter_kwargs["opponent_backend"] == "stockfish"
+    assert domain.adapter_kwargs["stockfish_depth"] == 2
+    assert domain.adapter_kwargs["stockfish_strict"] is True
+    assert domain.bootstrap_random_episodes == 0
+    assert domain.bootstrap_simple_episodes == 0
     assert domain.bootstrap_legality_samples == 2048
     assert domain.bootstrap_legality_stages == (
         "piece_drills",

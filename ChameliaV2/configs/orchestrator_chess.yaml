@@ -54,14 +54,20 @@ domains:
       opponent_max_branching: 12
       chess_data_root: data/curriculum/stage3/chess/lichess
       stockfish_path: external/stockfish/stockfish14-cluster-x86-64
+      opponent_backend: stockfish
+      stockfish_depth: 2
+      stockfish_nodes: 2000
+      stockfish_threads: 1
+      stockfish_hash_mb: 64
+      stockfish_strict: true
       move_vocabulary_source: alphazero_4672
       self_play_unlock_threshold: 0.90
       invalid_move_mode: retry
       invalid_move_penalty: -0.25
       max_invalid_retries: 4
-    bootstrap_random_episodes: 16
+    bootstrap_random_episodes: 0
     bootstrap_teacher_episodes: 0
-    bootstrap_simple_episodes: 128
+    bootstrap_simple_episodes: 0
     bootstrap_legality_samples: 2048
     bootstrap_legality_stages: [piece_drills, blocked_piece_drills, king_safety, short_games]
     bootstrap_curriculum_samples: 2048
