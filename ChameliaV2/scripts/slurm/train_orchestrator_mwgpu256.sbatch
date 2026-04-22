@@ -61,6 +61,17 @@ export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 if [[ -n "${CONDA_PREFIX:-}" ]]; then
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
+if [[ -z "${CUDA_HOME:-}" && -d "/usr/local/cuda-12.6" ]]; then
+  export CUDA_HOME="/usr/local/cuda-12.6"
+elif [[ -z "${CUDA_HOME:-}" && -d "/usr/local/cuda" ]]; then
+  export CUDA_HOME="/usr/local/cuda"
+fi
+if [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME}/lib64" ]]; then
+  export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+if [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME}/bin" ]]; then
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
 
 RUN_TAG="${RUN_TAG:-orchestrator-mwgpu256-$(date +%Y%m%dT%H%M%S)}"
 ORCHESTRATOR_CONFIG="${ORCHESTRATOR_CONFIG:-${ROOT_DIR}/configs/orchestrator_foundation.yaml}"

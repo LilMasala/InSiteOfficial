@@ -493,6 +493,7 @@ class DomainRunConfig:
     bootstrap_pretrain_steps: int = 64
     bootstrap_replay_warmup_steps: int = 64
     bootstrap_batch_size: int = 16
+    optimization_batch_size: int = 32
     mask_ratio: float = 0.25
     max_episode_steps: int = 256
     optimizer_interval: int = 1
@@ -501,6 +502,7 @@ class DomainRunConfig:
     evaluation_episodes: int = 16
     planner_backend: str = "mcts"
     world_model_backend: str = "mamba"
+    require_native_mamba: bool = False
     baselines: tuple[str, ...] = ("random",)
     mcts_simulations: int = 16
     mcts_depth: int = 3
@@ -592,6 +594,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 bootstrap_pretrain_steps=int(entry.get("bootstrap_pretrain_steps", 64)),
                 bootstrap_replay_warmup_steps=int(entry.get("bootstrap_replay_warmup_steps", 64)),
                 bootstrap_batch_size=int(entry.get("bootstrap_batch_size", 16)),
+                optimization_batch_size=int(entry.get("optimization_batch_size", 32)),
                 mask_ratio=float(entry.get("mask_ratio", 0.25)),
                 max_episode_steps=int(entry.get("max_episode_steps", 256)),
                 optimizer_interval=int(entry.get("optimizer_interval", 1)),
@@ -600,6 +603,7 @@ def load_orchestrator_config(path: str | Path) -> OrchestratorConfig:
                 evaluation_episodes=int(entry.get("evaluation_episodes", 16)),
                 planner_backend=str(entry.get("planner_backend", "mcts")),
                 world_model_backend=str(entry.get("world_model_backend", "mamba")),
+                require_native_mamba=bool(entry.get("require_native_mamba", False)),
                 baselines=tuple(entry.get("baselines", ("random",))),
                 mcts_simulations=int(entry.get("mcts_simulations", 16)),
                 mcts_depth=int(entry.get("mcts_depth", 3)),
@@ -1120,6 +1124,13 @@ class UnifiedTrainingOrchestrator:
                 posture_dim=actor.posture_dim,
                 max_horizon=max(self.config.rollout_horizon, actor.path_length),
             )
+            if domain_cfg.require_native_mamba and getattr(world_model, "backend", "") != "mamba2":
+                raise RuntimeError(
+                    "Domain requested require_native_mamba=true, but MambaActionConditionedWorldModel "
+                    f"initialized backend={getattr(world_model, 'backend', 'unknown')!r}. "
+                    "Install a working mamba-ssm build in the active environment or set "
+                    "require_native_mamba=false."
+                )
         else:
             world_model = ActionConditionedWorldModel(
                 embed_dim=embed_dim,
@@ -1199,6 +1210,12 @@ class UnifiedTrainingOrchestrator:
         sleep.domain_index = domain_index
         model.domain_index = domain_index
         model.set_domain(adapter)
+        print(
+            f"[{domain_cfg.name}] model_backend={domain_cfg.world_model_backend} "
+            f"world_model_runtime={getattr(world_model, 'backend', domain_cfg.world_model_backend)} "
+            f"optimization_batch_size={domain_cfg.optimization_batch_size}",
+            flush=True,
+        )
         return model
 
     def _parameter_groups(
@@ -2656,8 +2673,9 @@ class UnifiedTrainingOrchestrator:
                 for record in self.replay.records
             ):
                 teacher_sources = ("bootstrap_teacher",)
+        optimization_batch_size = max(1, int(domain_cfg.optimization_batch_size))
         actor_batch = self.replay.sample(
-            32,
+            optimization_batch_size,
             domain_id=domain_cfg.name,
             require_next_latent=False,
             priority_alpha=self.config.surprise_replay_alpha,
@@ -2673,7 +2691,7 @@ class UnifiedTrainingOrchestrator:
         if actor_loss is not None:
             losses["actor"] = phase_cfg.actor_loss_weight * actor_loss
         world_model_windows = self.replay.sample_windows(
-            32,
+            optimization_batch_size,
             horizon=min(self.config.rollout_horizon, model.world_model.max_horizon),
             domain_id=domain_cfg.name,
             priority_alpha=self.config.surprise_replay_alpha,
@@ -2683,7 +2701,7 @@ class UnifiedTrainingOrchestrator:
         if world_model_loss is not None:
             losses["world_model"] = phase_cfg.world_model_loss_weight * world_model_loss
         critic_batch = self.replay.sample(
-            32,
+            optimization_batch_size,
             domain_id=domain_cfg.name,
             priority_alpha=self.config.surprise_replay_alpha,
         )
@@ -2697,7 +2715,7 @@ class UnifiedTrainingOrchestrator:
         )
         for critic_horizon in range(max_critic_horizon, 1, -1):
             critic_windows = self.replay.sample_windows(
-                32,
+                optimization_batch_size,
                 horizon=critic_horizon,
                 domain_id=domain_cfg.name,
                 priority_alpha=self.config.surprise_replay_alpha,
@@ -2760,12 +2778,21 @@ class UnifiedTrainingOrchestrator:
                 if window:
                     loss_parts.append(f"{key}_loss={mean(window):.4f}")
             if loss_parts:
+                cuda_part = ""
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    device_index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+                    cuda_part = (
+                        f" cuda_alloc_mb={torch.cuda.memory_allocated(device_index) / (1024 ** 2):.1f}"
+                        f" cuda_reserved_mb={torch.cuda.memory_reserved(device_index) / (1024 ** 2):.1f}"
+                        f" cuda_peak_mb={torch.cuda.max_memory_allocated(device_index) / (1024 ** 2):.1f}"
+                    )
                 print(
                     f"[{domain_cfg.name}] opt_call={self._optimization_calls} opt_step={self._optimizer_steps} "
                     + " ".join(loss_parts)
                     + (
                         f" grad_norm={grad_norm:.4f} replay={len(self.replay)} actor_valid={actor_valid} "
                         f"wm_valid={world_model_valid} critic_valid={critic_valid}"
+                        f" batch={optimization_batch_size}{cuda_part}"
                     ),
                     flush=True,
                 )
@@ -3288,6 +3315,12 @@ class UnifiedTrainingOrchestrator:
             ),
         )
         for episode_idx in range(1, phase_cfg.episodes + 1):
+            episode_start_s = time.perf_counter()
+            episode_model_s = 0.0
+            episode_env_s = 0.0
+            episode_encode_s = 0.0
+            episode_opt_s = 0.0
+            episode_transfer_s = 0.0
             observation, info = adapter.reset(seed=self.config.seed + episode_idx)
             episode_reward = 0.0
             winner = 0
@@ -3310,6 +3343,7 @@ class UnifiedTrainingOrchestrator:
                 tokens = tokenized.tokens.to(self.device)
                 domain_state = adapter.build_domain_state(observation, current_info)
                 domain_state["_planner_budget_multiplier"] = self._planner_budget_multiplier(last_surprise_bonus)
+                model_start_s = time.perf_counter()
                 outputs = model(
                     tokens=tokens,
                     mask=_build_zero_mask(tokens),
@@ -3318,6 +3352,7 @@ class UnifiedTrainingOrchestrator:
                     store_to_memory=False,
                     input_kind="embedded_tokens",
                 )
+                episode_model_s += time.perf_counter() - model_start_s
                 candidate_total_std = float(
                     outputs["candidate_costs"]["total"][0].std(unbiased=False).item()
                 )
@@ -3401,10 +3436,14 @@ class UnifiedTrainingOrchestrator:
                 )
                 fen_before = self._observation_fen(observation)
                 moves_before = self._observation_moves(observation)
+                env_start_s = time.perf_counter()
                 next_observation, reward, terminated, truncated, info = adapter.step(chosen_action)
+                episode_env_s += time.perf_counter() - env_start_s
                 if bool(info.get("invalid_action", False)):
                     episode_invalid_attempts += 1
+                encode_start_s = time.perf_counter()
                 next_tokens, next_z = self._encode_latent(model, adapter, next_observation)
+                episode_encode_s += time.perf_counter() - encode_start_s
                 realized_cost = adapter.compute_realized_cost(
                     next_observation,
                     reward,
@@ -3553,6 +3592,7 @@ class UnifiedTrainingOrchestrator:
                         provisional_skill_uses += 1
                 global_step += 1
                 if global_step % max(1, domain_cfg.optimizer_interval) == 0:
+                    opt_start_s = time.perf_counter()
                     self._optimize_from_replay(
                         model,
                         outputs,
@@ -3564,6 +3604,8 @@ class UnifiedTrainingOrchestrator:
                         domain_cfg=domain_cfg,
                         global_step=global_step,
                     )
+                    episode_opt_s += time.perf_counter() - opt_start_s
+                transfer_start_s = time.perf_counter()
                 self._optimize_transfer_modules(
                     model,
                     domain_cfg=domain_cfg,
@@ -3571,11 +3613,13 @@ class UnifiedTrainingOrchestrator:
                     optimizer=transfer_optimizer,
                     global_step=global_step,
                 )
+                episode_transfer_s += time.perf_counter() - transfer_start_s
                 episode_reward += float(reward)
                 observation = next_observation
                 if terminated or truncated:
                     winner = int(info.get("winner", 0))
                     break
+            episode_wall_s = time.perf_counter() - episode_start_s
             episode_rewards.append(float(episode_reward))
             episode_lengths.append(int(step_idx + 1))
             for r in self.replay.records:
@@ -3590,6 +3634,12 @@ class UnifiedTrainingOrchestrator:
                     f"memory_size={model.memory.size} "
                     f"reward_mean100={mean(episode_rewards):.3f} "
                     f"len_mean100={mean(episode_lengths):.2f} "
+                    f"episode_s={episode_wall_s:.2f} "
+                    f"model_s={episode_model_s:.2f} "
+                    f"env_s={episode_env_s:.2f} "
+                    f"encode_s={episode_encode_s:.2f} "
+                    f"opt_s={episode_opt_s:.2f} "
+                    f"transfer_s={episode_transfer_s:.2f} "
                     f"candidate_total_min={float(output_summary.get('candidate_total_min', 0.0)):.4f} "
                     f"candidate_total_mean={float(output_summary.get('candidate_total_mean', 0.0)):.4f} "
                     f"candidate_total_max={float(output_summary.get('candidate_total_max', 0.0)):.4f} "
@@ -3638,6 +3688,12 @@ class UnifiedTrainingOrchestrator:
                         "memory_size": model.memory.size,
                         "reward_mean100": mean(episode_rewards),
                         "episode_length_mean100": mean(episode_lengths),
+                        "episode_wall_s": float(episode_wall_s),
+                        "episode_model_s": float(episode_model_s),
+                        "episode_env_s": float(episode_env_s),
+                        "episode_encode_s": float(episode_encode_s),
+                        "episode_opt_s": float(episode_opt_s),
+                        "episode_transfer_s": float(episode_transfer_s),
                         "planner_debug": planner_debug,
                         "baseline_guard_fraction": (
                             float(baseline_guard_count) / float(max(1, decision_count))

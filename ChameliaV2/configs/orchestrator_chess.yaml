@@ -74,7 +74,8 @@ domains:
     bootstrap_curriculum_buckets: [openings, puzzles, endgames, middlegames, short_games, full_games]
     bootstrap_pretrain_steps: 128
     bootstrap_replay_warmup_steps: 128
-    bootstrap_batch_size: 8
+    bootstrap_batch_size: 32
+    optimization_batch_size: 128
     mask_ratio: 0.15
     max_episode_steps: 80
     optimizer_interval: 1
@@ -83,6 +84,7 @@ domains:
     evaluation_episodes: 16
     planner_backend: mcts
     world_model_backend: mamba
+    require_native_mamba: true
     baselines: [random, simple]
     mcts_simulations: 16
     mcts_depth: 3
