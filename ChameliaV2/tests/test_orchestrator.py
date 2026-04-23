@@ -1708,8 +1708,8 @@ def test_chess_orchestrator_config_enables_legality_curriculum() -> None:
     assert domain.adapter_kwargs["stockfish_strict"] is True
     assert domain.bootstrap_random_episodes == 0
     assert domain.bootstrap_simple_episodes == 0
-    assert domain.bootstrap_batch_size == 32
-    assert domain.optimization_batch_size == 128
+    assert domain.bootstrap_batch_size == 64
+    assert domain.optimization_batch_size == 256
     assert domain.require_native_mamba is True
     assert domain.bootstrap_legality_samples == 2048
     assert domain.bootstrap_legality_stages == (

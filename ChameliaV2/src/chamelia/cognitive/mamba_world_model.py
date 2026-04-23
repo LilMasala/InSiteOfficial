@@ -93,8 +93,18 @@ class _SequenceMixerBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
+    def _native_ready(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.backend == "mamba2":
+            # The native causal-conv1d kernels used by Mamba2 are stricter than
+            # the fallback path about incoming strides, especially for tensors
+            # assembled from expand/reshape views during rollout construction.
+            return tensor.contiguous()
+        return tensor
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        inputs = inputs + self.dropout(self.mixer(self.norm1(inputs)))
+        residual = self._native_ready(inputs)
+        mixed = self.mixer(self._native_ready(self.norm1(residual)))
+        inputs = residual + self.dropout(self._native_ready(mixed))
         inputs = inputs + self.dropout(self.mlp(self.norm2(inputs)))
         return inputs
 
@@ -251,19 +261,25 @@ class MambaActionConditionedWorldModel(nn.Module):
             raise ValueError(
                 f"path_length={path_length} exceeds max_horizon={self.max_horizon}."
             )
-        current = z.unsqueeze(1).expand(-1, num_candidates, -1).reshape(-1, z.shape[-1])
+        current = (
+            z.unsqueeze(1)
+            .expand(-1, num_candidates, -1)
+            .reshape(-1, z.shape[-1])
+            .contiguous()
+        )
         flat_ctx = (
             ctx_tokens.unsqueeze(1)
             .expand(-1, num_candidates, -1, -1)
             .reshape(-1, ctx_tokens.shape[1], ctx_tokens.shape[2])
+            .contiguous()
         )
-        ctx_summary = self.ctx_proj(flat_ctx.mean(dim=1))
+        ctx_summary = self.ctx_proj(flat_ctx.mean(dim=1)).contiguous()
         if reasoning_states is not None:
             if reasoning_states.dim() == 2:
                 reasoning_states = reasoning_states.unsqueeze(1)
             reasoning_flat = self.reasoning_proj(
                 reasoning_states.reshape(-1, reasoning_states.shape[-1])
-            )
+            ).contiguous()
         else:
             reasoning_flat = None
         if candidate_postures is not None:
@@ -271,14 +287,18 @@ class MambaActionConditionedWorldModel(nn.Module):
                 candidate_postures = candidate_postures.unsqueeze(1)
             posture_flat = self.posture_proj(
                 candidate_postures.reshape(-1, candidate_postures.shape[-1])
-            )
+            ).contiguous()
         else:
             posture_flat = None
         token_sequence: list[torch.Tensor] = []
         posture_tokens: list[torch.Tensor | None] = []
         for step_idx in range(path_length):
             step_action = actions_tensor[:, :, step_idx, :].reshape(-1, actions_tensor.shape[-1])
-            token = self.state_proj(current) + self._project_actions(step_action) + ctx_summary
+            token = (
+                self.state_proj(current)
+                + self._project_actions(step_action)
+                + ctx_summary
+            )
             token = token + self.time_embed(
                 torch.full((token.shape[0],), step_idx, device=token.device, dtype=torch.long)
             )
@@ -290,9 +310,9 @@ class MambaActionConditionedWorldModel(nn.Module):
                 token = token + posture_token
             if reasoning_flat is not None:
                 token = token + reasoning_flat
-            token_sequence.append(token)
-            posture_tokens.append(posture_token)
-        sequence = torch.stack(token_sequence, dim=1)
+            token_sequence.append(token.contiguous())
+            posture_tokens.append(None if posture_token is None else posture_token.contiguous())
+        sequence = torch.stack(token_sequence, dim=1).contiguous()
         modeled = sequence
         for layer in self.sequence_model:
             modeled = layer(modeled)
