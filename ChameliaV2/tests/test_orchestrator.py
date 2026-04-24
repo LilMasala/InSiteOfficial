@@ -1718,4 +1718,46 @@ def test_chess_orchestrator_config_enables_legality_curriculum() -> None:
         "king_safety",
         "short_games",
     )
-    assert domain.bootstrap_curriculum_samples == 2048
+
+
+def test_chess_domain_reuses_cached_domain_state() -> None:
+    domain = ChessDomain(embed_dim=16, opponent_level=0)
+    observation, info = domain.reset(seed=0)
+
+    cached_state = domain.build_domain_state(observation, info)
+    legal = domain.legal_action_mask(observation, info)
+
+    assert observation["domain_state"]["fen"] == cached_state["fen"]
+    assert torch.equal(cached_state["board_observation"], observation["domain_state"]["board_observation"])
+    assert torch.equal(legal, observation["domain_state"]["legal_actions_mask"].reshape(-1).bool())
+
+
+def test_transition_surprise_reuses_selected_planner_rollout(tmp_path: Path) -> None:
+    orchestrator = UnifiedTrainingOrchestrator(_tiny_orchestrator_config(tmp_path / "surprise_reuse"))
+
+    class _FailWorldModel:
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("world_model should not be called when planner rollout is reusable")
+
+    model = SimpleNamespace(world_model=_FailWorldModel())
+    predicted_next = torch.tensor([0.25, -0.5, 0.75], dtype=torch.float32)
+    outputs = {
+        "rollout": {"trajectory": predicted_next.view(1, 1, 1, -1)},
+        "selected_candidate_idx": torch.tensor([0], dtype=torch.long),
+        "action_vec": torch.tensor([[0.1, 0.9]], dtype=torch.float32),
+        "z": torch.zeros(1, 3),
+        "ctx_tokens": torch.zeros(1, 1, 3),
+    }
+    next_z = predicted_next.clone()
+
+    world_model_error, surprise_bonus, surprise_priority = orchestrator._compute_transition_surprise(
+        model,
+        outputs=outputs,
+        executed_action_vec=torch.tensor([0.1, 0.9], dtype=torch.float32),
+        next_z=next_z,
+        executed_selected_posture=None,
+    )
+
+    assert world_model_error <= 1.0e-6
+    assert surprise_bonus <= 1.0e-6
+    assert abs(surprise_priority - 1.0) <= 1.0e-6

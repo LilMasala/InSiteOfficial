@@ -2003,20 +2003,43 @@ class UnifiedTrainingOrchestrator:
         next_z: torch.Tensor,
         executed_selected_posture: torch.Tensor | None = None,
     ) -> tuple[float, float, float]:
-        action_path = executed_action_vec.detach().to(self.device).unsqueeze(0).unsqueeze(0)
-        candidate_postures = None
-        if executed_selected_posture is not None:
-            candidate_postures = executed_selected_posture.detach().to(self.device).unsqueeze(0)
         with torch.no_grad():
-            rollout = model.world_model(
-                z=outputs["z"].detach(),
-                actions=action_path,
-                ctx_tokens=outputs["ctx_tokens"].detach(),
-                candidate_postures=candidate_postures,
-                reasoning_states=None,
-                horizon=1,
-            )
-            predicted_next = rollout["trajectory"][0, 0, 0]
+            predicted_next = None
+            rollout = outputs.get("rollout")
+            selected_candidate_idx = outputs.get("selected_candidate_idx")
+            planned_action_vec = outputs.get("action_vec")
+            if (
+                isinstance(rollout, dict)
+                and torch.is_tensor(rollout.get("trajectory"))
+                and torch.is_tensor(selected_candidate_idx)
+                and torch.is_tensor(planned_action_vec)
+            ):
+                trajectory = rollout["trajectory"]
+                selected_idx = int(selected_candidate_idx.detach().reshape(-1)[0].item())
+                if (
+                    trajectory.dim() == 4
+                    and trajectory.shape[0] > 0
+                    and 0 <= selected_idx < trajectory.shape[1]
+                    and torch.allclose(
+                        planned_action_vec[0].detach().reshape(-1).to(executed_action_vec),
+                        executed_action_vec.detach().reshape(-1),
+                    )
+                ):
+                    predicted_next = trajectory[0, selected_idx, 0]
+            if predicted_next is None:
+                action_path = executed_action_vec.detach().to(self.device).unsqueeze(0).unsqueeze(0)
+                candidate_postures = None
+                if executed_selected_posture is not None:
+                    candidate_postures = executed_selected_posture.detach().to(self.device).unsqueeze(0)
+                rollout = model.world_model(
+                    z=outputs["z"].detach(),
+                    actions=action_path,
+                    ctx_tokens=outputs["ctx_tokens"].detach(),
+                    candidate_postures=candidate_postures,
+                    reasoning_states=None,
+                    horizon=1,
+                )
+                predicted_next = rollout["trajectory"][0, 0, 0]
             target_next = next_z.detach().to(predicted_next)
             world_model_error = float(
                 torch.sqrt(torch.mean((predicted_next - target_next).pow(2)).clamp_min(1.0e-12)).item()
@@ -2025,6 +2048,46 @@ class UnifiedTrainingOrchestrator:
         surprise_bonus = float(self.config.surprise_bonus_weight) * normalized_surprise
         surprise_priority = 1.0 + normalized_surprise
         return world_model_error, surprise_bonus, surprise_priority
+
+    def _warmup_core_control(
+        self,
+        *,
+        adapter: InteractiveDomainAdapter,
+        model: Chamelia,
+        domain_cfg: DomainRunConfig,
+    ) -> None:
+        warmup_start_s = time.perf_counter()
+        observation, info = adapter.reset(seed=self.config.seed + 900_000)
+        tokenized = adapter.tokenize_observation(observation)
+        tokens = tokenized.tokens.to(self.device)
+        domain_state = adapter.build_domain_state(observation, info)
+        model_domain_state = dict(domain_state)
+        model_domain_state["_planner_budget_multiplier"] = 1.0
+        with torch.no_grad():
+            outputs = model(
+                tokens=tokens,
+                mask=_build_zero_mask(tokens),
+                domain_state=_move_nested_to_device(model_domain_state, self.device),
+                actor_mode="mode2",
+                store_to_memory=False,
+                input_kind="embedded_tokens",
+            )
+        action = outputs["action"]
+        chosen_action = action[0] if torch.is_tensor(action) else action
+        next_observation, _reward, _terminated, _truncated, next_info = adapter.step(chosen_action)
+        _next_tokens, next_z = self._encode_latent(model, adapter, next_observation)
+        selected_posture = outputs["selected_posture"][0].detach()
+        self._compute_transition_surprise(
+            model,
+            outputs=outputs,
+            executed_action_vec=outputs["action_vec"][0].detach(),
+            next_z=next_z,
+            executed_selected_posture=selected_posture,
+        )
+        print(
+            f"[{domain_cfg.name}] core_control_warmup_s={time.perf_counter() - warmup_start_s:.2f}",
+            flush=True,
+        )
 
     def _compute_actor_loss(
         self,
@@ -3304,6 +3367,12 @@ class UnifiedTrainingOrchestrator:
             f"sleep={phase_cfg.use_sleep} train_hjepa={phase_cfg.train_hjepa}",
             flush=True,
         )
+        if phase_name == "core_control":
+            self._warmup_core_control(
+                adapter=adapter,
+                model=model,
+                domain_cfg=domain_cfg,
+            )
         if phase_cfg.use_sleep and model.sleep_coordinator is not None:
             model.sleep_coordinator.start()
         global_step = 0
@@ -3342,12 +3411,13 @@ class UnifiedTrainingOrchestrator:
                 tokenized = adapter.tokenize_observation(observation)
                 tokens = tokenized.tokens.to(self.device)
                 domain_state = adapter.build_domain_state(observation, current_info)
-                domain_state["_planner_budget_multiplier"] = self._planner_budget_multiplier(last_surprise_bonus)
+                model_domain_state = dict(domain_state)
+                model_domain_state["_planner_budget_multiplier"] = self._planner_budget_multiplier(last_surprise_bonus)
                 model_start_s = time.perf_counter()
                 outputs = model(
                     tokens=tokens,
                     mask=_build_zero_mask(tokens),
-                    domain_state=_move_nested_to_device(domain_state, self.device),
+                    domain_state=_move_nested_to_device(model_domain_state, self.device),
                     actor_mode="mode2",
                     store_to_memory=False,
                     input_kind="embedded_tokens",
@@ -3441,6 +3511,7 @@ class UnifiedTrainingOrchestrator:
                 episode_env_s += time.perf_counter() - env_start_s
                 if bool(info.get("invalid_action", False)):
                     episode_invalid_attempts += 1
+                next_domain_state = adapter.build_domain_state(next_observation, info)
                 encode_start_s = time.perf_counter()
                 next_tokens, next_z = self._encode_latent(model, adapter, next_observation)
                 episode_encode_s += time.perf_counter() - encode_start_s
@@ -3487,7 +3558,7 @@ class UnifiedTrainingOrchestrator:
                     reward=reward,
                     cost=realized_cost,
                     done=bool(terminated or truncated),
-                    legal_actions_mask=adapter.legal_action_mask(observation, current_info),
+                    legal_actions_mask=domain_state.get("legal_actions_mask"),
                     executed_action=executed_action,
                     executed_action_vec=executed_action_vec,
                     executed_selected_path=executed_selected_path,
@@ -3499,7 +3570,7 @@ class UnifiedTrainingOrchestrator:
                     surprise_bonus=surprise_bonus,
                     surprise_priority=surprise_priority,
                 )
-                record.next_domain_state = _clone_nested_cpu(adapter.build_domain_state(next_observation, info))
+                record.next_domain_state = _clone_nested_cpu(next_domain_state)
                 self.replay.add(record)
                 promotion_source = None
                 if phase_cfg.use_memory and model.sleep_coordinator is not None and model.memory.size > 0:

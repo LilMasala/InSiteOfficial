@@ -658,6 +658,11 @@ class ChessDomain(InteractiveDomainAdapter):
         return state
 
     def build_domain_state(self, observation: Any, info: dict[str, Any] | None = None) -> dict[str, Any]:
+        if isinstance(observation, dict) and isinstance(observation.get("domain_state"), dict):
+            state = dict(observation["domain_state"])
+            if info:
+                state["info"] = dict(info)
+            return state
         if isinstance(observation, dict) and "fen" in observation:
             fen_value = observation["fen"]
             history_value = observation.get("history_block")
@@ -766,7 +771,10 @@ class ChessDomain(InteractiveDomainAdapter):
         return None
 
     def legal_action_mask(self, observation: Any, info: dict[str, Any] | None = None) -> torch.Tensor | None:
-        mask = self.build_domain_state(observation, info).get("legal_actions_mask")
+        if isinstance(observation, dict) and isinstance(observation.get("domain_state"), dict):
+            mask = observation["domain_state"].get("legal_actions_mask")
+        else:
+            mask = self.build_domain_state(observation, info).get("legal_actions_mask")
         if mask is None:
             return None
         return mask.reshape(-1).bool()
@@ -789,13 +797,16 @@ class ChessDomain(InteractiveDomainAdapter):
         return info
 
     def _observe(self) -> dict[str, Any]:
-        observation, self._history_block = _observation_from_board(self._board, self._history_block)
+        state = self._build_state_from_boards([self._board], [self._history_block.clone()])
+        observation = state["board_observation"][0].clone()
+        self._history_block = state["history_block"][0].clone()
         return {
             "observation": observation,
             "fen": self._board.fen(),
             "history_block": self._history_block.clone(),
             "moves": tuple(move.uci() for move in self._board.move_stack),
             "turn": "white" if self._board.turn == chess.WHITE else "black",
+            "domain_state": state,
         }
 
     def reset(self, seed: int | None = None) -> tuple[Any, dict[str, Any]]:
@@ -809,12 +820,15 @@ class ChessDomain(InteractiveDomainAdapter):
             [current, torch.zeros(8, 8, _HISTORY_PLANES - _CURRENT_BOARD_PLANES, dtype=torch.float32)],
             dim=-1,
         )
+        state = self._build_state_from_boards([self._board], [self._history_block.clone()])
+        self._history_block = state["history_block"][0].clone()
         observation = {
-            "observation": torch.cat([_aux_planes(self._board), self._history_block], dim=-1),
+            "observation": state["board_observation"][0].clone(),
             "fen": self._board.fen(),
             "history_block": self._history_block.clone(),
             "moves": (),
             "turn": "white",
+            "domain_state": state,
         }
         info = {
             "winner": 0,
