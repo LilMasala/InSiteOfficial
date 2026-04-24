@@ -92,6 +92,7 @@ class _SequenceMixerBlock(nn.Module):
             nn.Linear(hidden_dim, embed_dim),
         )
         self.dropout = nn.Dropout(dropout)
+        self._reported_native_stride_fallback = False
 
     def _native_ready(self, tensor: torch.Tensor) -> torch.Tensor:
         if self.backend == "mamba2":
@@ -101,9 +102,30 @@ class _SequenceMixerBlock(nn.Module):
             return tensor.contiguous()
         return tensor
 
+    def _run_mixer(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = self._native_ready(tensor)
+        if self.backend != "mamba2" or not hasattr(self.mixer, "use_mem_eff_path"):
+            return self.mixer(tensor)
+        try:
+            return self.mixer(tensor)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "causal_conv1d with channel last layout requires strides" not in message:
+                raise
+            if getattr(self.mixer, "use_mem_eff_path", None) is False:
+                raise
+            self.mixer.use_mem_eff_path = False
+            if not self._reported_native_stride_fallback:
+                print(
+                    "[mamba_world_model] disabling mem-efficient Mamba2 path after "
+                    "causal_conv1d stride-layout failure"
+                )
+                self._reported_native_stride_fallback = True
+            return self.mixer(tensor)
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         residual = self._native_ready(inputs)
-        mixed = self.mixer(self._native_ready(self.norm1(residual)))
+        mixed = self._run_mixer(self.norm1(residual))
         inputs = residual + self.dropout(self._native_ready(mixed))
         inputs = inputs + self.dropout(self.mlp(self.norm2(inputs)))
         return inputs

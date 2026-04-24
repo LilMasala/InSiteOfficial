@@ -16,6 +16,7 @@ from src.chamelia.cognitive.lancedb_assessment import assess_vector_backends
 from src.chamelia.cognitive.latent_action import LatentActionEncoder, LatentSkillCandidate
 from src.chamelia.cognitive.mamba_world_model import (
     MambaActionConditionedWorldModel,
+    _SequenceMixerBlock,
     benchmark_world_models,
 )
 from src.chamelia.cognitive.planning import HighLevelPlanner, MCTSNode, MCTSSearch, Talker
@@ -1061,6 +1062,44 @@ def test_chamelia_can_select_mamba_world_model_backend(tmp_path: Path) -> None:
 
     assert outputs["world_model_backend"] == "mamba"
     assert getattr(model.world_model, "backend", None) in {"mamba2", "fallback_ssm"}
+
+
+def test_sequence_mixer_block_disables_mem_eff_path_after_stride_error() -> None:
+    block = _SequenceMixerBlock(
+        embed_dim=16,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        use_native_mamba=False,
+        d_state=8,
+        d_conv=4,
+        expand=2,
+    )
+
+    class _FakeMamba(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_mem_eff_path = True
+            self.calls = 0
+
+        def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+            self.calls += 1
+            if self.use_mem_eff_path:
+                raise RuntimeError(
+                    "causal_conv1d with channel last layout requires strides "
+                    "(x.stride(0) and x.stride(2)) to be multiples of 8"
+                )
+            return tensor
+
+    fake_mixer = _FakeMamba()
+    block.mixer = fake_mixer
+    block.backend = "mamba2"
+
+    inputs = torch.randn(2, 3, 16)
+    outputs = block(inputs)
+
+    assert outputs.shape == inputs.shape
+    assert fake_mixer.use_mem_eff_path is False
+    assert fake_mixer.calls == 2
 
 
 def test_stitch_bodegen_and_gemma_worker_harness() -> None:
