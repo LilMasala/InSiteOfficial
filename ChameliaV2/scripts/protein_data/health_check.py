@@ -19,7 +19,7 @@ LOG = configure_logging(
 INTERVAL_SECONDS = 4 * 3600
 ENDPOINTS = {
     "uniprot": ("https://rest.uniprot.org/uniprotkb/P12345", {"format": "json"}),
-    "rcsb": ("https://data.rcsb.org/rest/v1/core/entry/1ABC", None),
+    "rcsb": ("https://data.rcsb.org/rest/v1/core/entry/1CRN", None),
     "alphafold": ("https://alphafold.ebi.ac.uk/api/prediction/P12345", None),
     "pubchem": ("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/aspirin/JSON", None),
 }
@@ -108,4 +108,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
